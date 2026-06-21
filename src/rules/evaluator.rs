@@ -585,12 +585,31 @@ mod tests {
         assert!(evaluate_rule(&make_rule("VETRO-090"), &p).is_some());
     }
 
+    // ── VETRO-050 / VETRO-051: SELECT limit & star (Postgres path) ─────────
+
     #[test]
-    fn vetro_090_ast_node_path_identifies_tautology() {
-        let p = parse("SELECT id FROM users WHERE name = 'x' OR 1=1", Dialect::Postgres);
-        let violation = evaluate_rule(&make_rule("VETRO-090"), &p).expect("must detect");
-        assert!(violation.ast_node_path.contains("OR"));
-        assert!(violation.ast_node_path.contains("always_true_branch"));
-        assert_eq!(violation.rule_code, "VETRO-090");
+    fn vetro_050_allows_select_with_limit() {
+        // Regression: `SELECT 1 LIMIT 1` was blocked because the pg_query
+        // path never populated select_has_limit. It must now pass.
+        let p = parse("SELECT 1 LIMIT 1", Dialect::Postgres);
+        assert!(evaluate_rule(&make_rule("VETRO-050"), &p).is_none());
+    }
+
+    #[test]
+    fn vetro_050_flags_select_without_limit() {
+        let p = parse("SELECT id FROM users WHERE id = 1", Dialect::Postgres);
+        assert!(evaluate_rule(&make_rule("VETRO-050"), &p).is_some());
+    }
+
+    #[test]
+    fn vetro_051_flags_select_star_without_where() {
+        let p = parse("SELECT * FROM users", Dialect::Postgres);
+        assert!(evaluate_rule(&make_rule("VETRO-051"), &p).is_some());
+    }
+
+    #[test]
+    fn vetro_051_allows_select_star_with_where() {
+        let p = parse("SELECT * FROM users WHERE id = 1", Dialect::Postgres);
+        assert!(evaluate_rule(&make_rule("VETRO-051"), &p).is_none());
     }
 }

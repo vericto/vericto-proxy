@@ -9,7 +9,7 @@
 
 use crate::error::{ProxyError, Result, MAX_AST_DEPTH};
 use crate::parser::{
-    DropObjectKind, ParsedQuery, StatementInfo, StatementKind, WherePresence,
+    AlterTableKind, DropObjectKind, ParsedQuery, StatementInfo, StatementKind, WherePresence,
 };
 
 use pg_query::protobuf::node::Node as NodeEnum;
@@ -53,6 +53,7 @@ fn walk_node(
                 where_presence: presence,
                 is_nested,
                 ast_node_path: node_path("DeleteStmt", presence, is_nested),
+                has_or_tautology: where_has_or_tautology(stmt.where_clause.as_deref()),
                 ..Default::default()
             });
             walk_with_clause(stmt.with_clause.as_ref(), depth + 1, out)?;
@@ -66,6 +67,7 @@ fn walk_node(
                 where_presence: presence,
                 is_nested,
                 ast_node_path: node_path("UpdateStmt", presence, is_nested),
+                has_or_tautology: where_has_or_tautology(stmt.where_clause.as_deref()),
                 ..Default::default()
             });
             walk_with_clause(stmt.with_clause.as_ref(), depth + 1, out)?;
@@ -77,8 +79,51 @@ fn walk_node(
                 is_nested,
                 ast_node_path: "DropStmt".to_string(),
                 drop_object: Some(drop_kind(stmt.remove_type)),
+                // `missing_ok` is libpg_query's representation of IF EXISTS.
+                drop_index_if_exists: stmt.missing_ok,
                 ..Default::default()
             });
+        }
+
+        // ALTER TABLE … DROP COLUMN (VETRO-015). libpg_query emits an
+        // AlterTableStmt whose `cmds` carry the subtype; RENAME is a separate
+        // RenameStmt node handled below.
+        NodeEnum::AlterTableStmt(stmt) => {
+            use pg_query::protobuf::AlterTableType;
+            for cmd in &stmt.cmds {
+                let Some(NodeEnum::AlterTableCmd(c)) = cmd.node.as_ref() else {
+                    continue;
+                };
+                if let Some(AlterTableType::AtDropColumn) = AlterTableType::from_i32(c.subtype) {
+                    out.push(StatementInfo {
+                        kind: StatementKind::AlterTable,
+                        relation: relname(stmt.relation.as_ref()),
+                        alter_table_kind: Some(AlterTableKind::DropColumn),
+                        is_nested,
+                        ast_node_path: "AlterTableStmt > DropColumn".to_string(),
+                        ..Default::default()
+                    });
+                }
+            }
+        }
+
+        // ALTER TABLE … RENAME TO / RENAME COLUMN (VETRO-016). PostgreSQL
+        // models renames as a dedicated RenameStmt rather than an
+        // AlterTableCmd subtype.
+        NodeEnum::RenameStmt(stmt) => {
+            if matches!(
+                ObjectType::from_i32(stmt.rename_type),
+                Some(ObjectType::ObjectTable) | Some(ObjectType::ObjectColumn)
+            ) {
+                out.push(StatementInfo {
+                    kind: StatementKind::AlterTable,
+                    relation: relname(stmt.relation.as_ref()),
+                    alter_table_kind: Some(AlterTableKind::Rename),
+                    is_nested,
+                    ast_node_path: "AlterTableStmt > Rename".to_string(),
+                    ..Default::default()
+                });
+            }
         }
 
         NodeEnum::TruncateStmt(_) => {
@@ -92,10 +137,20 @@ fn walk_node(
 
         NodeEnum::SelectStmt(stmt) => {
             if !is_nested {
+                // Populate the SELECT-specific attributes the rule engine
+                // consumes (VETRO-050 needs LIMIT presence, VETRO-051 needs
+                // SELECT * + WHERE state). Without this every PostgreSQL SELECT
+                // defaulted to `select_has_limit = false` / `where = Absent`,
+                // causing those rules to fire on every read.
+                let presence = where_presence(stmt.where_clause.as_deref());
                 out.push(StatementInfo {
                     kind: StatementKind::Select,
+                    where_presence: presence,
                     is_nested: false,
                     ast_node_path: "SelectStmt".to_string(),
+                    select_has_limit: stmt.limit_count.is_some(),
+                    select_is_star: target_list_has_star(&stmt.target_list),
+                    has_or_tautology: where_has_or_tautology(stmt.where_clause.as_deref()),
                     ..Default::default()
                 });
             }
@@ -202,6 +257,34 @@ fn is_always_true(node: &NodeEnum) -> bool {
     }
 }
 
+/// Returns `true` when a WHERE predicate contains a trivially-true OR branch
+/// at any depth (e.g. `id = $1 OR 1=1`). Used by VETRO-090 to detect the
+/// canonical SQL injection tautology on the PostgreSQL path. Mirrors the
+/// sqlparser walker so behaviour is identical across dialects.
+fn where_has_or_tautology(where_clause: Option<&Node>) -> bool {
+    where_clause
+        .and_then(|n| n.node.as_ref())
+        .map(has_or_tautology)
+        .unwrap_or(false)
+}
+
+/// Recursively detect a tautological OR branch: an `OR` whose any operand is
+/// always true, or an `AND` containing such an `OR` deeper down.
+fn has_or_tautology(node: &NodeEnum) -> bool {
+    use pg_query::protobuf::BoolExprType;
+    let NodeEnum::BoolExpr(b) = node else {
+        return false;
+    };
+    let children = || b.args.iter().filter_map(|n| n.node.as_ref());
+    match BoolExprType::from_i32(b.boolop) {
+        Some(BoolExprType::OrExpr) => {
+            children().any(is_always_true) || children().any(has_or_tautology)
+        }
+        Some(BoolExprType::AndExpr) => children().any(has_or_tautology),
+        _ => false,
+    }
+}
+
 /// Compare two nodes to determine whether they represent the same literal constant.
 fn const_eq(left: &Node, right: &Node) -> bool {
     match (left.node.as_ref(), right.node.as_ref()) {
@@ -224,6 +307,26 @@ fn operator_name(name: &[Node]) -> Option<String> {
 /// Extract the relation name from a `RangeVar`.
 fn relname(range_var: Option<&RangeVar>) -> Option<String> {
     range_var.map(|rv| rv.relname.clone()).filter(|s| !s.is_empty())
+}
+
+/// Returns `true` when a SELECT target list contains a `*` wildcard
+/// (e.g. `SELECT *` or `SELECT t.*`). pg_query represents this as a
+/// `ResTarget` whose value is a `ColumnRef` containing an `A_Star` field.
+fn target_list_has_star(target_list: &[Node]) -> bool {
+    target_list.iter().any(|node| {
+        let Some(NodeEnum::ResTarget(res)) = node.node.as_ref() else {
+            return false;
+        };
+        let Some(val) = res.val.as_deref() else {
+            return false;
+        };
+        let Some(NodeEnum::ColumnRef(col)) = val.node.as_ref() else {
+            return false;
+        };
+        col.fields
+            .iter()
+            .any(|f| matches!(f.node.as_ref(), Some(NodeEnum::AStar(_))))
+    })
 }
 
 /// Map the `remove_type` integer (ObjectType protobuf enum) to `DropObjectKind`.
@@ -292,5 +395,133 @@ mod tests {
     #[test]
     fn invalid_syntax_is_parse_error() {
         assert!(parse_postgres("DELETE FORM users").is_err());
+    }
+
+    // ── SELECT attribute population (VETRO-050 / VETRO-051) ─────────────────
+
+    #[test]
+    fn select_with_limit_sets_has_limit() {
+        // `SELECT 1 LIMIT 1` must record a LIMIT so VETRO-050 does not fire.
+        let parsed = parse_postgres("SELECT 1 LIMIT 1").unwrap();
+        let select = parsed
+            .statements
+            .iter()
+            .find(|s| s.kind == StatementKind::Select)
+            .expect("must detect the SELECT");
+        assert!(select.select_has_limit, "LIMIT 1 must set select_has_limit");
+    }
+
+    #[test]
+    fn select_without_limit_has_no_limit() {
+        let parsed = parse_postgres("SELECT id FROM users WHERE id = 1").unwrap();
+        let select = parsed
+            .statements
+            .iter()
+            .find(|s| s.kind == StatementKind::Select)
+            .expect("must detect the SELECT");
+        assert!(!select.select_has_limit);
+    }
+
+    #[test]
+    fn select_star_is_detected() {
+        let parsed = parse_postgres("SELECT * FROM users").unwrap();
+        let select = parsed
+            .statements
+            .iter()
+            .find(|s| s.kind == StatementKind::Select)
+            .expect("must detect the SELECT");
+        assert!(select.select_is_star, "SELECT * must set select_is_star");
+        assert_eq!(select.where_presence, WherePresence::Absent);
+    }
+
+    #[test]
+    fn select_explicit_columns_is_not_star() {
+        let parsed = parse_postgres("SELECT id, name FROM users").unwrap();
+        let select = parsed
+            .statements
+            .iter()
+            .find(|s| s.kind == StatementKind::Select)
+            .expect("must detect the SELECT");
+        assert!(!select.select_is_star);
+    }
+
+    #[test]
+    fn select_with_where_records_presence() {
+        let parsed = parse_postgres("SELECT * FROM users WHERE id = 1").unwrap();
+        let select = parsed
+            .statements
+            .iter()
+            .find(|s| s.kind == StatementKind::Select)
+            .expect("must detect the SELECT");
+        assert_eq!(select.where_presence, WherePresence::Present);
+    }
+
+    // ── ALTER TABLE / RENAME / DROP INDEX / OR-tautology ───────────────────
+
+    #[test]
+    fn alter_table_drop_column_is_detected() {
+        let parsed = parse_postgres("ALTER TABLE users DROP COLUMN email").unwrap();
+        let s = parsed
+            .statements
+            .iter()
+            .find(|s| s.kind == StatementKind::AlterTable)
+            .expect("must detect ALTER TABLE");
+        assert_eq!(s.alter_table_kind, Some(crate::parser::AlterTableKind::DropColumn));
+    }
+
+    #[test]
+    fn alter_table_rename_is_detected() {
+        let parsed = parse_postgres("ALTER TABLE users RENAME TO accounts").unwrap();
+        let s = parsed
+            .statements
+            .iter()
+            .find(|s| s.kind == StatementKind::AlterTable)
+            .expect("must detect ALTER TABLE RENAME");
+        assert_eq!(s.alter_table_kind, Some(crate::parser::AlterTableKind::Rename));
+    }
+
+    #[test]
+    fn drop_index_if_exists_flag() {
+        let with_ie = parse_postgres("DROP INDEX IF EXISTS idx_users_email").unwrap();
+        assert!(with_ie.statements[0].drop_index_if_exists);
+        let without_ie = parse_postgres("DROP INDEX idx_users_email").unwrap();
+        assert!(!without_ie.statements[0].drop_index_if_exists);
+    }
+
+    #[test]
+    fn or_tautology_is_detected() {
+        let parsed = parse_postgres("SELECT * FROM users WHERE id = 1 OR 1=1").unwrap();
+        let select = parsed
+            .statements
+            .iter()
+            .find(|s| s.kind == StatementKind::Select)
+            .expect("must detect the SELECT");
+        assert!(select.has_or_tautology);
+    }
+
+    #[test]
+    fn nested_or_tautology_is_detected() {
+        let parsed = parse_postgres(
+            "SELECT * FROM users WHERE status = 'active' AND (role = 'user' OR 1=1)",
+        )
+        .unwrap();
+        let select = parsed
+            .statements
+            .iter()
+            .find(|s| s.kind == StatementKind::Select)
+            .expect("must detect the SELECT");
+        assert!(select.has_or_tautology);
+    }
+
+    #[test]
+    fn legitimate_or_is_not_tautology() {
+        let parsed =
+            parse_postgres("SELECT * FROM products WHERE category = 'A' OR category = 'B'").unwrap();
+        let select = parsed
+            .statements
+            .iter()
+            .find(|s| s.kind == StatementKind::Select)
+            .expect("must detect the SELECT");
+        assert!(!select.has_or_tautology);
     }
 }
