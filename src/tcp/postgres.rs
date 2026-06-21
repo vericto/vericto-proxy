@@ -70,6 +70,10 @@ async fn run_session(
 
     // ── Phase 2: connect upstream and forward the StartupMessage
     let upstream = TcpStream::connect((config.upstream_host.as_str(), config.upstream_port)).await?;
+    // Disable Nagle's algorithm on the upstream socket. Without this, small
+    // forwarded messages interact with TCP delayed-ACK and incur a ~40ms delay
+    // per round-trip (classic Nagle + delayed-ACK stall).
+    let _ = upstream.set_nodelay(true);
     let (server_read, mut server_write) = upstream.into_split();
     server_write.write_all(&startup_raw).await?;
     server_write.flush().await?;
