@@ -1,0 +1,14 @@
+# Rust build artifacts
+/target
+**/*.rs.bk
+
+# Environment / secrets
+.env
+.env.*
+!.env.example
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
