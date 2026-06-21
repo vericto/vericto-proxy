@@ -68,6 +68,35 @@ curl -X POST http://localhost:5434/evaluate \
 | Oracle     | sqlparser-rs        | ✅        | n/a (OCI) |
 | SQL Server | sqlparser-rs (TSQL) | ✅        | roadmap   |
 
+## Built-in rules
+
+| Code | Detection | Severity |
+|------|-----------|----------|
+| VETRO-001 | DELETE without WHERE | critical |
+| VETRO-003 | DELETE with always-true WHERE (`1=1`) | critical |
+| VETRO-010 | DROP TABLE / DATABASE | critical |
+| VETRO-011 | TRUNCATE TABLE | critical |
+| VETRO-012 | DROP SCHEMA | critical |
+| VETRO-030 | UPDATE without WHERE (primary tables) | critical |
+| VETRO-042 | UPDATE without WHERE | critical |
+| VETRO-090 | OR tautology in WHERE (SQL injection — `OR 1=1`) | critical |
+| VETRO-002 | DELETE with LIMIT 0 (MySQL) | high |
+| VETRO-013 | DROP INDEX without IF EXISTS | high |
+| VETRO-015 | ALTER TABLE DROP COLUMN | high |
+| VETRO-016 | ALTER TABLE RENAME | high |
+| VETRO-031 | UPDATE nested in CTE without WHERE | high |
+| VETRO-033 | DELETE nested in subquery/CTE without WHERE | high |
+| VETRO-040 | INSERT INTO … SELECT without filter | high |
+| VETRO-070 | SLEEP() / PG_SLEEP() | high |
+| VETRO-050 | SELECT without LIMIT | medium |
+| VETRO-051 | SELECT * without WHERE | medium |
+| VETRO-060 | INSERT without explicit columns | medium |
+| VETRO-061 | INSERT batch > 10k rows | medium |
+
+Custom rules are defined as YAML AST conditions (`node_type`, `condition`) and
+evaluated against the same normalized AST. See [CONTRIBUTING.md](CONTRIBUTING.md)
+to propose a new rule.
+
 ## Contributing
 
 We actively welcome new rules, dialect improvements, and parser fixes — this is
