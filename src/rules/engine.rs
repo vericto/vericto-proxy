@@ -1,11 +1,11 @@
-//! Tipos del dominio de reglas y orquestación de la evaluación.
+//! Rule domain types and evaluation orchestration.
 
 use serde::{Deserialize, Serialize};
 
 use crate::parser::ParsedQuery;
 use crate::rules::evaluator;
 
-/// Severidad de una regla. El orden importa: Critical > High > Medium.
+/// Rule severity. Order matters: Critical > High > Medium.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Severity {
@@ -24,25 +24,25 @@ impl Severity {
     }
 }
 
-/// Tipo de regla: estándar (built-in) o custom (definida por el usuario en YAML).
+/// Rule type: standard (built-in) or custom (user-defined in YAML).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RuleType {
     Standard,
     Custom,
 }
 
-/// Una regla activa del workspace, tal como la envía la API.
+/// An active workspace rule, as sent by the API.
 #[derive(Debug, Clone)]
 pub struct Rule {
     pub rule_id: String,
     pub code: String,
     pub severity: Severity,
     pub rule_type: RuleType,
-    /// Condición YAML para reglas custom.
+    /// YAML condition for custom rules.
     pub ast_condition_yaml: Option<String>,
 }
 
-/// Decisión final sobre una query.
+/// Final decision on a query.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "UPPERCASE")]
 pub enum Decision {
@@ -50,7 +50,7 @@ pub enum Decision {
     Blocked,
 }
 
-/// Resultado de la evaluación de una query contra el ruleset activo.
+/// Result of evaluating a query against the active ruleset.
 #[derive(Debug, Clone)]
 pub struct EvaluationOutcome {
     pub decision: Decision,
@@ -76,14 +76,14 @@ impl EvaluationOutcome {
     }
 }
 
-/// El motor de reglas. Evalúa una query parseada contra las reglas activas y
-/// devuelve la violación de mayor severidad (o ALLOWED si ninguna se viola).
+/// The rule engine. Evaluates a parsed query against the active rules and
+/// returns the highest-severity violation (or ALLOWED if none is violated).
 pub struct RuleEngine;
 
 impl RuleEngine {
-    /// Evalúa `parsed` contra `rules`. Las reglas se evalúan todas; gana la
-    /// violación de mayor severidad. El parsing AST ya garantizó que la query
-    /// es sintácticamente válida.
+    /// Evaluates `parsed` against `rules`. All rules are evaluated; the
+    /// highest-severity violation wins. AST parsing has already guaranteed the
+    /// query is syntactically valid.
     pub fn evaluate(parsed: &ParsedQuery, rules: &[Rule]) -> EvaluationOutcome {
         let mut best: Option<(Severity, evaluator::Violation)> = None;
 

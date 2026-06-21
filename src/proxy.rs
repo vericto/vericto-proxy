@@ -1,12 +1,12 @@
-//! Handler de evaluación AST.
+//! AST evaluation handler.
 //!
-//! Expone el endpoint HTTP que consume la API Fastify (`callRustProxy`). Recibe
-//! una query, su dialecto y el ruleset activo del workspace, ejecuta el parsing
-//! AST determinístico y devuelve la decisión de bloqueo o paso.
+//! Exposes the HTTP endpoint consumed by the Fastify API (`callRustProxy`). It
+//! receives a query, its dialect, and the workspace's active ruleset, runs the
+//! deterministic AST parsing, and returns the block-or-allow decision.
 //!
-//! Aunque el componente se llama "proxy TCP" en las specs, el path crítico de
-//! seguridad es este motor de evaluación AST; la terminación del wire-protocol
-//! de Postgres/MySQL delega la decisión a este servicio vía HTTP local.
+//! Although the component is called "TCP proxy" in the specs, the critical
+//! security path is this AST evaluation engine; the Postgres/MySQL wire-protocol
+//! termination delegates the decision to this service over local HTTP.
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -20,7 +20,7 @@ use crate::metrics::Metrics;
 use crate::parser::{parser_for, Dialect};
 use crate::rules::engine::{Decision, Rule, RuleEngine, RuleType, Severity};
 
-/// Estado compartido del servicio.
+/// Shared service state.
 pub struct AppState {
     pub cache: RulesetCache,
     pub metrics: Metrics,
@@ -42,7 +42,7 @@ impl Default for AppState {
 }
 
 // ----------------------------------------------------------------------------
-// DTOs de request/response
+// Request/response DTOs
 // ----------------------------------------------------------------------------
 
 #[derive(Debug, Deserialize)]
@@ -90,14 +90,14 @@ pub struct EvaluateResponse {
 // Handler
 // ----------------------------------------------------------------------------
 
-/// POST /evaluate — evalúa una query contra el ruleset activo.
+/// POST /evaluate — evaluate a query against the active ruleset.
 pub async fn evaluate(
     State(state): State<Arc<AppState>>,
     Json(req): Json<EvaluateRequest>,
 ) -> (StatusCode, Json<EvaluateResponse>) {
     let start = Instant::now();
 
-    // 1) Límite de tamaño de query (fail-closed ante queries gigantes).
+    // 1) Query size limit (fail-closed against oversized queries).
     if req.query.len() > MAX_QUERY_SIZE_BYTES {
         let latency_us = start.elapsed().as_micros() as u64;
         state.metrics.record_blocked(latency_us);
@@ -107,7 +107,7 @@ pub async fn evaluate(
         );
     }
 
-    // 2) Resolver dialecto.
+    // 2) Resolve dialect.
     let dialect = match Dialect::from_str(&req.dialect) {
         Ok(d) => d,
         Err(e) => {
@@ -117,7 +117,7 @@ pub async fn evaluate(
         }
     };
 
-    // 3) Parsing AST. Una query que no parsea se bloquea (fail-closed).
+    // 3) AST parsing. A query that does not parse is blocked (fail-closed).
     let parser = parser_for(dialect);
     let parsed = match parser.parse(&req.query) {
         Ok(p) => p,
@@ -128,10 +128,10 @@ pub async fn evaluate(
         }
     };
 
-    // 4) Resolver el ruleset (con caché por workspace si hay versión).
+    // 4) Resolve the ruleset (with per-workspace cache if a version is present).
     let rules = resolve_rules(&state.cache, &req);
 
-    // 5) Evaluar.
+    // 5) Evaluate.
     let outcome = RuleEngine::evaluate(&parsed, &rules);
     let latency_us = start.elapsed().as_micros() as u64;
     let latency_ms = latency_us as f64 / 1000.0;
@@ -174,7 +174,7 @@ pub async fn evaluate(
     }
 }
 
-/// Resuelve el ruleset desde la caché o lo construye desde el request DTO.
+/// Resolves the ruleset from the cache or builds it from the request DTO.
 fn resolve_rules(cache: &RulesetCache, req: &EvaluateRequest) -> Vec<Rule> {
     if let (Some(ws), Some(version)) = (&req.workspace_id, &req.ruleset_version) {
         if let Some(cached) = cache.get(ws, version) {
@@ -210,9 +210,9 @@ fn parse_severity(s: &str) -> Severity {
     }
 }
 
-/// Respuesta de query bloqueada por error de parsing o validación.
-/// Devuelve 200 con `decision: PARSE_ERROR` para que la API decida la respuesta
-/// HTTP final hacia el cliente.
+/// Response for a query blocked by a parse or validation error.
+/// Returns 200 with `decision: PARSE_ERROR` so the API decides the final HTTP
+/// response to the client.
 fn blocked_parse_error(
     message: String,
     latency_us: u64,

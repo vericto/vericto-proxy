@@ -1,11 +1,11 @@
-//! Métricas del proxy: contadores de decisiones y percentiles de latencia.
+//! Proxy metrics: decision counters and latency percentiles.
 //!
-//! Latencia objetivo: <2ms p99 en el path de parsing + evaluación.
+//! Target latency: <2ms p99 on the parsing + evaluation path.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
-/// Número máximo de muestras de latencia retenidas para el cálculo de percentiles.
+/// Maximum number of latency samples retained for percentile computation.
 const MAX_SAMPLES: usize = 4096;
 
 #[derive(Default)]
@@ -14,7 +14,7 @@ pub struct Metrics {
     allowed: AtomicU64,
     blocked: AtomicU64,
     parse_errors: AtomicU64,
-    /// Muestras de latencia en microsegundos (ventana deslizante).
+    /// Latency samples in microseconds (sliding window).
     latencies_us: Mutex<Vec<u64>>,
 }
 
@@ -50,7 +50,7 @@ impl Metrics {
         }
     }
 
-    /// Devuelve un snapshot de las métricas para el endpoint `/metrics`.
+    /// Returns a snapshot of the metrics for the `/metrics` endpoint.
     pub fn snapshot(&self) -> MetricsSnapshot {
         let (p50_us, p99_us) = self.percentiles();
         MetricsSnapshot {

@@ -1,3 +1,3 @@
-//! Caché en memoria del ruleset por workspace.
+//! In-memory per-workspace ruleset cache.
 
 pub mod ruleset;

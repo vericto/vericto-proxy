@@ -1,9 +1,9 @@
-//! Motor de reglas AST.
+//! AST rule engine.
 //!
-//! - [`engine`]: tipos del dominio (Rule, Severity, Decision) y el `RuleEngine`
-//!   que orquesta la evaluación.
-//! - [`evaluator`]: lógica que evalúa cada regla (built-in y custom) contra el
-//!   AST normalizado.
+//! - [`engine`]: domain types (Rule, Severity, Decision) and the `RuleEngine`
+//!   that orchestrates evaluation.
+//! - [`evaluator`]: logic that evaluates each rule (built-in and custom) against
+//!   the normalized AST.
 
 pub mod engine;
 pub mod evaluator;

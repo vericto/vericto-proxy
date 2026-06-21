@@ -1,39 +1,39 @@
-//! Tipos de error del proxy Vetro.
+//! Vetro proxy error types.
 //!
-//! `ProxyError` cubre los fallos del path de evaluación AST. Los errores de
-//! parsing se tratan de forma especial: una query que no parsea se bloquea por
-//! precaución (fail-closed) y se reporta como `PARSE_ERROR`.
+//! `ProxyError` covers failures in the AST evaluation path. Parse errors get
+//! special treatment: a query that does not parse is blocked as a precaution
+//! (fail-closed) and reported as `PARSE_ERROR`.
 
 use thiserror::Error;
 
-/// Límite de tamaño de query (64KB) impuesto por las coding standards.
+/// Query size limit (64KB) enforced by the coding standards.
 pub const MAX_QUERY_SIZE_BYTES: usize = 64 * 1024;
 
-/// Profundidad máxima del AST que se recorre (50 niveles).
+/// Maximum AST depth that is walked (50 levels).
 pub const MAX_AST_DEPTH: usize = 50;
 
 #[derive(Debug, Error)]
 pub enum ProxyError {
-    /// La query SQL tiene sintaxis inválida o malformada.
-    /// Código de cara al cliente: `VETRO-PARSE-ERROR`.
+    /// The SQL query has invalid or malformed syntax.
+    /// Client-facing code: `VETRO-PARSE-ERROR`.
     #[error("VETRO-PARSE-ERROR: {0}")]
     ParseError(String),
 
-    /// La query excede el tamaño máximo permitido (64KB).
-    #[error("VETRO-QUERY-TOO-LARGE: la query excede el límite de {MAX_QUERY_SIZE_BYTES} bytes")]
+    /// The query exceeds the maximum allowed size (64KB).
+    #[error("VETRO-QUERY-TOO-LARGE: query exceeds the {MAX_QUERY_SIZE_BYTES} byte limit")]
     QueryTooLarge,
 
-    /// El AST excede la profundidad máxima de anidamiento (50 niveles).
-    /// Posible intento de evasión por anidamiento excesivo.
-    #[error("VETRO-AST-TOO-DEEP: el AST excede la profundidad máxima de {MAX_AST_DEPTH} niveles")]
+    /// The AST exceeds the maximum nesting depth (50 levels).
+    /// Possible evasion attempt via excessive nesting.
+    #[error("VETRO-AST-TOO-DEEP: AST exceeds the maximum depth of {MAX_AST_DEPTH} levels")]
     AstTooDeep,
 
-    /// Dialecto no soportado.
-    #[error("VETRO-UNSUPPORTED-DIALECT: dialecto '{0}' no soportado")]
+    /// Unsupported dialect.
+    #[error("VETRO-UNSUPPORTED-DIALECT: dialect '{0}' is not supported")]
     UnsupportedDialect(String),
 
-    /// Una regla custom YAML está malformada.
-    #[error("VETRO-INVALID-RULE: regla custom inválida: {0}")]
+    /// A custom YAML rule is malformed.
+    #[error("VETRO-INVALID-RULE: invalid custom rule: {0}")]
     InvalidCustomRule(String),
 }
 

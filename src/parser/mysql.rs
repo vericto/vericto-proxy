@@ -1,8 +1,8 @@
-//! Parser AST para MySQL.
+//! MySQL AST parser.
 //!
-//! Usa `sqlparser-rs` con `MySqlDialect`, que conoce las particularidades
-//! sintácticas de MySQL — por ejemplo `DELETE ... LIMIT N`, que es válido en
-//! MySQL (y acota el borrado) pero no existe en PostgreSQL.
+//! Uses `sqlparser-rs` with `MySqlDialect`, which understands MySQL-specific
+//! syntax — for example `DELETE ... LIMIT N`, which is valid in MySQL (and
+//! bounds the delete) but does not exist in PostgreSQL.
 
 use crate::error::Result;
 use crate::parser::walk::parse_with_dialect;

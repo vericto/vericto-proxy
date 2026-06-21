@@ -1,13 +1,13 @@
-//! Vetro Proxy — servicio de evaluación AST determinística.
+//! Vetro Proxy — deterministic AST evaluation service.
 //!
-//! Expone un endpoint HTTP local que la API Fastify invoca para decidir si una
-//! query SQL es segura o destructiva, usando parsing AST (pg_query + sqlparser-rs)
-//! sin IA ni heurísticas estocásticas.
+//! Exposes a local HTTP endpoint that the Fastify API calls to decide whether a
+//! SQL query is safe or destructive, using AST parsing (pg_query + sqlparser-rs)
+//! with no AI and no stochastic heuristics.
 //!
-//! Rutas:
-//!   POST /evaluate  — evalúa una query contra el ruleset activo
+//! Routes:
+//!   POST /evaluate  — evaluate a query against the active ruleset
 //!   GET  /health    — health check
-//!   GET  /metrics   — contadores y percentiles de latencia
+//!   GET  /metrics   — counters and latency percentiles
 
 mod cache;
 mod config;
@@ -44,7 +44,7 @@ async fn main() {
         .route("/evaluate", post(proxy::evaluate))
         .route("/health", get(health))
         .route("/metrics", get(metrics_handler))
-        // Límite de cuerpo de request alineado con el tamaño máximo de query (+holgura).
+        // Request body limit aligned with the max query size (+ slack).
         .layer(RequestBodyLimitLayer::new(MAX_QUERY_SIZE_BYTES + 8 * 1024))
         .layer(TraceLayer::new_for_http())
         .with_state(state);
@@ -55,14 +55,14 @@ async fn main() {
         .unwrap_or(5434);
 
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
-    tracing::info!("vetro-proxy AST engine escuchando en http://{addr}");
+    tracing::info!("vetro-proxy AST engine listening on http://{addr}");
 
     let listener = tokio::net::TcpListener::bind(addr)
         .await
-        .expect("no se pudo enlazar al puerto del proxy");
+        .expect("could not bind to the proxy port");
 
-    // Arranca el proxy TCP de PostgreSQL si está configurado el upstream.
-    // Corre en paralelo al servidor HTTP de evaluación AST.
+    // Start the PostgreSQL TCP proxy if the upstream is configured.
+    // It runs in parallel with the AST evaluation HTTP server.
     if let Some(tcp_opts) = tcp::TcpProxyOptions::from_env() {
         // Shared, hot-swappable ruleset. Seeded with the local default so the
         // proxy is protective from the first connection, even before the first
@@ -97,7 +97,7 @@ async fn main() {
             }
             None => {
                 tracing::info!(
-                    "Control-plane link disabled (define VETRO_API_URL y VETRO_API_KEY para activarlo)"
+                    "Control-plane link disabled (set VETRO_API_URL and VETRO_API_KEY to enable it)"
                 );
                 None
             }
@@ -105,18 +105,18 @@ async fn main() {
 
         tokio::spawn(async move {
             if let Err(e) = tcp::run_pg_proxy(tcp_opts, ruleset, telemetry_sink).await {
-                tracing::error!(error = %e, "El proxy TCP de PostgreSQL falló");
+                tracing::error!(error = %e, "The PostgreSQL TCP proxy failed");
             }
         });
     } else {
         tracing::info!(
-            "Proxy TCP de PostgreSQL deshabilitado (define UPSTREAM_PG_HOST para activarlo)"
+            "PostgreSQL TCP proxy disabled (set UPSTREAM_PG_HOST to enable it)"
         );
     }
 
     axum::serve(listener, app)
         .await
-        .expect("el servidor del proxy falló");
+        .expect("the proxy server failed");
 }
 
 async fn health() -> Json<serde_json::Value> {

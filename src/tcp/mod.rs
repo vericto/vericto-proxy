@@ -1,9 +1,9 @@
-//! Proxy TCP transparente del protocolo de wire de PostgreSQL.
+//! Transparent PostgreSQL wire-protocol TCP proxy.
 //!
-//! Permite que cualquier driver/ORM se conecte a Vetro como si fuera Postgres
-//! (solo cambia el host del connection string), sin modificar el código de la
-//! aplicación. Cada query pasa por el motor de evaluación AST antes de llegar a
-//! la base de datos real.
+//! Lets any driver/ORM connect to Vetro as if it were Postgres (only the
+//! connection string host changes), without modifying application code. Every
+//! query passes through the AST evaluation engine before reaching the real
+//! database.
 
 pub mod codec;
 pub mod evaluator;
@@ -16,7 +16,7 @@ use tokio::net::TcpListener;
 use crate::rules::sync::SharedRuleset;
 use crate::tcp::postgres::{handle_connection, PgProxyConfig, TelemetrySink};
 
-/// Configuración de arranque del proxy TCP, resuelta desde entorno.
+/// TCP proxy startup configuration, resolved from the environment.
 pub struct TcpProxyOptions {
     pub listen_port: u16,
     pub upstream_host: String,
@@ -26,8 +26,8 @@ pub struct TcpProxyOptions {
 }
 
 impl TcpProxyOptions {
-    /// Lee la configuración del proxy TCP desde variables de entorno.
-    /// Devuelve `None` si no está configurado el upstream (proxy TCP deshabilitado).
+    /// Reads the TCP proxy configuration from environment variables.
+    /// Returns `None` if the upstream is not configured (TCP proxy disabled).
     pub fn from_env() -> Option<Self> {
         let upstream_host = std::env::var("UPSTREAM_PG_HOST").ok()?;
         let listen_port = std::env::var("PROXY_PG_LISTEN_PORT")
@@ -47,10 +47,10 @@ impl TcpProxyOptions {
     }
 }
 
-/// Arranca el listener del proxy TCP de Postgres. Corre indefinidamente.
+/// Starts the Postgres TCP proxy listener. Runs indefinitely.
 ///
-/// `ruleset` es compartido y recargable por el syncer; `telemetry` es opcional
-/// (None deshabilita el reporte, p.ej. en modo dev/air-gapped).
+/// `ruleset` is shared and reloadable by the syncer; `telemetry` is optional
+/// (None disables reporting, e.g. in dev/air-gapped mode).
 pub async fn run_pg_proxy(
     opts: TcpProxyOptions,
     ruleset: SharedRuleset,
@@ -69,19 +69,19 @@ pub async fn run_pg_proxy(
     tracing::info!(
         listen = %addr,
         upstream = %format!("{}:{}", opts.upstream_host, opts.upstream_port),
-        "Proxy TCP de PostgreSQL escuchando"
+        "PostgreSQL TCP proxy listening"
     );
 
     loop {
         match listener.accept().await {
             Ok((socket, _)) => {
-                // Desactiva el algoritmo de Nagle para minimizar latencia.
+                // Disable Nagle's algorithm to minimize latency.
                 let _ = socket.set_nodelay(true);
                 let config = config.clone();
                 tokio::spawn(handle_connection(socket, config));
             }
             Err(e) => {
-                tracing::warn!(error = %e, "Error aceptando conexión TCP");
+                tracing::warn!(error = %e, "Error accepting TCP connection");
             }
         }
     }

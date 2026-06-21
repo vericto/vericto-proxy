@@ -1,13 +1,14 @@
-//! Parser AST para PostgreSQL.
+//! PostgreSQL AST parser.
 //!
-//! Usa `pg_query` (binding de libpg_query — el parser interno de PostgreSQL) como
-//! parser principal: construye el árbol sintáctico exacto que produciría el motor
-//! y lo recorre en [`crate::parser::pg_ast`] para detectar sentencias destructivas,
-//! incluyendo las anidadas en CTEs data-modifying (`WITH x AS (DELETE ...)`).
+//! Uses `pg_query` (a binding for libpg_query — PostgreSQL's internal parser)
+//! as the primary parser: it builds the exact syntax tree the engine would
+//! produce and walks it in [`crate::parser::pg_ast`] to detect destructive
+//! statements, including those nested in data-modifying CTEs
+//! (`WITH x AS (DELETE ...)`).
 //!
-//! Esto garantiza fidelidad total: lo que Vetro analiza es idéntico a lo que
-//! PostgreSQL ejecutaría, y cualquier query con sintaxis inválida se bloquea como
-//! `PARSE_ERROR` antes de tocar la base de datos.
+//! This guarantees full fidelity: what Vetro analyses is identical to what
+//! PostgreSQL would execute, and any query with invalid syntax is blocked as
+//! `PARSE_ERROR` before reaching the database.
 
 use crate::error::Result;
 use crate::parser::pg_ast;
@@ -29,7 +30,7 @@ impl Default for PostgresParser {
 
 impl SqlParser for PostgresParser {
     fn parse(&self, sql: &str) -> Result<ParsedQuery> {
-        // Parsing AST directo con libpg_query (el parser oficial de PostgreSQL).
+        // Direct AST parsing with libpg_query (PostgreSQL's official parser).
         pg_ast::parse_postgres(sql)
     }
 

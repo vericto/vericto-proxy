@@ -1,20 +1,20 @@
-//! Handler de sesión del proxy TCP de PostgreSQL.
+//! PostgreSQL TCP proxy session handler.
 //!
-//! Termina el protocolo de wire de PostgreSQL de forma transparente: el cliente
-//! (Prisma, SQLAlchemy, psql, ...) se conecta creyendo que habla con Postgres.
-//! El proxy:
-//!   1. Negocia la fase de startup (declina TLS/GSS, reenvía StartupMessage).
-//!   2. Abre una conexión upstream al Postgres real y reenvía el startup.
-//!   3. Relaya server→cliente sin tocar.
-//!   4. Intercepta cliente→server: extrae el SQL de los mensajes Query ('Q') y
-//!      Parse ('P'), lo evalúa con el motor AST y, si es destructivo, responde
-//!      un ErrorResponse nativo SIN reenviar la query al motor real.
+//! Terminates the PostgreSQL wire protocol transparently: the client (Prisma,
+//! SQLAlchemy, psql, ...) connects believing it talks to Postgres. The proxy:
+//!   1. Negotiates the startup phase (declines TLS/GSS, forwards StartupMessage).
+//!   2. Opens an upstream connection to the real Postgres and forwards startup.
+//!   3. Relays server→client untouched.
+//!   4. Intercepts client→server: extracts the SQL from Query ('Q') and Parse
+//!      ('P') messages, evaluates it with the AST engine, and if destructive,
+//!      responds with a native ErrorResponse WITHOUT forwarding the query to the
+//!      real engine.
 //!
-//! Best practices aplicadas:
-//! - Lectura por mensaje completo (read_exact gestiona TCP segmentado).
-//! - Fail-closed: una query que no parsea o un fallo de evaluación bloquea.
-//! - Escritura al cliente serializada con un Mutex (relay + inyección de errores).
-//! - Límites de tamaño de mensaje (codec) para mitigar DoS.
+//! Best practices applied:
+//! - Read by complete message (read_exact handles TCP segmentation).
+//! - Fail-closed: a query that does not parse or an evaluation failure blocks.
+//! - Client writes serialized with a Mutex (relay + error injection).
+//! - Message size limits (codec) to mitigate DoS.
 
 use std::sync::Arc;
 
@@ -31,7 +31,7 @@ use crate::tcp::codec::{
 };
 use crate::tcp::evaluator::{evaluate, TcpDecision};
 
-/// Configuración del proxy TCP de Postgres.
+/// PostgreSQL TCP proxy configuration.
 pub struct PgProxyConfig {
     pub upstream_host: String,
     pub upstream_port: u16,
@@ -49,7 +49,7 @@ pub struct TelemetrySink {
     pub database_id: String,
 }
 
-/// Gestiona una conexión entrante completa. Cualquier error cierra la conexión.
+/// Handles a complete incoming connection. Any error closes the connection.
 pub async fn handle_connection(client: TcpStream, config: Arc<PgProxyConfig>) {
     let peer = client
         .peer_addr()
@@ -57,7 +57,7 @@ pub async fn handle_connection(client: TcpStream, config: Arc<PgProxyConfig>) {
         .unwrap_or_else(|_| "unknown".to_string());
 
     if let Err(e) = run_session(client, config).await {
-        tracing::debug!(peer = %peer, error = %e, "Sesión TCP terminada");
+        tracing::debug!(peer = %peer, error = %e, "TCP session ended");
     }
 }
 
@@ -65,23 +65,23 @@ async fn run_session(
     mut client: TcpStream,
     config: Arc<PgProxyConfig>,
 ) -> std::io::Result<()> {
-    // ── Fase 1: negociar el startup (declinar TLS/GSS hasta recibir StartupMessage)
+    // ── Phase 1: negotiate startup (decline TLS/GSS until StartupMessage arrives)
     let startup_raw = negotiate_startup(&mut client).await?;
 
-    // ── Fase 2: conectar upstream y reenviar el StartupMessage
+    // ── Phase 2: connect upstream and forward the StartupMessage
     let upstream = TcpStream::connect((config.upstream_host.as_str(), config.upstream_port)).await?;
     let (server_read, mut server_write) = upstream.into_split();
     server_write.write_all(&startup_raw).await?;
     server_write.flush().await?;
 
-    // ── Fase 3: split del cliente; el write half se comparte (relay + errores)
+    // ── Phase 3: split the client; the write half is shared (relay + errors)
     let (mut client_read, client_write) = client.into_split();
     let client_write = Arc::new(Mutex::new(client_write));
 
-    // Relay server→cliente (auth, datos, notices) sin interceptar.
+    // Relay server→client (auth, data, notices) without intercepting.
     let relay_handle = tokio::spawn(relay_server_to_client(server_read, client_write.clone()));
 
-    // ── Fase 4: loop de intercepción cliente→server
+    // ── Phase 4: client→server interception loop
     let result = intercept_client_to_server(
         &mut client_read,
         &mut server_write,
@@ -94,14 +94,14 @@ async fn run_session(
     result
 }
 
-/// Declina TLS/GSS y devuelve los bytes crudos del StartupMessage real.
+/// Declines TLS/GSS and returns the raw bytes of the real StartupMessage.
 async fn negotiate_startup(client: &mut TcpStream) -> std::io::Result<Vec<u8>> {
     loop {
         match read_startup_packet(client).await? {
             StartupPacket::SslRequest | StartupPacket::GssRequest => {
-                // Declinamos el cifrado a nivel de proxy ('N'). En un despliegue
-                // con TLS, aquí se haría la terminación TLS. El tráfico
-                // proxy↔upstream va por la red interna confiable.
+                // Decline proxy-level encryption ('N'). In a TLS deployment, TLS
+                // termination would happen here. The proxy↔upstream traffic goes
+                // over the trusted internal network.
                 client.write_all(b"N").await?;
                 client.flush().await?;
             }
@@ -109,7 +109,7 @@ async fn negotiate_startup(client: &mut TcpStream) -> std::io::Result<Vec<u8>> {
                 tracing::debug!(
                     user = ?params.user,
                     database = ?params.database,
-                    "StartupMessage recibido"
+                    "StartupMessage received"
                 );
                 return Ok(raw);
             }
@@ -117,7 +117,7 @@ async fn negotiate_startup(client: &mut TcpStream) -> std::io::Result<Vec<u8>> {
     }
 }
 
-/// Relaya bytes del servidor al cliente sin interceptar.
+/// Relays bytes from the server to the client without intercepting.
 async fn relay_server_to_client(
     mut server_read: OwnedReadHalf,
     client_write: Arc<Mutex<OwnedWriteHalf>>,
@@ -125,7 +125,7 @@ async fn relay_server_to_client(
     let mut buf = vec![0u8; 16 * 1024];
     loop {
         match server_read.read(&mut buf).await {
-            Ok(0) => break, // upstream cerró
+            Ok(0) => break, // upstream closed
             Ok(n) => {
                 let mut writer = client_write.lock().await;
                 if writer.write_all(&buf[..n]).await.is_err() || writer.flush().await.is_err() {
@@ -137,30 +137,30 @@ async fn relay_server_to_client(
     }
 }
 
-/// Loop principal: lee mensajes del cliente, intercepta Query/Parse, reenvía el resto.
+/// Main loop: reads client messages, intercepts Query/Parse, forwards the rest.
 async fn intercept_client_to_server(
     client_read: &mut OwnedReadHalf,
     server_write: &mut OwnedWriteHalf,
     client_write: &Arc<Mutex<OwnedWriteHalf>>,
     config: &PgProxyConfig,
 ) -> std::io::Result<()> {
-    // En el protocolo extendido, si bloqueamos en Parse debemos tragar los
-    // mensajes siguientes hasta el Sync ('S') y entonces enviar ReadyForQuery.
+    // In the extended protocol, if we block at Parse we must swallow the
+    // following messages until Sync ('S') and then send ReadyForQuery.
     let mut skip_until_sync = false;
 
     loop {
         let msg = match read_message(client_read).await? {
             Some(m) => m,
-            None => break, // cliente cerró
+            None => break, // client closed
         };
 
         if skip_until_sync {
             if msg.tag == b'S' {
-                // Sync: cerramos la secuencia extendida abortada.
+                // Sync: close the aborted extended sequence.
                 send_to_client(client_write, &build_ready_for_query()).await?;
                 skip_until_sync = false;
             }
-            continue; // tragar Bind/Describe/Execute/Flush
+            continue; // swallow Bind/Describe/Execute/Flush
         }
 
         match msg.tag {
@@ -181,7 +181,7 @@ async fn intercept_client_to_server(
                 forward(server_write, &msg.encode()).await?;
             }
 
-            // Parse (protocolo extendido)
+            // Parse (extended protocol)
             b'P' => {
                 if let Some(sql) = extract_parse_query(&msg) {
                     let rules = config.ruleset.load();
@@ -207,7 +207,7 @@ async fn intercept_client_to_server(
                 break;
             }
 
-            // Resto (Bind, Execute, Sync, PasswordMessage, etc.): reenviar tal cual.
+            // Rest (Bind, Execute, Sync, PasswordMessage, etc.): forward as-is.
             _ => {
                 forward(server_write, &msg.encode()).await?;
             }
@@ -217,7 +217,7 @@ async fn intercept_client_to_server(
     Ok(())
 }
 
-/// Envía un bloque en el protocolo simple: ErrorResponse + ReadyForQuery.
+/// Sends a block in the simple protocol: ErrorResponse + ReadyForQuery.
 async fn send_block_simple(
     client_write: &Arc<Mutex<OwnedWriteHalf>>,
     rule_code: &str,
@@ -234,9 +234,9 @@ async fn send_block_simple(
 }
 
 fn block_message(rule_code: &str, ast_node_path: &str, suggestion: Option<&str>) -> String {
-    let base = format!("Vetro bloqueó esta query [{rule_code}] — nodo AST: {ast_node_path}");
+    let base = format!("Vetro blocked this query [{rule_code}] — AST node: {ast_node_path}");
     match suggestion {
-        Some(s) => format!("{base}. Sugerencia: {s}"),
+        Some(s) => format!("{base}. Suggestion: {s}"),
         None => base,
     }
 }
@@ -261,7 +261,7 @@ fn log_block(sql: &str, rule_code: &str, ast_node_path: &str) {
         rule_code,
         ast_node_path,
         query_preview = %preview,
-        "Query BLOQUEADA en proxy TCP"
+        "Query BLOCKED at TCP proxy"
     );
 }
 

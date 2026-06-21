@@ -1,8 +1,8 @@
-//! Caché del ruleset activo por workspace.
+//! Per-workspace active ruleset cache.
 //!
-//! La API envía el ruleset en cada request, pero cachearlo evita recompilar las
-//! condiciones YAML de las reglas custom en cada query del mismo workspace. La
-//! entrada se invalida por TTL o cuando cambia la versión del ruleset.
+//! The API sends the ruleset on every request, but caching it avoids
+//! recompiling the YAML conditions of custom rules on every query from the same
+//! workspace. An entry is invalidated by TTL or when the ruleset version changes.
 
 use std::collections::HashMap;
 use std::sync::RwLock;
@@ -10,8 +10,8 @@ use std::time::{Duration, Instant};
 
 use crate::rules::engine::Rule;
 
-/// TTL por defecto de una entrada de caché (5 segundos), alineado con el tiempo
-/// de propagación de reglas custom documentado (<5s).
+/// Default TTL for a cache entry (5 seconds), aligned with the documented
+/// custom-rule propagation time (<5s).
 const DEFAULT_TTL: Duration = Duration::from_secs(5);
 
 struct CacheEntry {
@@ -20,7 +20,7 @@ struct CacheEntry {
     inserted_at: Instant,
 }
 
-/// Caché thread-safe del ruleset por workspace.
+/// Thread-safe per-workspace ruleset cache.
 pub struct RulesetCache {
     inner: RwLock<HashMap<String, CacheEntry>>,
     ttl: Duration,
@@ -34,7 +34,7 @@ impl RulesetCache {
         }
     }
 
-    /// Devuelve el ruleset cacheado si existe, está vigente y la versión coincide.
+    /// Returns the cached ruleset if it exists, is still valid, and the version matches.
     pub fn get(&self, workspace_id: &str, version: &str) -> Option<Vec<Rule>> {
         let guard = self.inner.read().ok()?;
         let entry = guard.get(workspace_id)?;
@@ -47,7 +47,7 @@ impl RulesetCache {
         Some(entry.rules.clone())
     }
 
-    /// Inserta o actualiza el ruleset de un workspace.
+    /// Inserts or updates a workspace's ruleset.
     pub fn put(&self, workspace_id: &str, version: &str, rules: Vec<Rule>) {
         if let Ok(mut guard) = self.inner.write() {
             guard.insert(
@@ -61,7 +61,7 @@ impl RulesetCache {
         }
     }
 
-    /// Invalida explícitamente la entrada de un workspace.
+    /// Explicitly invalidates a workspace's entry.
     pub fn invalidate(&self, workspace_id: &str) {
         if let Ok(mut guard) = self.inner.write() {
             guard.remove(workspace_id);
@@ -75,5 +75,5 @@ impl Default for RulesetCache {
     }
 }
 
-// Nota: `Rule` deriva `Clone`, por lo que `get` devuelve una copia y no mantiene
-// el lock durante la evaluación.
+// Note: `Rule` derives `Clone`, so `get` returns a copy and does not hold the
+// lock during evaluation.

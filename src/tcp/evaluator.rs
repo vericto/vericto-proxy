@@ -1,12 +1,12 @@
-//! Puente entre el proxy TCP y el motor de evaluación AST (in-process).
+//! Bridge between the TCP proxy and the AST evaluation engine (in-process).
 //!
-//! El proxy TCP llama directamente al parser y al `RuleEngine` que ya existen,
-//! sin pasar por HTTP. Esto mantiene la latencia mínima en el path crítico.
+//! The TCP proxy calls the existing parser and `RuleEngine` directly, without
+//! going through HTTP. This keeps latency minimal on the critical path.
 
 use crate::parser::{parser_for, Dialect};
 use crate::rules::engine::{Decision, Rule, RuleEngine, RuleType, Severity};
 
-/// Resultado de evaluar una query en el path TCP.
+/// Result of evaluating a query on the TCP path.
 pub enum TcpDecision {
     Allow,
     Block {
@@ -16,10 +16,10 @@ pub enum TcpDecision {
     },
 }
 
-/// Evalúa una query SQL contra el ruleset dado.
+/// Evaluates a SQL query against the given ruleset.
 ///
-/// Una query que no parsea se bloquea (fail-closed) — igual que en el endpoint
-/// HTTP, no se deja pasar nada potencialmente destructivo.
+/// A query that does not parse is blocked (fail-closed) — same as the HTTP
+/// endpoint, nothing potentially destructive is let through.
 pub fn evaluate(sql: &str, dialect: Dialect, rules: &[Rule]) -> TcpDecision {
     let parser = parser_for(dialect);
     let parsed = match parser.parse(sql) {

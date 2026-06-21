@@ -1,53 +1,53 @@
-//! Codec del protocolo de wire de PostgreSQL (pgwire v3).
+//! PostgreSQL wire-protocol codec (pgwire v3).
 //!
-//! Maneja el framing de mensajes en ambas fases:
-//! - **Startup** (sin byte de tipo): `[Int32 len][Int32 code/version][payload]`
-//! - **Regular** (con byte de tipo): `[Byte1 tag][Int32 len][payload]`
+//! Handles message framing in both phases:
+//! - **Startup** (no type byte): `[Int32 len][Int32 code/version][payload]`
+//! - **Regular** (with type byte): `[Byte1 tag][Int32 len][payload]`
 //!
-//! Referencia: https://www.postgresql.org/docs/current/protocol-message-formats.html
+//! Reference: https://www.postgresql.org/docs/current/protocol-message-formats.html
 
 use tokio::io::{AsyncRead, AsyncReadExt};
 
-/// Código mágico de `SSLRequest` (80877103).
+/// `SSLRequest` magic code (80877103).
 pub const SSL_REQUEST_CODE: i32 = 80_877_103;
-/// Código mágico de `GSSENCRequest` (80877104).
+/// `GSSENCRequest` magic code (80877104).
 pub const GSS_REQUEST_CODE: i32 = 80_877_104;
 
-/// SQLSTATE devuelto al bloquear una query (insufficient_privilege).
+/// SQLSTATE returned when blocking a query (insufficient_privilege).
 pub const SQLSTATE_INSUFFICIENT_PRIVILEGE: &str = "42501";
 
-/// Tamaño máximo de un mensaje aceptado (defensa anti-DoS). 64MB.
+/// Maximum accepted message size (anti-DoS defense). 64MB.
 const MAX_MESSAGE_LEN: usize = 64 * 1024 * 1024;
 
-/// Resultado de leer el mensaje de inicio del cliente.
+/// Result of reading the client's startup message.
 #[derive(Debug)]
 pub enum StartupPacket {
-    /// El cliente pide TLS. Respondemos declinando ('N').
+    /// The client requests TLS. We respond declining ('N').
     SslRequest,
-    /// El cliente pide GSSAPI encryption. Respondemos declinando ('N').
+    /// The client requests GSSAPI encryption. We respond declining ('N').
     GssRequest,
-    /// `StartupMessage` real. Contiene los bytes completos (len + body) para
-    /// reenviar al upstream sin modificar.
+    /// The real `StartupMessage`. Contains the complete bytes (len + body) to
+    /// forward to the upstream unmodified.
     Startup { raw: Vec<u8>, params: StartupParams },
 }
 
-/// Parámetros relevantes extraídos del StartupMessage.
+/// Relevant parameters extracted from the StartupMessage.
 #[derive(Debug, Default, Clone)]
 pub struct StartupParams {
     pub user: Option<String>,
     pub database: Option<String>,
 }
 
-/// Un mensaje del protocolo regular (con tag).
+/// A regular-protocol message (with tag).
 #[derive(Debug, Clone)]
 pub struct PgMessage {
     pub tag: u8,
-    /// Payload sin el tag ni los 4 bytes de longitud.
+    /// Payload without the tag or the 4 length bytes.
     pub body: Vec<u8>,
 }
 
 impl PgMessage {
-    /// Reconstruye los bytes completos del mensaje (tag + len + body) para reenviar.
+    /// Rebuilds the complete message bytes (tag + len + body) for forwarding.
     pub fn encode(&self) -> Vec<u8> {
         let len = (self.body.len() + 4) as i32;
         let mut out = Vec::with_capacity(self.body.len() + 5);
@@ -58,7 +58,7 @@ impl PgMessage {
     }
 }
 
-/// Lee el paquete de inicio del cliente (fase startup, sin byte de tipo).
+/// Reads the client's startup packet (startup phase, no type byte).
 pub async fn read_startup_packet<R>(reader: &mut R) -> std::io::Result<StartupPacket>
 where
     R: AsyncRead + Unpin,
@@ -70,7 +70,7 @@ where
     if len < 8 || (len as usize) > MAX_MESSAGE_LEN {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
-            format!("startup length inválido: {len}"),
+            format!("invalid startup length: {len}"),
         ));
     }
 
@@ -84,7 +84,7 @@ where
         SSL_REQUEST_CODE => Ok(StartupPacket::SslRequest),
         GSS_REQUEST_CODE => Ok(StartupPacket::GssRequest),
         _ => {
-            // StartupMessage real. Reconstruimos los bytes originales para reenviar.
+            // The real StartupMessage. Rebuild the original bytes for forwarding.
             let mut raw = Vec::with_capacity(body_len + 4);
             raw.extend_from_slice(&len_buf);
             raw.extend_from_slice(&body);
@@ -94,7 +94,7 @@ where
     }
 }
 
-/// Parsea los pares clave/valor del StartupMessage (tras los 4 bytes de versión).
+/// Parses the StartupMessage key/value pairs (after the 4 version bytes).
 fn parse_startup_params(body: &[u8]) -> StartupParams {
     let mut params = StartupParams::default();
     let mut parts = body.split(|&b| b == 0).filter(|s| !s.is_empty());
@@ -108,7 +108,7 @@ fn parse_startup_params(body: &[u8]) -> StartupParams {
     params
 }
 
-/// Lee un mensaje del protocolo regular (con tag). Devuelve `None` en EOF limpio.
+/// Reads a regular-protocol message (with tag). Returns `None` on clean EOF.
 pub async fn read_message<R>(reader: &mut R) -> std::io::Result<Option<PgMessage>>
 where
     R: AsyncRead + Unpin,
@@ -127,7 +127,7 @@ where
     if len < 4 || (len as usize) > MAX_MESSAGE_LEN {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
-            format!("message length inválido: {len}"),
+            format!("invalid message length: {len}"),
         ));
     }
 
@@ -138,20 +138,20 @@ where
     Ok(Some(PgMessage { tag: tag[0], body }))
 }
 
-/// Extrae el SQL de un mensaje Simple Query ('Q'): payload = cstring.
+/// Extracts the SQL from a Simple Query message ('Q'): payload = cstring.
 pub fn extract_simple_query(msg: &PgMessage) -> Option<String> {
     cstring_at(&msg.body, 0).map(|(s, _)| s)
 }
 
-/// Extrae el SQL de un mensaje Parse ('P'): [cstring stmt][cstring query][...].
+/// Extracts the SQL from a Parse message ('P'): [cstring stmt][cstring query][...].
 pub fn extract_parse_query(msg: &PgMessage) -> Option<String> {
-    // Primera cstring: nombre del statement (puede estar vacío).
+    // First cstring: statement name (may be empty).
     let (_, after_name) = cstring_at(&msg.body, 0)?;
-    // Segunda cstring: el SQL.
+    // Second cstring: the SQL.
     cstring_at(&msg.body, after_name).map(|(s, _)| s)
 }
 
-/// Lee una cstring (terminada en \0) desde `offset`. Devuelve (string, offset_siguiente).
+/// Reads a cstring (NUL-terminated) from `offset`. Returns (string, next_offset).
 fn cstring_at(buf: &[u8], offset: usize) -> Option<(String, usize)> {
     if offset > buf.len() {
         return None;
@@ -161,20 +161,20 @@ fn cstring_at(buf: &[u8], offset: usize) -> Option<(String, usize)> {
     Some((s, offset + end + 1))
 }
 
-/// Construye un mensaje `ErrorResponse` ('E') del backend.
+/// Builds a backend `ErrorResponse` ('E') message.
 pub fn build_error_response(sqlstate: &str, message: &str) -> Vec<u8> {
     let mut body = Vec::new();
-    // Campos: tipo (1 byte) + valor (cstring). Terminados por un byte 0.
+    // Fields: type (1 byte) + value (cstring). Terminated by a 0 byte.
     let push_field = |body: &mut Vec<u8>, field: u8, value: &str| {
         body.push(field);
         body.extend_from_slice(value.as_bytes());
         body.push(0);
     };
     push_field(&mut body, b'S', "ERROR"); // Severity (localizable)
-    push_field(&mut body, b'V', "ERROR"); // Severity (no localizable)
+    push_field(&mut body, b'V', "ERROR"); // Severity (non-localizable)
     push_field(&mut body, b'C', sqlstate); // SQLSTATE
-    push_field(&mut body, b'M', message); // Mensaje
-    body.push(0); // Terminador de campos
+    push_field(&mut body, b'M', message); // Message
+    body.push(0); // Field terminator
 
     let len = (body.len() + 4) as i32;
     let mut out = Vec::with_capacity(body.len() + 5);
@@ -184,7 +184,7 @@ pub fn build_error_response(sqlstate: &str, message: &str) -> Vec<u8> {
     out
 }
 
-/// Construye un mensaje `ReadyForQuery` ('Z') con estado 'I' (idle).
+/// Builds a `ReadyForQuery` ('Z') message with status 'I' (idle).
 pub fn build_ready_for_query() -> Vec<u8> {
     // tag 'Z' + len(5) + status 'I'
     vec![b'Z', 0, 0, 0, 5, b'I']
@@ -242,13 +242,13 @@ mod tests {
 
     #[test]
     fn error_response_has_sqlstate() {
-        let err = build_error_response(SQLSTATE_INSUFFICIENT_PRIVILEGE, "bloqueada");
+        let err = build_error_response(SQLSTATE_INSUFFICIENT_PRIVILEGE, "blocked");
         assert_eq!(err[0], b'E');
-        // El SQLSTATE 42501 debe estar presente en el payload.
+        // SQLSTATE 42501 must be present in the payload.
         let payload = &err[5..];
         let as_str = String::from_utf8_lossy(payload);
         assert!(as_str.contains("42501"));
-        assert!(as_str.contains("bloqueada"));
+        assert!(as_str.contains("blocked"));
     }
 
     #[test]
