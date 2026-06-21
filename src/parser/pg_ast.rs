@@ -306,7 +306,9 @@ fn operator_name(name: &[Node]) -> Option<String> {
 
 /// Extract the relation name from a `RangeVar`.
 fn relname(range_var: Option<&RangeVar>) -> Option<String> {
-    range_var.map(|rv| rv.relname.clone()).filter(|s| !s.is_empty())
+    range_var
+        .map(|rv| rv.relname.clone())
+        .filter(|s| !s.is_empty())
 }
 
 /// Returns `true` when a SELECT target list contains a `*` wildcard
@@ -376,7 +378,10 @@ mod tests {
     #[test]
     fn delete_one_equals_one() {
         let parsed = parse_postgres("DELETE FROM users WHERE 1 = 1").unwrap();
-        assert_eq!(parsed.statements[0].where_presence, WherePresence::AlwaysTrue);
+        assert_eq!(
+            parsed.statements[0].where_presence,
+            WherePresence::AlwaysTrue
+        );
     }
 
     #[test]
@@ -466,7 +471,10 @@ mod tests {
             .iter()
             .find(|s| s.kind == StatementKind::AlterTable)
             .expect("must detect ALTER TABLE");
-        assert_eq!(s.alter_table_kind, Some(crate::parser::AlterTableKind::DropColumn));
+        assert_eq!(
+            s.alter_table_kind,
+            Some(crate::parser::AlterTableKind::DropColumn)
+        );
     }
 
     #[test]
@@ -477,7 +485,10 @@ mod tests {
             .iter()
             .find(|s| s.kind == StatementKind::AlterTable)
             .expect("must detect ALTER TABLE RENAME");
-        assert_eq!(s.alter_table_kind, Some(crate::parser::AlterTableKind::Rename));
+        assert_eq!(
+            s.alter_table_kind,
+            Some(crate::parser::AlterTableKind::Rename)
+        );
     }
 
     #[test]
@@ -516,7 +527,8 @@ mod tests {
     #[test]
     fn legitimate_or_is_not_tautology() {
         let parsed =
-            parse_postgres("SELECT * FROM products WHERE category = 'A' OR category = 'B'").unwrap();
+            parse_postgres("SELECT * FROM products WHERE category = 'A' OR category = 'B'")
+                .unwrap();
         let select = parsed
             .statements
             .iter()

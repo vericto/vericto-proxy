@@ -90,10 +90,10 @@ async fn main() {
                 let reporter = telemetry::Reporter::new(cp.clone(), queue.clone());
                 tokio::spawn(async move { reporter.run().await });
 
-                tcp_opts.database_id.clone().map(|database_id| tcp::postgres::TelemetrySink {
-                    queue,
-                    database_id,
-                })
+                tcp_opts
+                    .database_id
+                    .clone()
+                    .map(|database_id| tcp::postgres::TelemetrySink { queue, database_id })
             }
             None => {
                 tracing::info!(
@@ -109,9 +109,7 @@ async fn main() {
             }
         });
     } else {
-        tracing::info!(
-            "PostgreSQL TCP proxy disabled (set UPSTREAM_PG_HOST to enable it)"
-        );
+        tracing::info!("PostgreSQL TCP proxy disabled (set UPSTREAM_PG_HOST to enable it)");
     }
 
     axum::serve(listener, app)

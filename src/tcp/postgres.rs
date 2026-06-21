@@ -25,9 +25,8 @@ use tokio::sync::Mutex;
 
 use crate::parser::Dialect;
 use crate::tcp::codec::{
-    build_error_response, build_ready_for_query, extract_parse_query,
-    extract_simple_query, read_message, read_startup_packet, StartupPacket,
-    SQLSTATE_INSUFFICIENT_PRIVILEGE,
+    build_error_response, build_ready_for_query, extract_parse_query, extract_simple_query,
+    read_message, read_startup_packet, StartupPacket, SQLSTATE_INSUFFICIENT_PRIVILEGE,
 };
 use crate::tcp::evaluator::{evaluate, TcpDecision};
 
@@ -61,15 +60,13 @@ pub async fn handle_connection(client: TcpStream, config: Arc<PgProxyConfig>) {
     }
 }
 
-async fn run_session(
-    mut client: TcpStream,
-    config: Arc<PgProxyConfig>,
-) -> std::io::Result<()> {
+async fn run_session(mut client: TcpStream, config: Arc<PgProxyConfig>) -> std::io::Result<()> {
     // ── Phase 1: negotiate startup (decline TLS/GSS until StartupMessage arrives)
     let startup_raw = negotiate_startup(&mut client).await?;
 
     // ── Phase 2: connect upstream and forward the StartupMessage
-    let upstream = TcpStream::connect((config.upstream_host.as_str(), config.upstream_port)).await?;
+    let upstream =
+        TcpStream::connect((config.upstream_host.as_str(), config.upstream_port)).await?;
     // Disable Nagle's algorithm on the upstream socket. Without this, small
     // forwarded messages interact with TCP delayed-ACK and incur a ~40ms delay
     // per round-trip (classic Nagle + delayed-ACK stall).
@@ -86,13 +83,9 @@ async fn run_session(
     let relay_handle = tokio::spawn(relay_server_to_client(server_read, client_write.clone()));
 
     // ── Phase 4: client→server interception loop
-    let result = intercept_client_to_server(
-        &mut client_read,
-        &mut server_write,
-        &client_write,
-        &config,
-    )
-    .await;
+    let result =
+        intercept_client_to_server(&mut client_read, &mut server_write, &client_write, &config)
+            .await;
 
     relay_handle.abort();
     result
@@ -175,10 +168,20 @@ async fn intercept_client_to_server(
                     let rules = config.ruleset.load();
                     let decision = evaluate(&sql, Dialect::Postgres, &rules);
                     report_telemetry(config, &sql, &decision);
-                    if let TcpDecision::Block { rule_code, ast_node_path, suggested_safe_query } = decision {
+                    if let TcpDecision::Block {
+                        rule_code,
+                        ast_node_path,
+                        suggested_safe_query,
+                    } = decision
+                    {
                         log_block(&sql, &rule_code, &ast_node_path);
-                        send_block_simple(client_write, &rule_code, &ast_node_path, suggested_safe_query.as_deref())
-                            .await?;
+                        send_block_simple(
+                            client_write,
+                            &rule_code,
+                            &ast_node_path,
+                            suggested_safe_query.as_deref(),
+                        )
+                        .await?;
                         continue;
                     }
                 }
@@ -191,7 +194,12 @@ async fn intercept_client_to_server(
                     let rules = config.ruleset.load();
                     let decision = evaluate(&sql, Dialect::Postgres, &rules);
                     report_telemetry(config, &sql, &decision);
-                    if let TcpDecision::Block { rule_code, ast_node_path, .. } = decision {
+                    if let TcpDecision::Block {
+                        rule_code,
+                        ast_node_path,
+                        ..
+                    } = decision
+                    {
                         log_block(&sql, &rule_code, &ast_node_path);
                         let err = build_error_response(
                             SQLSTATE_INSUFFICIENT_PRIVILEGE,
@@ -272,13 +280,27 @@ fn log_block(sql: &str, rule_code: &str, ast_node_path: &str) {
 /// Push a telemetry event for an evaluation. Non-blocking and best-effort: if no
 /// sink is configured this is a no-op, and the queue never blocks the SQL path.
 fn report_telemetry(config: &PgProxyConfig, sql: &str, decision: &TcpDecision) {
-    let Some(sink) = &config.telemetry else { return };
+    let Some(sink) = &config.telemetry else {
+        return;
+    };
 
     let (status, rule_code, ast_node_path) = match decision {
         TcpDecision::Allow => ("ALLOWED".to_string(), None, None),
-        TcpDecision::Block { rule_code, ast_node_path, .. } => {
-            let status = if rule_code == "VETRO-PARSE-ERROR" { "PARSE_ERROR" } else { "BLOCKED" };
-            (status.to_string(), Some(rule_code.clone()), Some(ast_node_path.clone()))
+        TcpDecision::Block {
+            rule_code,
+            ast_node_path,
+            ..
+        } => {
+            let status = if rule_code == "VETRO-PARSE-ERROR" {
+                "PARSE_ERROR"
+            } else {
+                "BLOCKED"
+            };
+            (
+                status.to_string(),
+                Some(rule_code.clone()),
+                Some(ast_node_path.clone()),
+            )
         }
     };
 

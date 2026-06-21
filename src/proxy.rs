@@ -101,10 +101,7 @@ pub async fn evaluate(
     if req.query.len() > MAX_QUERY_SIZE_BYTES {
         let latency_us = start.elapsed().as_micros() as u64;
         state.metrics.record_blocked(latency_us);
-        return blocked_parse_error(
-            ProxyError::QueryTooLarge.to_string(),
-            latency_us,
-        );
+        return blocked_parse_error(ProxyError::QueryTooLarge.to_string(), latency_us);
     }
 
     // 2) Resolve dialect.
@@ -213,10 +210,7 @@ fn parse_severity(s: &str) -> Severity {
 /// Response for a query blocked by a parse or validation error.
 /// Returns 200 with `decision: PARSE_ERROR` so the API decides the final HTTP
 /// response to the client.
-fn blocked_parse_error(
-    message: String,
-    latency_us: u64,
-) -> (StatusCode, Json<EvaluateResponse>) {
+fn blocked_parse_error(message: String, latency_us: u64) -> (StatusCode, Json<EvaluateResponse>) {
     (
         StatusCode::OK,
         Json(EvaluateResponse {

@@ -61,19 +61,19 @@ pub fn default_ruleset() -> Vec<Rule> {
         ("VETRO-030", Severity::Critical), // UPDATE without WHERE (primary tables)
         ("VETRO-042", Severity::Critical), // UPDATE without WHERE
         // HIGH
-        ("VETRO-002", Severity::High),     // DELETE with LIMIT 0 (MySQL)
-        ("VETRO-013", Severity::High),     // DROP INDEX without IF EXISTS
-        ("VETRO-015", Severity::High),     // ALTER TABLE DROP COLUMN
-        ("VETRO-016", Severity::High),     // ALTER TABLE RENAME
-        ("VETRO-031", Severity::High),     // UPDATE in CTE without WHERE
-        ("VETRO-033", Severity::High),     // DELETE in subquery without WHERE
-        ("VETRO-040", Severity::High),     // INSERT INTO … SELECT without filter
-        ("VETRO-070", Severity::High),     // SLEEP() / PG_SLEEP()
+        ("VETRO-002", Severity::High), // DELETE with LIMIT 0 (MySQL)
+        ("VETRO-013", Severity::High), // DROP INDEX without IF EXISTS
+        ("VETRO-015", Severity::High), // ALTER TABLE DROP COLUMN
+        ("VETRO-016", Severity::High), // ALTER TABLE RENAME
+        ("VETRO-031", Severity::High), // UPDATE in CTE without WHERE
+        ("VETRO-033", Severity::High), // DELETE in subquery without WHERE
+        ("VETRO-040", Severity::High), // INSERT INTO … SELECT without filter
+        ("VETRO-070", Severity::High), // SLEEP() / PG_SLEEP()
         // MEDIUM
-        ("VETRO-050", Severity::Medium),   // SELECT without LIMIT
-        ("VETRO-051", Severity::Medium),   // SELECT * without WHERE
-        ("VETRO-060", Severity::Medium),   // INSERT without explicit columns
-        ("VETRO-061", Severity::Medium),   // INSERT batch > 10k rows
+        ("VETRO-050", Severity::Medium), // SELECT without LIMIT
+        ("VETRO-051", Severity::Medium), // SELECT * without WHERE
+        ("VETRO-060", Severity::Medium), // INSERT without explicit columns
+        ("VETRO-061", Severity::Medium), // INSERT batch > 10k rows
         // SQL injection
         ("VETRO-090", Severity::Critical), // OR tautology in WHERE (SQL injection)
     ];

@@ -90,7 +90,8 @@ pub async fn run(cfg: ControlPlaneConfig, ruleset: SharedRuleset) {
                     .map(|s| s.to_string());
                 match res.json::<SyncResponse>().await {
                     Ok(body) => {
-                        let rules: Vec<Rule> = body.rules.into_iter().map(ApiRule::into_rule).collect();
+                        let rules: Vec<Rule> =
+                            body.rules.into_iter().map(ApiRule::into_rule).collect();
                         let count = rules.len();
                         ruleset.store(Arc::new(rules));
                         etag = new_etag;

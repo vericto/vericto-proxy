@@ -22,8 +22,8 @@ use sqlparser::parser::Parser as SqlAstParser;
 // ---------------------------------------------------------------------------
 
 pub fn parse_with_dialect<D: SqlDialect>(dialect: &D, sql: &str) -> Result<ParsedQuery> {
-    let statements = SqlAstParser::parse_sql(dialect, sql)
-        .map_err(|e| ProxyError::ParseError(e.to_string()))?;
+    let statements =
+        SqlAstParser::parse_sql(dialect, sql).map_err(|e| ProxyError::ParseError(e.to_string()))?;
 
     let mut collected: Vec<StatementInfo> = Vec::new();
     for stmt in &statements {
@@ -55,7 +55,11 @@ fn walk_statement(
             let presence = where_presence(delete.selection.as_ref());
             let relation = relation_from_delete(delete);
             let delete_limit = delete.limit.as_ref().and_then(expr_as_i64);
-            let tautology = delete.selection.as_ref().map(has_or_tautology).unwrap_or(false);
+            let tautology = delete
+                .selection
+                .as_ref()
+                .map(has_or_tautology)
+                .unwrap_or(false);
 
             out.push(StatementInfo {
                 kind: StatementKind::Delete,
@@ -134,7 +138,9 @@ fn walk_statement(
         }
 
         // ── ALTER TABLE ────────────────────────────────────────────────────
-        Statement::AlterTable { name, operations, .. } => {
+        Statement::AlterTable {
+            name, operations, ..
+        } => {
             for op in operations {
                 use sqlparser::ast::AlterTableOperation;
                 let (kind, path) = match op {
@@ -249,15 +255,20 @@ fn walk_set_expr(
     match set_expr {
         SetExpr::Select(select) => {
             // SELECT * detection
-            let is_star = select.projection.iter().any(|item| {
-                matches!(item, SelectItem::Wildcard(_))
-            });
+            let is_star = select
+                .projection
+                .iter()
+                .any(|item| matches!(item, SelectItem::Wildcard(_)));
 
             // LIMIT detection (in the enclosing Query, but here we get it from select)
             let has_limit = false; // limit is on Query, not Select — handled below
 
             // Tautological OR detection in WHERE
-            let tautology = select.selection.as_ref().map(has_or_tautology).unwrap_or(false);
+            let tautology = select
+                .selection
+                .as_ref()
+                .map(has_or_tautology)
+                .unwrap_or(false);
 
             // WHERE recursion
             if let Some(expr) = select.selection.as_ref() {
@@ -384,11 +395,7 @@ fn walk_expr(expr: &Expr, depth: usize, out: &mut Vec<StatementInfo>) -> Result<
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn walk_with_from_ctes(
-    from: &FromTable,
-    depth: usize,
-    out: &mut Vec<StatementInfo>,
-) -> Result<()> {
+fn walk_with_from_ctes(from: &FromTable, depth: usize, out: &mut Vec<StatementInfo>) -> Result<()> {
     match from {
         FromTable::WithFromKeyword(tables) | FromTable::WithoutKeyword(tables) => {
             for twj in tables {
@@ -601,7 +608,11 @@ mod tests {
     #[test]
     fn select_star_is_detected() {
         let p = parse_pg("SELECT * FROM users");
-        let selects: Vec<_> = p.statements.iter().filter(|s| s.kind == StatementKind::Select).collect();
+        let selects: Vec<_> = p
+            .statements
+            .iter()
+            .filter(|s| s.kind == StatementKind::Select)
+            .collect();
         assert!(!selects.is_empty());
         assert!(selects.iter().any(|s| s.select_is_star));
     }
@@ -609,6 +620,9 @@ mod tests {
     #[test]
     fn safe_select_has_no_destructive_stmt() {
         let p = parse_pg("SELECT * FROM users WHERE id = 1");
-        assert!(p.statements.iter().all(|s| s.kind != StatementKind::Delete && s.kind != StatementKind::Drop));
+        assert!(p
+            .statements
+            .iter()
+            .all(|s| s.kind != StatementKind::Delete && s.kind != StatementKind::Drop));
     }
 }

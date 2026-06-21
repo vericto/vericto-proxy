@@ -157,7 +157,9 @@ fn cstring_at(buf: &[u8], offset: usize) -> Option<(String, usize)> {
         return None;
     }
     let end = buf[offset..].iter().position(|&b| b == 0)?;
-    let s = std::str::from_utf8(&buf[offset..offset + end]).ok()?.to_string();
+    let s = std::str::from_utf8(&buf[offset..offset + end])
+        .ok()?
+        .to_string();
     Some((s, offset + end + 1))
 }
 
@@ -213,7 +215,10 @@ mod tests {
     #[test]
     fn extract_simple_query_works() {
         let msg = simple_query_msg("DELETE FROM users");
-        assert_eq!(extract_simple_query(&msg).as_deref(), Some("DELETE FROM users"));
+        assert_eq!(
+            extract_simple_query(&msg).as_deref(),
+            Some("DELETE FROM users")
+        );
     }
 
     #[test]

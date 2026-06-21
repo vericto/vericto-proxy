@@ -371,11 +371,16 @@ fn relation_matches(actual: &str, expected: &str) -> bool {
 }
 
 fn rel_or_placeholder(stmt: &StatementInfo) -> String {
-    stmt.relation.clone().unwrap_or_else(|| "{table}".to_string())
+    stmt.relation
+        .clone()
+        .unwrap_or_else(|| "{table}".to_string())
 }
 
 fn suggest_delete(stmt: &StatementInfo) -> Option<String> {
-    Some(format!("DELETE FROM {} WHERE id = $1", rel_or_placeholder(stmt)))
+    Some(format!(
+        "DELETE FROM {} WHERE id = $1",
+        rel_or_placeholder(stmt)
+    ))
 }
 
 fn suggest_update(stmt: &StatementInfo) -> Option<String> {
@@ -505,7 +510,10 @@ mod tests {
 
     #[test]
     fn vetro_042_allows_update_with_where() {
-        let p = parse("UPDATE products SET price = 0 WHERE id = 1", Dialect::Postgres);
+        let p = parse(
+            "UPDATE products SET price = 0 WHERE id = 1",
+            Dialect::Postgres,
+        );
         assert!(evaluate_rule(&make_rule("VETRO-042"), &p).is_none());
     }
 
@@ -526,7 +534,10 @@ mod tests {
 
     #[test]
     fn vetro_060_allows_insert_with_columns() {
-        let p = parse("INSERT INTO users (id, name) VALUES (1, 'a')", Dialect::Postgres);
+        let p = parse(
+            "INSERT INTO users (id, name) VALUES (1, 'a')",
+            Dialect::Postgres,
+        );
         assert!(evaluate_rule(&make_rule("VETRO-060"), &p).is_none());
     }
 
@@ -540,26 +551,38 @@ mod tests {
 
     #[test]
     fn vetro_090_blocks_select_with_or_string_tautology() {
-        let p = parse("SELECT * FROM users WHERE name = 'x' OR 'a'='a'", Dialect::Postgres);
+        let p = parse(
+            "SELECT * FROM users WHERE name = 'x' OR 'a'='a'",
+            Dialect::Postgres,
+        );
         assert!(evaluate_rule(&make_rule("VETRO-090"), &p).is_some());
     }
 
     #[test]
     fn vetro_090_blocks_delete_with_or_true() {
-        let p = parse("DELETE FROM sessions WHERE user_id = $1 OR 1=1", Dialect::Postgres);
+        let p = parse(
+            "DELETE FROM sessions WHERE user_id = $1 OR 1=1",
+            Dialect::Postgres,
+        );
         assert!(evaluate_rule(&make_rule("VETRO-090"), &p).is_some());
     }
 
     #[test]
     fn vetro_090_blocks_update_with_or_tautology() {
-        let p = parse("UPDATE users SET role = 'admin' WHERE id = 1 OR 1=1", Dialect::Postgres);
+        let p = parse(
+            "UPDATE users SET role = 'admin' WHERE id = 1 OR 1=1",
+            Dialect::Postgres,
+        );
         assert!(evaluate_rule(&make_rule("VETRO-090"), &p).is_some());
     }
 
     #[test]
     fn vetro_090_allows_select_with_legitimate_or() {
         // Legitimate: OR with two real conditions, neither always-true
-        let p = parse("SELECT * FROM products WHERE category = 'A' OR category = 'B'", Dialect::Postgres);
+        let p = parse(
+            "SELECT * FROM products WHERE category = 'A' OR category = 'B'",
+            Dialect::Postgres,
+        );
         assert!(evaluate_rule(&make_rule("VETRO-090"), &p).is_none());
     }
 
@@ -571,7 +594,10 @@ mod tests {
 
     #[test]
     fn vetro_090_allows_select_with_normal_where() {
-        let p = parse("SELECT * FROM users WHERE id = $1 AND status = 'active'", Dialect::Postgres);
+        let p = parse(
+            "SELECT * FROM users WHERE id = $1 AND status = 'active'",
+            Dialect::Postgres,
+        );
         assert!(evaluate_rule(&make_rule("VETRO-090"), &p).is_none());
     }
 

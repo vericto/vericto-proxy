@@ -55,8 +55,8 @@ impl ControlPlaneConfig {
             _ => BufferMode::Memory,
         };
 
-        let disk_spool_path =
-            std::env::var("VETRO_TELEMETRY_DISK_PATH").unwrap_or_else(|_| "/var/lib/vetro/spool".to_string());
+        let disk_spool_path = std::env::var("VETRO_TELEMETRY_DISK_PATH")
+            .unwrap_or_else(|_| "/var/lib/vetro/spool".to_string());
 
         Some(Self {
             api_url: api_url.trim_end_matches('/').to_string(),

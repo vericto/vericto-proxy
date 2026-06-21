@@ -37,15 +37,17 @@ pub trait EventQueue: Send + Sync {
 pub fn new_queue(cfg: &ControlPlaneConfig) -> Box<dyn EventQueue> {
     match cfg.buffer_mode {
         BufferMode::Memory => Box::new(MemoryQueue::new(cfg.memory_capacity)),
-        BufferMode::Disk => match DiskQueue::new(cfg.disk_spool_path.clone(), cfg.memory_capacity) {
-            Ok(q) => Box::new(q),
-            Err(e) => {
-                // Disk spool unavailable (permissions, missing dir): degrade to
-                // memory rather than failing — telemetry must never break the proxy.
-                tracing::error!(error = %e, "Disk spool init failed; falling back to in-memory telemetry buffer");
-                Box::new(MemoryQueue::new(cfg.memory_capacity))
+        BufferMode::Disk => {
+            match DiskQueue::new(cfg.disk_spool_path.clone(), cfg.memory_capacity) {
+                Ok(q) => Box::new(q),
+                Err(e) => {
+                    // Disk spool unavailable (permissions, missing dir): degrade to
+                    // memory rather than failing — telemetry must never break the proxy.
+                    tracing::error!(error = %e, "Disk spool init failed; falling back to in-memory telemetry buffer");
+                    Box::new(MemoryQueue::new(cfg.memory_capacity))
+                }
             }
-        },
+        }
     }
 }
 
@@ -79,7 +81,10 @@ impl EventQueue for MemoryQueue {
         let mut q = self.inner.lock().unwrap();
         let take = q.len().min(max);
         let events = q.drain(..take).collect();
-        Batch { events, files: Vec::new() }
+        Batch {
+            events,
+            files: Vec::new(),
+        }
     }
 
     fn ack(&self, _batch: &Batch) {
@@ -139,7 +144,11 @@ impl EventQueue for DiskQueue {
         }
         // Name: <occurred_at-ish ordering via event_id is not monotonic>, so use
         // a high-resolution-ish prefix from the event's occurred_at + event_id.
-        let name = format!("{}__{}.json", event.occurred_at.replace([':', '.'], "-"), event.event_id);
+        let name = format!(
+            "{}__{}.json",
+            event.occurred_at.replace([':', '.'], "-"),
+            event.event_id
+        );
         let path = self.dir.join(name);
         match serde_json::to_vec(&event) {
             Ok(bytes) => {
@@ -163,7 +172,10 @@ impl EventQueue for DiskQueue {
                 }
             }
         }
-        Batch { events, files: taken }
+        Batch {
+            events,
+            files: taken,
+        }
     }
 
     fn ack(&self, batch: &Batch) {
