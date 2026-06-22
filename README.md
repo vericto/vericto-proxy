@@ -1,111 +1,172 @@
 # Vetro Proxy
 
-> Deterministic SQL firewall — parse before it burns.
+> Transparent PostgreSQL TCP proxy — deterministic SQL firewall in the wire path.
 
-Vetro Proxy is the open core of [Vetro](https://vetro.dev): a deterministic SQL
-security engine that parses every query into its Abstract Syntax Tree (AST) and
-decides whether it is safe or destructive. No AI, no stochastic heuristics — the
-same input always produces the same result.
+[![CI](https://github.com/donkan168/vetro-proxy/actions/workflows/ci.yml/badge.svg)](https://github.com/donkan168/vetro-proxy/actions/workflows/ci.yml)
+[![License: ELv2](https://img.shields.io/badge/license-Elastic--2.0-blue.svg)](LICENSE)
+[![Rust 1.88+](https://img.shields.io/badge/rust-1.88%2B-orange.svg)](https://www.rust-lang.org)
 
-This repository contains the **AST evaluation engine and rule set**. The hosted
-platform (dashboard, audit trail, notifications, multi-tenancy, billing) is a
-separate commercial product.
+`vetro-proxy` is the **customer-facing TCP wire-protocol proxy**. It intercepts
+every query via the PostgreSQL wire protocol, evaluates it with the
+[vetro-engine](https://github.com/donkan168/vetro-engine) AST parser, and either
+forwards it to the real database or blocks it — all in <2ms.
 
-## Why deterministic?
+No AI, no stochastic heuristics — the same input always produces the same result.
 
-LLM-based or heuristic SQL guards drift: the same query can be allowed today and
-blocked tomorrow. Vetro evaluates a formal AST condition. A query either matches
-a rule or it does not — auditable, reproducible, and fast (<2ms p99).
+> **For HTTP evaluation** (CI/CD dry-runs, dashboard): use
+> [vetro-eval](https://github.com/donkan168/vetro-eval) instead.
 
-## What it does
+---
 
-- Parses SQL into an AST (`pg_query` for PostgreSQL, `sqlparser-rs` for MySQL,
-  Oracle, and SQL Server).
-- Evaluates a normalized AST against a deterministic rule set.
-- Blocks destructive statements: `DELETE`/`UPDATE` without `WHERE`, `DROP`,
-  `TRUNCATE`, OR-tautology SQL injection (`OR 1=1`), and more.
-- Fails closed: a query that does not parse is blocked by default.
+## Architecture position
 
-## Two modes
+```
+Your app / ORM
+     │
+     │  PostgreSQL wire protocol (port 5433)
+     ▼
+ vetro-proxy   ──── vetro-engine (lib) ────►  ALLOWED / BLOCKED
+     │
+     │  (if ALLOWED) forwards query
+     ▼
+ PostgreSQL upstream
+```
 
-1. **HTTP evaluation endpoint** (`POST /evaluate`) — evaluate a query against a
-   rule set without a database connection. Used for CI/CD dry-runs.
-2. **Transparent PostgreSQL TCP proxy** — terminates the Postgres wire protocol.
-   Point your driver at Vetro instead of your database; destructive queries are
-   blocked with a native `SQLSTATE 42501` before they reach the database.
+Point your `DATABASE_URL` host at `vetro-proxy` instead of your real database.
+No code changes required — your ORM/driver is unaware of the proxy.
+
+---
+
+## What it blocks
+
+- `DELETE` / `UPDATE` without `WHERE`
+- `DROP TABLE`, `DROP SCHEMA`, `TRUNCATE`
+- OR-tautology SQL injection (`WHERE id = $1 OR 1=1`)
+- `ALTER TABLE DROP COLUMN` / `RENAME`
+- `INSERT` without explicit column list
+- `SELECT *` without `WHERE`, `SELECT` without `LIMIT`
+- … [full rule list →](https://vetro.dev/rules)
+
+Blocked queries return a native PostgreSQL error `SQLSTATE 42501`
+(insufficient_privilege) — no special handling needed in your application.
+
+---
+
+## Environment variables
+
+### Required
+
+| Variable           | Description                                            |
+|--------------------|--------------------------------------------------------|
+| `UPSTREAM_PG_HOST` | Hostname of the real PostgreSQL database to proxy to  |
+
+### Optional — TCP proxy
+
+| Variable              | Default | Description                                     |
+|-----------------------|---------|------------------------------------------------|
+| `PROXY_PG_LISTEN_PORT`| `5433`  | Port the TCP proxy listens on                  |
+| `UPSTREAM_PG_PORT`    | `5432`  | Port of the upstream PostgreSQL database       |
+
+### Optional — control-plane link (telemetry + rule sync)
+
+When `VETRO_API_URL` and `VETRO_API_KEY` are set, the proxy reports blocked
+queries to the Vetro API and polls the active ruleset every 5 minutes.
+Without them the proxy runs with the built-in default ruleset only (suitable
+for dev / air-gapped deployments).
+
+| Variable                          | Default | Description                                      |
+|-----------------------------------|---------|--------------------------------------------------|
+| `VETRO_API_URL`                   | —       | e.g. `https://api.vetro.dev`                     |
+| `VETRO_API_KEY`                   | —       | Workspace API key (`vtro_...`)                   |
+| `VETRO_DATABASE_ID`               | —       | UUID of the database record in the Vetro platform|
+| `VETRO_RULES_SYNC_INTERVAL_SECS`  | `300`   | How often to poll `/sync/rules` (seconds)        |
+| `VETRO_TELEMETRY_BUFFER`          | `memory`| `memory` or `disk` (survives restarts)           |
+| `VETRO_TELEMETRY_DISK_PATH`       | `/var/lib/vetro/spool` | Spool dir when `buffer_mode=disk`  |
+| `VETRO_TELEMETRY_MEMORY_CAPACITY` | `10000` | Max events in memory ring buffer                 |
+| `VETRO_TELEMETRY_BATCH_SIZE`      | `100`   | Max events per POST `/ingest/events`             |
+| `VETRO_TELEMETRY_FLUSH_SECS`      | `5`     | How often the reporter flushes (seconds)         |
+
+### Observability
+
+| Variable        | Default | Description                                   |
+|-----------------|---------|-----------------------------------------------|
+| `RUST_LOG`      | `info`  | Log level (`info`, `debug`, `trace`)          |
+| `RUST_BACKTRACE`| `0`     | Set to `1` to enable backtraces on panic      |
+
+---
 
 ## Quick start
 
 ```bash
-cargo run                 # starts on :5434 (PROXY_EVAL_PORT)
-cargo test                # unit tests for parsers and rules
+# Run locally (requires a local Postgres on 5432)
+UPSTREAM_PG_HOST=localhost cargo run
+
+# With control-plane link
+UPSTREAM_PG_HOST=localhost \
+VETRO_API_URL=https://api.vetro.dev \
+VETRO_API_KEY=vtro_... \
+VETRO_DATABASE_ID=your-db-uuid \
+cargo run
+
+# Tests
+cargo test
 cargo clippy -- -D warnings
 cargo fmt
 ```
 
-Evaluate a query:
+---
+
+## Docker
 
 ```bash
-curl -X POST http://localhost:5434/evaluate \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "query": "DELETE FROM users",
-    "dialect": "postgres",
-    "workspace_id": "00000000-0000-0000-0000-000000000000",
-    "rules": [
-      { "rule_id": "r1", "code": "VETRO-001", "severity": "critical",
-        "rule_type": "standard", "ast_condition_yaml": null }
-    ]
-  }'
+docker build -t vetro/proxy:local .
+docker run --rm \
+  -e UPSTREAM_PG_HOST=host.docker.internal \
+  -p 5433:5433 \
+  vetro/proxy:local
 ```
 
-## Supported dialects
+In `docker-compose.yml` (vetro-fmw monorepo):
 
-| Dialect    | Parser              | HTTP eval | TCP proxy |
-|------------|---------------------|-----------|-----------|
-| PostgreSQL | pg_query            | ✅        | ✅        |
-| MySQL      | sqlparser-rs        | ✅        | roadmap   |
-| Oracle     | sqlparser-rs        | ✅        | n/a (OCI) |
-| SQL Server | sqlparser-rs (TSQL) | ✅        | roadmap   |
+```yaml
+proxy:
+  image: ${VETRO_PROXY_IMAGE:-ghcr.io/donkan168/vetro-proxy:1.0.0}
+  ports:
+    - "5433:5433"
+  environment:
+    PROXY_PG_LISTEN_PORT: "5433"
+    UPSTREAM_PG_HOST: postgres
+    UPSTREAM_PG_PORT: "5432"
+    # Optional — uncomment for telemetry + rule sync:
+    # VETRO_API_URL: "http://api:4000"
+    # VETRO_API_KEY: "${VETRO_API_KEY}"
+    # VETRO_DATABASE_ID: "${VETRO_DATABASE_ID}"
+```
 
-## Built-in rules
+To build and run a local image:
 
-| Code | Detection | Severity |
-|------|-----------|----------|
-| VETRO-001 | DELETE without WHERE | critical |
-| VETRO-003 | DELETE with always-true WHERE (`1=1`) | critical |
-| VETRO-010 | DROP TABLE / DATABASE | critical |
-| VETRO-011 | TRUNCATE TABLE | critical |
-| VETRO-012 | DROP SCHEMA | critical |
-| VETRO-030 | UPDATE without WHERE (primary tables) | critical |
-| VETRO-042 | UPDATE without WHERE | critical |
-| VETRO-090 | OR tautology in WHERE (SQL injection — `OR 1=1`) | critical |
-| VETRO-002 | DELETE with LIMIT 0 (MySQL) | high |
-| VETRO-013 | DROP INDEX without IF EXISTS | high |
-| VETRO-015 | ALTER TABLE DROP COLUMN | high |
-| VETRO-016 | ALTER TABLE RENAME | high |
-| VETRO-031 | UPDATE nested in CTE without WHERE | high |
-| VETRO-033 | DELETE nested in subquery/CTE without WHERE | high |
-| VETRO-040 | INSERT INTO … SELECT without filter | high |
-| VETRO-070 | SLEEP() / PG_SLEEP() | high |
-| VETRO-050 | SELECT without LIMIT | medium |
-| VETRO-051 | SELECT * without WHERE | medium |
-| VETRO-060 | INSERT without explicit columns | medium |
-| VETRO-061 | INSERT batch > 10k rows | medium |
+```bash
+docker build -t vetro/proxy:local .
+VETRO_PROXY_IMAGE=vetro/proxy:local docker compose up -d proxy
+```
 
-Custom rules are defined as YAML AST conditions (`node_type`, `condition`) and
-evaluated against the same normalized AST. See [CONTRIBUTING.md](CONTRIBUTING.md)
-to propose a new rule.
+---
+
+## Connection strings
+
+| | Connection string |
+|-|-------------------|
+| **Via proxy (protected)** | `postgres://postgres:postgres@localhost:5433/vetro_dev` |
+| **Direct (unprotected)**  | `postgres://postgres:postgres@localhost:54322/vetro_dev` |
+
+---
 
 ## Contributing
 
-We actively welcome new rules, dialect improvements, and parser fixes — this is
-exactly where community knowledge adds the most value. See
-[CONTRIBUTING.md](CONTRIBUTING.md) and our [security policy](SECURITY.md).
+Rules, dialect improvements, and parser fixes are the highest-value community
+contributions. See [CONTRIBUTING.md](CONTRIBUTING.md) and [SECURITY.md](SECURITY.md).
 
 ## License
 
-Vetro Proxy is source-available under the [Elastic License 2.0](LICENSE). You
-may freely use, modify, and redistribute it. You may **not** offer it to third
-parties as a hosted or managed service. For a commercial managed-service
-license, contact hola@vetro.dev.
+Elastic License 2.0 — source-available, no managed-service resale.
+For a commercial license contact [hola@vetro.dev](mailto:hola@vetro.dev).
