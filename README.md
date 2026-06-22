@@ -79,7 +79,7 @@ for dev / air-gapped deployments).
 | `VETRO_API_URL`                   | —       | e.g. `https://api.vetro.dev`                     |
 | `VETRO_API_KEY`                   | —       | Workspace API key (`vtro_...`)                   |
 | `VETRO_DATABASE_ID`               | —       | UUID of the database record in the Vetro platform|
-| `VETRO_RULES_SYNC_INTERVAL_SECS`  | `300`   | How often to poll `/sync/rules` (seconds)        |
+| `VETRO_RULES_SYNC_INTERVAL_SECS`  | `300`   | How often to poll `/sync/rules` (seconds, minimum: 30) |
 | `VETRO_TELEMETRY_BUFFER`          | `memory`| `memory` or `disk` (survives restarts)           |
 | `VETRO_TELEMETRY_DISK_PATH`       | `/var/lib/vetro/spool` | Spool dir when `buffer_mode=disk`  |
 | `VETRO_TELEMETRY_MEMORY_CAPACITY` | `10000` | Max events in memory ring buffer                 |

@@ -10,6 +10,10 @@
 
 use std::time::Duration;
 
+/// Minimum allowed rules-sync polling interval.
+/// Values below this are clamped to prevent excessive API load.
+const RULES_SYNC_MIN_SECS: u64 = 30;
+
 /// Where telemetry events are buffered before delivery.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BufferMode {
@@ -47,7 +51,25 @@ impl ControlPlaneConfig {
         }
 
         let rules_sync_interval = Duration::from_secs(
-            env_u64("VETRO_RULES_SYNC_INTERVAL_SECS").unwrap_or(300), // default: 5 min
+            // Minimum 30 seconds to avoid hammering the API.
+            // Values below the minimum are silently clamped — a warning is logged
+            // so operators can spot the misconfiguration without a hard failure.
+            env_u64("VETRO_RULES_SYNC_INTERVAL_SECS")
+                .map(|v| {
+                    if v < RULES_SYNC_MIN_SECS {
+                        tracing::warn!(
+                            configured = v,
+                            minimum = RULES_SYNC_MIN_SECS,
+                            "VETRO_RULES_SYNC_INTERVAL_SECS is below the minimum — \
+                             clamping to {} seconds",
+                            RULES_SYNC_MIN_SECS
+                        );
+                        RULES_SYNC_MIN_SECS
+                    } else {
+                        v
+                    }
+                })
+                .unwrap_or(300), // default: 5 min
         );
 
         let buffer_mode = match std::env::var("VETRO_TELEMETRY_BUFFER").as_deref() {
