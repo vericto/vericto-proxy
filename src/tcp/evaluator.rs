@@ -3,8 +3,8 @@
 //! The TCP proxy calls the existing parser and `RuleEngine` directly, without
 //! going through HTTP. This keeps latency minimal on the critical path.
 
-use crate::parser::{parser_for, Dialect};
-use crate::rules::engine::{Decision, Rule, RuleEngine, RuleType, Severity};
+use vetro_engine::parser::{parser_for, Dialect};
+use vetro_engine::{Decision, Rule, RuleEngine, RuleType, Severity};
 
 /// Result of evaluating a query on the TCP path.
 pub enum TcpDecision {

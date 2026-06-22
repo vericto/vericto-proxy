@@ -23,7 +23,7 @@ use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
 
-use crate::parser::Dialect;
+use vetro_engine::parser::Dialect;
 use crate::tcp::codec::{
     build_error_response, build_ready_for_query, extract_parse_query, extract_simple_query,
     read_message, read_startup_packet, StartupPacket, SQLSTATE_INSUFFICIENT_PRIVILEGE,
@@ -35,7 +35,7 @@ pub struct PgProxyConfig {
     pub upstream_host: String,
     pub upstream_port: u16,
     /// Hot-swappable ruleset shared with the rule syncer. Read lock-free per query.
-    pub ruleset: crate::rules::sync::SharedRuleset,
+    pub ruleset: crate::tcp::rules_sync::SharedRuleset,
     /// Optional telemetry sink: when set, each evaluation is reported. The
     /// database_id identifies which connected database this proxy fronts.
     pub telemetry: Option<TelemetrySink>,

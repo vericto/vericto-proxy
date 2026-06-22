@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use tokio::net::TcpListener;
 
-use crate::rules::sync::SharedRuleset;
+use crate::tcp::rules_sync::SharedRuleset;
 use crate::tcp::postgres::{handle_connection, PgProxyConfig, TelemetrySink};
 
 /// TCP proxy startup configuration, resolved from the environment.
@@ -86,3 +86,5 @@ pub async fn run_pg_proxy(
         }
     }
 }
+
+pub mod rules_sync;

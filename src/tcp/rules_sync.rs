@@ -12,7 +12,7 @@ use arc_swap::ArcSwap;
 use serde::Deserialize;
 
 use crate::config::ControlPlaneConfig;
-use crate::rules::engine::{Rule, RuleType, Severity};
+use vetro_engine::{Rule, RuleType, Severity};
 
 /// Shared, hot-swappable ruleset.
 pub type SharedRuleset = Arc<ArcSwap<Vec<Rule>>>;
