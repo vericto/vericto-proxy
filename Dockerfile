@@ -6,7 +6,6 @@
 
 # syntax=docker/dockerfile:1.7
 
-# Stage 1: Builder
 FROM rust:1.88-slim-bookworm AS builder
 WORKDIR /app
 
@@ -20,9 +19,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 ENV LIBCLANG_PATH=/usr/lib/llvm-14/lib
-
-# Bust the GHA layer cache so the secret-aware RUN is never served from cache
-ARG CACHEBUST=1
 
 COPY Cargo.toml ./
 RUN --mount=type=secret,id=github_token,required=true \
@@ -39,7 +35,6 @@ RUN --mount=type=secret,id=github_token,required=true \
     && git config --global url."https://${TOKEN}@github.com/".insteadOf "https://github.com/" \
     && touch src/main.rs && cargo build --release
 
-# Stage 2: Runtime
 FROM debian:bookworm-slim AS runner
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
