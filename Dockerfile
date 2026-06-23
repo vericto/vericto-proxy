@@ -1,12 +1,18 @@
 # =============================================================================
 # Vetro Rust AST Proxy — Multi-stage Dockerfile
-# Builder: rust:1.88-slim-bookworm (Debian/glibc — required for bindgen/dlopen)
-# Runner:  debian:bookworm-slim (matches glibc ABI)
+# Uses cargo-chef to cache dependency compilation separately from source.
+#
+# Stages:
+#   chef     — installs cargo-chef tool
+#   planner  — generates recipe.json from Cargo.toml
+#   builder  — compiles deps (cached), then source (fast on rebuilds)
+#   runner   — minimal runtime image
 # =============================================================================
 
 # syntax=docker/dockerfile:1.7
 
-FROM rust:1.88-slim-bookworm AS builder
+# ── Stage 1: install cargo-chef ──────────────────────────────────────────────
+FROM rust:1.88-slim-bookworm AS chef
 WORKDIR /app
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -20,21 +26,31 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 ENV LIBCLANG_PATH=/usr/lib/llvm-14/lib
 
-COPY Cargo.toml ./
-RUN --mount=type=secret,id=github_token,required=true \
-    TOKEN=$(cat /run/secrets/github_token) \
-    && git config --global url."https://${TOKEN}@github.com/".insteadOf "https://github.com/" \
-    && mkdir src && echo 'fn main() {}' > src/main.rs \
-    && cargo generate-lockfile \
-    && cargo build --release \
-    && rm -rf src
+RUN cargo install cargo-chef --locked
 
+# ── Stage 2: generate recipe (dependency fingerprint) ────────────────────────
+FROM chef AS planner
+COPY . .
+RUN --mount=type=secret,id=github_token,required=true \
+    git config --global url."https://$(cat /run/secrets/github_token)@github.com/".insteadOf "https://github.com/" \
+    && cargo chef prepare --recipe-path recipe.json
+
+# ── Stage 3: compile deps (cached layer) + source ────────────────────────────
+FROM chef AS builder
+
+# Deps layer — only invalidated when Cargo.toml changes
+COPY --from=planner /app/recipe.json recipe.json
+RUN --mount=type=secret,id=github_token,required=true \
+    git config --global url."https://$(cat /run/secrets/github_token)@github.com/".insteadOf "https://github.com/" \
+    && cargo chef cook --release --recipe-path recipe.json
+
+# Source layer — only recompiles your code (seconds on rebuilds)
 COPY src ./src
 RUN --mount=type=secret,id=github_token,required=true \
-    TOKEN=$(cat /run/secrets/github_token) \
-    && git config --global url."https://${TOKEN}@github.com/".insteadOf "https://github.com/" \
-    && touch src/main.rs && cargo build --release
+    git config --global url."https://$(cat /run/secrets/github_token)@github.com/".insteadOf "https://github.com/" \
+    && cargo build --release
 
+# ── Stage 4: minimal runtime ──────────────────────────────────────────────────
 FROM debian:bookworm-slim AS runner
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
