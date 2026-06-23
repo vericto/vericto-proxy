@@ -60,6 +60,8 @@ jobs:
           sbom: true
           cache-from: type=gha
           cache-to: type=gha,mode=max
+          build-args: |
+            CACHEBUST=${{ github.run_id }}
           secrets: |
             github_token=${{ secrets.GH_PAT_PRIVATE_REPOS }}
 
