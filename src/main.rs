@@ -22,8 +22,10 @@ mod telemetry;
 use std::sync::Arc;
 use arc_swap::ArcSwap;
 
+use vetro_engine::EnforcementPolicy;
+
 use crate::tcp::evaluator::default_ruleset;
-use crate::tcp::rules_sync::SharedRuleset;
+use crate::tcp::rules_sync::{SharedPolicy, SharedRuleset};
 
 // vetro-engine re-exports through the tcp evaluator module's imports
 
@@ -45,6 +47,12 @@ async fn main() {
     let ruleset: SharedRuleset =
         Arc::new(ArcSwap::from_pointee(default_ruleset()));
 
+    // Shared, hot-swappable enforcement policy. Defaults until the first API
+    // sync (Critical/High → BLOCK, Medium → FLAG, Low/Informational → MONITOR,
+    // parse-error → allow_report).
+    let policy: SharedPolicy =
+        Arc::new(ArcSwap::from_pointee(EnforcementPolicy::default()));
+
     // Control-plane link (telemetry + rule sync) — optional.
     let telemetry_sink = match config::ControlPlaneConfig::from_env() {
         Some(cp) => {
@@ -54,11 +62,13 @@ async fn main() {
                 "Control-plane link enabled (telemetry + rule sync)"
             );
 
-            // Rule syncer: polls GET /sync/rules and swaps the ruleset in place.
+            // Rule syncer: polls GET /sync/rules and swaps the ruleset and
+            // policy in place.
             let sync_cfg = cp.clone();
             let sync_ruleset = ruleset.clone();
+            let sync_policy = policy.clone();
             tokio::spawn(async move {
-                crate::tcp::rules_sync::run(sync_cfg, sync_ruleset).await
+                crate::tcp::rules_sync::run(sync_cfg, sync_ruleset, sync_policy).await
             });
 
             // Telemetry reporter: drains the queue and POSTs to /ingest/events.
@@ -85,7 +95,7 @@ async fn main() {
         "vetro-proxy starting"
     );
 
-    if let Err(e) = tcp::run_pg_proxy(tcp_opts, ruleset, telemetry_sink).await {
+    if let Err(e) = tcp::run_pg_proxy(tcp_opts, ruleset, policy, telemetry_sink).await {
         tracing::error!(error = %e, "The PostgreSQL TCP proxy failed");
         std::process::exit(1);
     }

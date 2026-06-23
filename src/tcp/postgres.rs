@@ -12,7 +12,9 @@
 //!
 //! Best practices applied:
 //! - Read by complete message (read_exact handles TCP segmentation).
-//! - Fail-closed: a query that does not parse or an evaluation failure blocks.
+//! - The enforcement action is resolved by the workspace policy; parse errors
+//!   are fail-open by default (forward + report) unless the policy opts into
+//!   fail-closed.
 //! - Client writes serialized with a Mutex (relay + error injection).
 //! - Message size limits (codec) to mitigate DoS.
 
@@ -24,6 +26,7 @@ use tokio::net::TcpStream;
 use tokio::sync::Mutex;
 
 use vetro_engine::parser::Dialect;
+use vetro_engine::EnforcementAction;
 use crate::tcp::codec::{
     build_error_response, build_ready_for_query, extract_parse_query, extract_simple_query,
     read_message, read_startup_packet, StartupPacket, SQLSTATE_INSUFFICIENT_PRIVILEGE,
@@ -36,6 +39,8 @@ pub struct PgProxyConfig {
     pub upstream_port: u16,
     /// Hot-swappable ruleset shared with the rule syncer. Read lock-free per query.
     pub ruleset: crate::tcp::rules_sync::SharedRuleset,
+    /// Hot-swappable enforcement policy shared with the rule syncer.
+    pub policy: crate::tcp::rules_sync::SharedPolicy,
     /// Optional telemetry sink: when set, each evaluation is reported. The
     /// database_id identifies which connected database this proxy fronts.
     pub telemetry: Option<TelemetrySink>,
@@ -164,14 +169,17 @@ async fn intercept_client_to_server(
             // Simple Query
             b'Q' => {
                 if let Some(sql) = extract_simple_query(&msg) {
-                    // Read the current ruleset lock-free (syncer may swap it).
+                    // Read the current ruleset and policy lock-free (syncer may swap them).
                     let rules = config.ruleset.load();
-                    let decision = evaluate(&sql, Dialect::Postgres, &rules);
+                    let policy = config.policy.load();
+                    let decision = evaluate(&sql, Dialect::Postgres, &rules, &policy);
+                    // Telemetry is emitted before any forwarding (R5.7).
                     report_telemetry(config, &sql, &decision);
                     if let TcpDecision::Block {
                         rule_code,
                         ast_node_path,
                         suggested_safe_query,
+                        ..
                     } = decision
                     {
                         log_block(&sql, &rule_code, &ast_node_path);
@@ -192,7 +200,9 @@ async fn intercept_client_to_server(
             b'P' => {
                 if let Some(sql) = extract_parse_query(&msg) {
                     let rules = config.ruleset.load();
-                    let decision = evaluate(&sql, Dialect::Postgres, &rules);
+                    let policy = config.policy.load();
+                    let decision = evaluate(&sql, Dialect::Postgres, &rules, &policy);
+                    // Telemetry is emitted before any forwarding (R5.7).
                     report_telemetry(config, &sql, &decision);
                     if let TcpDecision::Block {
                         rule_code,
@@ -277,21 +287,65 @@ fn log_block(sql: &str, rule_code: &str, ast_node_path: &str) {
     );
 }
 
-/// Push a telemetry event for an evaluation. Non-blocking and best-effort: if no
-/// sink is configured this is a no-op, and the queue never blocks the SQL path.
-fn report_telemetry(config: &PgProxyConfig, sql: &str, decision: &TcpDecision) {
-    let Some(sink) = &config.telemetry else {
-        return;
-    };
+/// Textual representation of an enforcement action for telemetry.
+fn action_str(action: EnforcementAction) -> &'static str {
+    match action {
+        EnforcementAction::Block => "block",
+        EnforcementAction::Flag => "flag",
+        EnforcementAction::Monitor => "monitor",
+    }
+}
+
+/// Builds a telemetry event from an evaluation decision. Pure (no I/O) so it can
+/// be unit-tested. Returns `None` only when there is nothing to report (never,
+/// currently — every decision maps to a status).
+fn build_telemetry_event(
+    database_id: &str,
+    sql: &str,
+    decision: &TcpDecision,
+) -> crate::telemetry::TelemetryEvent {
+    let mut severity: Option<String> = None;
+    let mut enforcement_action: Option<String> = None;
+    let mut parse_error: Option<String> = None;
 
     let (status, rule_code, ast_node_path) = match decision {
-        TcpDecision::Allow => ("ALLOWED".to_string(), None, None),
+        // No violation: forwarded silently.
+        TcpDecision::Forward { observation: None } => ("ALLOWED".to_string(), None, None),
+
+        // Non-blocking violation (Flag/Monitor) or parse-error allow-report.
+        TcpDecision::Forward {
+            observation: Some(obs),
+        } => {
+            severity = Some(obs.severity.as_str().to_string());
+            enforcement_action = Some(action_str(obs.action).to_string());
+            let status = if obs.parse_error.is_some() {
+                parse_error = obs.parse_error.clone();
+                "PARSE_ERROR"
+            } else {
+                match obs.action {
+                    EnforcementAction::Monitor => "MONITORED",
+                    _ => "FLAGGED",
+                }
+            };
+            (
+                status.to_string(),
+                Some(obs.rule_code.clone()),
+                Some(obs.ast_node_path.clone()),
+            )
+        }
+
+        // Rejected query (or fail-closed parse error).
         TcpDecision::Block {
             rule_code,
             ast_node_path,
+            severity: sev,
             ..
         } => {
+            severity = Some(sev.as_str().to_string());
+            enforcement_action = Some("block".to_string());
             let status = if rule_code == "VETRO-PARSE-ERROR" {
+                // ast_node_path holds "PARSE_ERROR: <msg>".
+                parse_error = Some(ast_node_path.clone());
                 "PARSE_ERROR"
             } else {
                 "BLOCKED"
@@ -304,18 +358,134 @@ fn report_telemetry(config: &PgProxyConfig, sql: &str, decision: &TcpDecision) {
         }
     };
 
-    let event = crate::telemetry::TelemetryEvent {
+    crate::telemetry::TelemetryEvent {
         event_id: uuid::Uuid::new_v4().to_string(),
-        database_id: sink.database_id.clone(),
+        database_id: database_id.to_string(),
         query_text: sql.to_string(),
         dialect: "postgres".to_string(),
         status,
         rule_code,
         ast_node_path,
-        severity: None,
+        severity,
+        enforcement_action,
+        parse_error,
         latency_ms: None,
         client_ip: None,
         occurred_at: chrono::Utc::now().to_rfc3339(),
+    }
+}
+
+/// Push a telemetry event for an evaluation. Non-blocking and best-effort: if no
+/// sink is configured this is a no-op, and the queue never blocks the SQL path.
+fn report_telemetry(config: &PgProxyConfig, sql: &str, decision: &TcpDecision) {
+    let Some(sink) = &config.telemetry else {
+        return;
     };
+    let event = build_telemetry_event(&sink.database_id, sql, decision);
     sink.queue.push(event);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tcp::evaluator::Observation;
+    use vetro_engine::Severity;
+
+    fn forward_observation(action: EnforcementAction) -> TcpDecision {
+        TcpDecision::Forward {
+            observation: Some(Observation {
+                rule_code: "VETRO-050".to_string(),
+                ast_node_path: "SelectStmt".to_string(),
+                severity: Severity::Medium,
+                action,
+                parse_error: None,
+            }),
+        }
+    }
+
+    #[test]
+    fn telemetry_allowed_when_no_observation() {
+        let ev = build_telemetry_event(
+            "db1",
+            "SELECT 1",
+            &TcpDecision::Forward { observation: None },
+        );
+        assert_eq!(ev.status, "ALLOWED");
+        assert!(ev.rule_code.is_none());
+        assert!(ev.enforcement_action.is_none());
+        assert!(ev.severity.is_none());
+    }
+
+    #[test]
+    fn telemetry_flagged_populates_severity_and_action() {
+        let ev = build_telemetry_event(
+            "db1",
+            "SELECT * FROM t",
+            &forward_observation(EnforcementAction::Flag),
+        );
+        assert_eq!(ev.status, "FLAGGED");
+        assert_eq!(ev.enforcement_action.as_deref(), Some("flag"));
+        assert_eq!(ev.severity.as_deref(), Some("medium"));
+        assert_eq!(ev.rule_code.as_deref(), Some("VETRO-050"));
+    }
+
+    #[test]
+    fn telemetry_monitored_includes_rule_code() {
+        let ev = build_telemetry_event(
+            "db1",
+            "INSERT INTO t VALUES (1)",
+            &forward_observation(EnforcementAction::Monitor),
+        );
+        assert_eq!(ev.status, "MONITORED");
+        assert_eq!(ev.enforcement_action.as_deref(), Some("monitor"));
+        assert_eq!(ev.severity.as_deref(), Some("medium"));
+        // MONITOR telemetry carries the rule identifier (R7.4).
+        assert_eq!(ev.rule_code.as_deref(), Some("VETRO-050"));
+    }
+
+    #[test]
+    fn telemetry_blocked_populates_action_block() {
+        let decision = TcpDecision::Block {
+            rule_code: "VETRO-001".to_string(),
+            ast_node_path: "DeleteStmt".to_string(),
+            suggested_safe_query: None,
+            severity: Severity::Critical,
+        };
+        let ev = build_telemetry_event("db1", "DELETE FROM t", &decision);
+        assert_eq!(ev.status, "BLOCKED");
+        assert_eq!(ev.enforcement_action.as_deref(), Some("block"));
+        assert_eq!(ev.severity.as_deref(), Some("critical"));
+        assert_eq!(ev.rule_code.as_deref(), Some("VETRO-001"));
+    }
+
+    #[test]
+    fn telemetry_parse_error_fail_open_carries_message() {
+        let decision = TcpDecision::Forward {
+            observation: Some(Observation {
+                rule_code: "VETRO-PARSE-ERROR".to_string(),
+                ast_node_path: "PARSE_ERROR: boom".to_string(),
+                severity: Severity::Medium,
+                action: EnforcementAction::Flag,
+                parse_error: Some("boom".to_string()),
+            }),
+        };
+        let ev = build_telemetry_event("db1", "@@@", &decision);
+        assert_eq!(ev.status, "PARSE_ERROR");
+        assert_eq!(ev.parse_error.as_deref(), Some("boom"));
+        assert_eq!(ev.enforcement_action.as_deref(), Some("flag"));
+    }
+
+    #[test]
+    fn telemetry_parse_error_fail_closed_is_block() {
+        let decision = TcpDecision::Block {
+            rule_code: "VETRO-PARSE-ERROR".to_string(),
+            ast_node_path: "PARSE_ERROR: boom".to_string(),
+            suggested_safe_query: None,
+            severity: Severity::Medium,
+        };
+        let ev = build_telemetry_event("db1", "@@@", &decision);
+        assert_eq!(ev.status, "PARSE_ERROR");
+        assert_eq!(ev.enforcement_action.as_deref(), Some("block"));
+        assert_eq!(ev.parse_error.as_deref(), Some("PARSE_ERROR: boom"));
+    }
 }

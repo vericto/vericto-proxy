@@ -19,7 +19,7 @@ pub struct TelemetryEvent {
     pub database_id: String,
     pub query_text: String,
     pub dialect: String,
-    /// "ALLOWED" | "BLOCKED" | "PARSE_ERROR"
+    /// "ALLOWED" | "BLOCKED" | "FLAGGED" | "MONITORED" | "PARSE_ERROR"
     pub status: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rule_code: Option<String>,
@@ -27,6 +27,12 @@ pub struct TelemetryEvent {
     pub ast_node_path: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub severity: Option<String>,
+    /// Resolved enforcement action: "block" | "flag" | "monitor".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enforcement_action: Option<String>,
+    /// Parser error message for PARSE_ERROR events.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parse_error: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub latency_ms: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]

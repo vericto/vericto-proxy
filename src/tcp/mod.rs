@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use tokio::net::TcpListener;
 
-use crate::tcp::rules_sync::SharedRuleset;
+use crate::tcp::rules_sync::{SharedPolicy, SharedRuleset};
 use crate::tcp::postgres::{handle_connection, PgProxyConfig, TelemetrySink};
 
 /// TCP proxy startup configuration, resolved from the environment.
@@ -54,12 +54,14 @@ impl TcpProxyOptions {
 pub async fn run_pg_proxy(
     opts: TcpProxyOptions,
     ruleset: SharedRuleset,
+    policy: SharedPolicy,
     telemetry: Option<TelemetrySink>,
 ) -> std::io::Result<()> {
     let config = Arc::new(PgProxyConfig {
         upstream_host: opts.upstream_host.clone(),
         upstream_port: opts.upstream_port,
         ruleset,
+        policy,
         telemetry,
     });
 
