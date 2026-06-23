@@ -4,6 +4,8 @@
 # Runner:  debian:bookworm-slim (matches glibc ABI)
 # =============================================================================
 
+# syntax=docker/dockerfile:1.7
+
 # Stage 1: Builder (Debian — glibc supports dlopen needed by bindgen/pg_query)
 FROM rust:1.88-slim-bookworm AS builder
 WORKDIR /app
@@ -14,21 +16,29 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libssl-dev \
     pkg-config \
     protobuf-compiler \
+    git \
     && rm -rf /var/lib/apt/lists/*
 
 # Tell bindgen where to find libclang.
 ENV LIBCLANG_PATH=/usr/lib/llvm-14/lib
 
 # Cache dep compilation: copy only the manifest, build a dummy binary.
+# Mount the GitHub token secret so Cargo can clone private repos.
 COPY Cargo.toml ./
-RUN mkdir src && echo 'fn main() {}' > src/main.rs \
+RUN --mount=type=secret,id=github_token \
+    git config --global url."https://$(cat /run/secrets/github_token)@github.com/".insteadOf "https://github.com/" \
+    && mkdir src && echo 'fn main() {}' > src/main.rs \
     && cargo generate-lockfile \
     && cargo build --release \
-    && rm -rf src
+    && rm -rf src \
+    && git config --global --unset url."https://$(cat /run/secrets/github_token)@github.com/".insteadOf
 
 # Build the real binary.
 COPY src ./src
-RUN touch src/main.rs && cargo build --release
+RUN --mount=type=secret,id=github_token \
+    git config --global url."https://$(cat /run/secrets/github_token)@github.com/".insteadOf "https://github.com/" \
+    && touch src/main.rs && cargo build --release \
+    && git config --global --unset url."https://$(cat /run/secrets/github_token)@github.com/".insteadOf
 
 # Stage 2: Runtime — minimal Debian (no Rust toolchain, no LLVM)
 FROM debian:bookworm-slim AS runner
