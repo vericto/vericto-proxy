@@ -1,16 +1,12 @@
 name: Release
 
-# Publishes the proxy container image to GitHub Container Registry on every
-# semver tag (e.g. v1.0.0). The private monorepo pins one of these tags in its
-# docker-compose.yml — see docs/PUBLIC-SPLIT.md (Option A).
-
 on:
   push:
     tags: ['v*.*.*']
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository }}   # vetrodev/vetro-proxy
+  IMAGE_NAME: ${{ github.repository }}
 
 jobs:
   publish:
@@ -19,7 +15,7 @@ jobs:
     permissions:
       contents: read
       packages: write
-      id-token: write          # for build provenance attestation
+      id-token: write
     steps:
       - uses: actions/checkout@v4
 
@@ -41,8 +37,6 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          # From tag v1.2.3 produce: 1.2.3, 1.2, 1, and the raw tag.
-          # No `latest` — the monorepo always pins an explicit version.
           tags: |
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
@@ -66,6 +60,8 @@ jobs:
           sbom: true
           cache-from: type=gha
           cache-to: type=gha,mode=max
+          secrets: |
+            github_token=${{ secrets.GH_PAT_PRIVATE_REPOS }}
 
       - name: Summary
         run: |
