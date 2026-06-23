@@ -6,7 +6,7 @@
 
 # syntax=docker/dockerfile:1.7
 
-# Stage 1: Builder (Debian — glibc supports dlopen needed by bindgen/pg_query)
+# Stage 1: Builder
 FROM rust:1.88-slim-bookworm AS builder
 WORKDIR /app
 
@@ -19,28 +19,27 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
     && rm -rf /var/lib/apt/lists/*
 
-# Tell bindgen where to find libclang.
 ENV LIBCLANG_PATH=/usr/lib/llvm-14/lib
 
-# Cache dep compilation: copy only the manifest, build a dummy binary.
-# Mount the GitHub token secret so Cargo can clone private repos.
+# Bust the GHA layer cache so the secret-aware RUN is never served from cache
+ARG CACHEBUST=1
+
 COPY Cargo.toml ./
-RUN --mount=type=secret,id=github_token \
-    git config --global url."https://$(cat /run/secrets/github_token)@github.com/".insteadOf "https://github.com/" \
+RUN --mount=type=secret,id=github_token,required=true \
+    TOKEN=$(cat /run/secrets/github_token) \
+    && git config --global url."https://${TOKEN}@github.com/".insteadOf "https://github.com/" \
     && mkdir src && echo 'fn main() {}' > src/main.rs \
     && cargo generate-lockfile \
     && cargo build --release \
-    && rm -rf src \
-    && git config --global --unset url."https://$(cat /run/secrets/github_token)@github.com/".insteadOf
+    && rm -rf src
 
-# Build the real binary.
 COPY src ./src
-RUN --mount=type=secret,id=github_token \
-    git config --global url."https://$(cat /run/secrets/github_token)@github.com/".insteadOf "https://github.com/" \
-    && touch src/main.rs && cargo build --release \
-    && git config --global --unset url."https://$(cat /run/secrets/github_token)@github.com/".insteadOf
+RUN --mount=type=secret,id=github_token,required=true \
+    TOKEN=$(cat /run/secrets/github_token) \
+    && git config --global url."https://${TOKEN}@github.com/".insteadOf "https://github.com/" \
+    && touch src/main.rs && cargo build --release
 
-# Stage 2: Runtime — minimal Debian (no Rust toolchain, no LLVM)
+# Stage 2: Runtime
 FROM debian:bookworm-slim AS runner
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -49,7 +48,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libssl3 \
     && rm -rf /var/lib/apt/lists/*
 
-# Security: non-root user
 RUN groupadd --system --gid 1001 vetro && \
     useradd --system --uid 1001 --gid vetro vetro
 
@@ -58,8 +56,6 @@ RUN chown vetro:vetro /usr/local/bin/vetro-proxy
 
 USER vetro
 
-# 5434 = HTTP evaluation endpoint (consumed by Fastify API)
-# 5433 = PostgreSQL TCP wire-protocol proxy
 ENV PROXY_EVAL_PORT=5434
 ENV RUST_LOG=info
 ENV RUST_BACKTRACE=0
