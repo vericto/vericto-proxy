@@ -8,6 +8,7 @@
 pub mod codec;
 pub mod evaluator;
 pub mod postgres;
+pub mod upstream;
 
 use std::sync::Arc;
 
@@ -23,6 +24,10 @@ pub struct TcpProxyOptions {
     pub upstream_port: u16,
     /// Database this proxy fronts, used to tag telemetry. Optional.
     pub database_id: Option<String>,
+    /// TLS mode for the proxy→database hop (default: disable).
+    pub upstream_tls: crate::tcp::upstream::UpstreamTlsMode,
+    /// CA bundle (PEM) used to verify the upstream cert in verify-full mode.
+    pub upstream_ca_path: Option<String>,
 }
 
 impl TcpProxyOptions {
@@ -43,6 +48,10 @@ impl TcpProxyOptions {
             upstream_host,
             upstream_port,
             database_id: std::env::var("VETRO_DATABASE_ID").ok(),
+            upstream_tls: crate::tcp::upstream::UpstreamTlsMode::from_env_str(
+                &std::env::var("UPSTREAM_PG_SSLMODE").unwrap_or_default(),
+            ),
+            upstream_ca_path: std::env::var("UPSTREAM_PG_SSLROOTCERT").ok(),
         })
     }
 }
@@ -61,6 +70,8 @@ pub async fn run_pg_proxy(
     let config = Arc::new(PgProxyConfig {
         upstream_host: opts.upstream_host.clone(),
         upstream_port: opts.upstream_port,
+        upstream_tls: opts.upstream_tls,
+        upstream_ca_path: opts.upstream_ca_path.clone(),
         ruleset,
         policy,
         telemetry_mode,
@@ -73,6 +84,7 @@ pub async fn run_pg_proxy(
     tracing::info!(
         listen = %addr,
         upstream = %format!("{}:{}", opts.upstream_host, opts.upstream_port),
+        upstream_tls = ?opts.upstream_tls,
         "PostgreSQL TCP proxy listening"
     );
 

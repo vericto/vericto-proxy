@@ -35,6 +35,10 @@ use crate::tcp::rules_sync::{
 async fn main() {
     init_tracing();
 
+    // Install the process-default rustls crypto provider (ring) before any TLS
+    // is used (upstream TLS client + telemetry/rule-sync HTTPS). Idempotent.
+    let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
+
     let Some(tcp_opts) = tcp::TcpProxyOptions::from_env() else {
         tracing::error!(
             "UPSTREAM_PG_HOST is not set — vetro-proxy requires a PostgreSQL upstream to proxy to. \

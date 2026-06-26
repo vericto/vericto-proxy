@@ -38,6 +38,10 @@ use vetro_engine::EnforcementAction;
 pub struct PgProxyConfig {
     pub upstream_host: String,
     pub upstream_port: u16,
+    /// TLS mode for the proxy→database hop.
+    pub upstream_tls: crate::tcp::upstream::UpstreamTlsMode,
+    /// CA bundle (PEM) for verify-full upstream TLS.
+    pub upstream_ca_path: Option<String>,
     /// Hot-swappable ruleset shared with the rule syncer. Read lock-free per query.
     pub ruleset: crate::tcp::rules_sync::SharedRuleset,
     /// Hot-swappable enforcement policy shared with the rule syncer.
@@ -72,14 +76,14 @@ async fn run_session(mut client: TcpStream, config: Arc<PgProxyConfig>) -> std::
     // ── Phase 1: negotiate startup (decline TLS/GSS until StartupMessage arrives)
     let startup_raw = negotiate_startup(&mut client).await?;
 
-    // ── Phase 2: connect upstream and forward the StartupMessage
-    let upstream =
-        TcpStream::connect((config.upstream_host.as_str(), config.upstream_port)).await?;
-    // Disable Nagle's algorithm on the upstream socket. Without this, small
-    // forwarded messages interact with TCP delayed-ACK and incur a ~40ms delay
-    // per round-trip (classic Nagle + delayed-ACK stall).
-    let _ = upstream.set_nodelay(true);
-    let (server_read, mut server_write) = upstream.into_split();
+    // ── Phase 2: connect upstream (optionally over TLS) and forward the StartupMessage
+    let (server_read, mut server_write) = crate::tcp::upstream::connect_upstream(
+        &config.upstream_host,
+        config.upstream_port,
+        config.upstream_tls,
+        config.upstream_ca_path.as_deref(),
+    )
+    .await?;
     server_write.write_all(&startup_raw).await?;
     server_write.flush().await?;
 
@@ -124,7 +128,7 @@ async fn negotiate_startup(client: &mut TcpStream) -> std::io::Result<Vec<u8>> {
 
 /// Relays bytes from the server to the client without intercepting.
 async fn relay_server_to_client(
-    mut server_read: OwnedReadHalf,
+    mut server_read: crate::tcp::upstream::UpstreamRead,
     client_write: Arc<Mutex<OwnedWriteHalf>>,
 ) {
     let mut buf = vec![0u8; 16 * 1024];
@@ -145,7 +149,7 @@ async fn relay_server_to_client(
 /// Main loop: reads client messages, intercepts Query/Parse, forwards the rest.
 async fn intercept_client_to_server(
     client_read: &mut OwnedReadHalf,
-    server_write: &mut OwnedWriteHalf,
+    server_write: &mut crate::tcp::upstream::UpstreamWrite,
     client_write: &Arc<Mutex<OwnedWriteHalf>>,
     config: &PgProxyConfig,
 ) -> std::io::Result<()> {
@@ -279,7 +283,10 @@ async fn send_to_client(
     writer.flush().await
 }
 
-async fn forward(server_write: &mut OwnedWriteHalf, bytes: &[u8]) -> std::io::Result<()> {
+async fn forward(
+    server_write: &mut crate::tcp::upstream::UpstreamWrite,
+    bytes: &[u8],
+) -> std::io::Result<()> {
     server_write.write_all(bytes).await?;
     server_write.flush().await
 }
