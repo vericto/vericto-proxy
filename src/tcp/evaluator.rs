@@ -63,7 +63,10 @@ pub fn evaluate(
                 },
                 Decision::Flag | Decision::Allow => TcpDecision::Forward {
                     observation: outcome.action.map(|action| Observation {
-                        rule_code: outcome.rule_code.clone().unwrap_or_else(|| "VETRO".to_string()),
+                        rule_code: outcome
+                            .rule_code
+                            .clone()
+                            .unwrap_or_else(|| "VETRO".to_string()),
                         ast_node_path: outcome.ast_node_path.clone().unwrap_or_default(),
                         severity: outcome.severity.unwrap_or(Severity::Medium),
                         action,

@@ -20,18 +20,19 @@
 
 use std::sync::Arc;
 
+use std::time::Instant;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
 
-use vetro_engine::parser::Dialect;
-use vetro_engine::EnforcementAction;
 use crate::tcp::codec::{
     build_error_response, build_ready_for_query, extract_parse_query, extract_simple_query,
     read_message, read_startup_packet, StartupPacket, SQLSTATE_INSUFFICIENT_PRIVILEGE,
 };
 use crate::tcp::evaluator::{evaluate, TcpDecision};
+use vetro_engine::parser::Dialect;
+use vetro_engine::EnforcementAction;
 
 /// PostgreSQL TCP proxy configuration.
 pub struct PgProxyConfig {
@@ -41,6 +42,8 @@ pub struct PgProxyConfig {
     pub ruleset: crate::tcp::rules_sync::SharedRuleset,
     /// Hot-swappable enforcement policy shared with the rule syncer.
     pub policy: crate::tcp::rules_sync::SharedPolicy,
+    /// Hot-swappable telemetry query mode (raw | sanitized) shared with the syncer.
+    pub telemetry_mode: crate::tcp::rules_sync::SharedTelemetryMode,
     /// Optional telemetry sink: when set, each evaluation is reported. The
     /// database_id identifies which connected database this proxy fronts.
     pub telemetry: Option<TelemetrySink>,
@@ -172,9 +175,11 @@ async fn intercept_client_to_server(
                     // Read the current ruleset and policy lock-free (syncer may swap them).
                     let rules = config.ruleset.load();
                     let policy = config.policy.load();
+                    let eval_start = Instant::now();
                     let decision = evaluate(&sql, Dialect::Postgres, &rules, &policy);
+                    let eval_us = eval_start.elapsed().as_micros();
                     // Telemetry is emitted before any forwarding (R5.7).
-                    report_telemetry(config, &sql, &decision);
+                    report_telemetry(config, &sql, &decision, eval_us);
                     if let TcpDecision::Block {
                         rule_code,
                         ast_node_path,
@@ -201,9 +206,11 @@ async fn intercept_client_to_server(
                 if let Some(sql) = extract_parse_query(&msg) {
                     let rules = config.ruleset.load();
                     let policy = config.policy.load();
+                    let eval_start = Instant::now();
                     let decision = evaluate(&sql, Dialect::Postgres, &rules, &policy);
+                    let eval_us = eval_start.elapsed().as_micros();
                     // Telemetry is emitted before any forwarding (R5.7).
-                    report_telemetry(config, &sql, &decision);
+                    report_telemetry(config, &sql, &decision, eval_us);
                     if let TcpDecision::Block {
                         rule_code,
                         ast_node_path,
@@ -303,6 +310,7 @@ fn build_telemetry_event(
     database_id: &str,
     sql: &str,
     decision: &TcpDecision,
+    latency_us: u128,
 ) -> crate::telemetry::TelemetryEvent {
     let mut severity: Option<String> = None;
     let mut enforcement_action: Option<String> = None;
@@ -369,7 +377,7 @@ fn build_telemetry_event(
         severity,
         enforcement_action,
         parse_error,
-        latency_ms: None,
+        latency_ms: Some(latency_us as f64 / 1000.0),
         client_ip: None,
         occurred_at: chrono::Utc::now().to_rfc3339(),
     }
@@ -377,12 +385,34 @@ fn build_telemetry_event(
 
 /// Push a telemetry event for an evaluation. Non-blocking and best-effort: if no
 /// sink is configured this is a no-op, and the queue never blocks the SQL path.
-fn report_telemetry(config: &PgProxyConfig, sql: &str, decision: &TcpDecision) {
+fn report_telemetry(config: &PgProxyConfig, sql: &str, decision: &TcpDecision, latency_us: u128) {
+    use crate::tcp::rules_sync::TelemetryQueryMode;
+
     let Some(sink) = &config.telemetry else {
         return;
     };
-    let event = build_telemetry_event(&sink.database_id, sql, decision);
+
+    // Privacy: when the workspace policy selects "sanitized", normalize literals
+    // to placeholders before the query text leaves the customer network. Rule
+    // evaluation already happened on the full query — this only affects reporting.
+    let reported_sql: std::borrow::Cow<'_, str> = match **config.telemetry_mode.load() {
+        TelemetryQueryMode::Raw => std::borrow::Cow::Borrowed(sql),
+        TelemetryQueryMode::Sanitized => std::borrow::Cow::Owned(sanitize_query(sql)),
+    };
+
+    let event = build_telemetry_event(&sink.database_id, &reported_sql, decision, latency_us);
     sink.queue.push(event);
+}
+
+/// Normalizes a SQL statement so no user data (literals) is reported: constants
+/// are replaced with placeholders ($1, $2, …) via libpg_query. If the query
+/// cannot be parsed (e.g. malformed SQL), nothing is leaked — a fixed redaction
+/// marker is returned instead of the raw text.
+fn sanitize_query(sql: &str) -> String {
+    match pg_query::normalize(sql) {
+        Ok(normalized) => normalized,
+        Err(_) => "<unparseable query redacted>".to_string(),
+    }
 }
 
 #[cfg(test)]
@@ -409,6 +439,7 @@ mod tests {
             "db1",
             "SELECT 1",
             &TcpDecision::Forward { observation: None },
+            42,
         );
         assert_eq!(ev.status, "ALLOWED");
         assert!(ev.rule_code.is_none());
@@ -422,6 +453,7 @@ mod tests {
             "db1",
             "SELECT * FROM t",
             &forward_observation(EnforcementAction::Flag),
+            150,
         );
         assert_eq!(ev.status, "FLAGGED");
         assert_eq!(ev.enforcement_action.as_deref(), Some("flag"));
@@ -435,6 +467,7 @@ mod tests {
             "db1",
             "INSERT INTO t VALUES (1)",
             &forward_observation(EnforcementAction::Monitor),
+            200,
         );
         assert_eq!(ev.status, "MONITORED");
         assert_eq!(ev.enforcement_action.as_deref(), Some("monitor"));
@@ -451,7 +484,7 @@ mod tests {
             suggested_safe_query: None,
             severity: Severity::Critical,
         };
-        let ev = build_telemetry_event("db1", "DELETE FROM t", &decision);
+        let ev = build_telemetry_event("db1", "DELETE FROM t", &decision, 80);
         assert_eq!(ev.status, "BLOCKED");
         assert_eq!(ev.enforcement_action.as_deref(), Some("block"));
         assert_eq!(ev.severity.as_deref(), Some("critical"));
@@ -469,7 +502,7 @@ mod tests {
                 parse_error: Some("boom".to_string()),
             }),
         };
-        let ev = build_telemetry_event("db1", "@@@", &decision);
+        let ev = build_telemetry_event("db1", "@@@", &decision, 10);
         assert_eq!(ev.status, "PARSE_ERROR");
         assert_eq!(ev.parse_error.as_deref(), Some("boom"));
         assert_eq!(ev.enforcement_action.as_deref(), Some("flag"));
@@ -483,9 +516,26 @@ mod tests {
             suggested_safe_query: None,
             severity: Severity::Medium,
         };
-        let ev = build_telemetry_event("db1", "@@@", &decision);
+        let ev = build_telemetry_event("db1", "@@@", &decision, 10);
         assert_eq!(ev.status, "PARSE_ERROR");
         assert_eq!(ev.enforcement_action.as_deref(), Some("block"));
         assert_eq!(ev.parse_error.as_deref(), Some("PARSE_ERROR: boom"));
+    }
+
+    #[test]
+    fn sanitize_query_normalizes_literals() {
+        let out =
+            sanitize_query("DELETE FROM users WHERE email = 'alice@acme.com' AND tenant_id = 42");
+        // Literals are replaced with placeholders; no user data remains.
+        assert!(out.contains("$1"), "expected placeholder, got: {out}");
+        assert!(out.contains("$2"), "expected placeholder, got: {out}");
+        assert!(!out.contains("alice@acme.com"), "PII leaked: {out}");
+    }
+
+    #[test]
+    fn sanitize_query_redacts_unparseable() {
+        // Malformed SQL must not leak — a fixed marker is returned instead.
+        let out = sanitize_query("SELEC * FORM users WHER id = 1");
+        assert_eq!(out, "<unparseable query redacted>");
     }
 }

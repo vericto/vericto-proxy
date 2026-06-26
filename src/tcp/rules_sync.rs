@@ -13,13 +13,38 @@ use arc_swap::ArcSwap;
 use serde::Deserialize;
 
 use crate::config::ControlPlaneConfig;
-use vetro_engine::{EnforcementAction, EnforcementPolicy, ParseErrorAction, Rule, RuleType, Severity};
+use vetro_engine::{
+    EnforcementAction, EnforcementPolicy, ParseErrorAction, Rule, RuleType, Severity,
+};
 
 /// Shared, hot-swappable ruleset.
 pub type SharedRuleset = Arc<ArcSwap<Vec<Rule>>>;
 
 /// Shared, hot-swappable enforcement policy (swapped together with the ruleset).
 pub type SharedPolicy = Arc<ArcSwap<EnforcementPolicy>>;
+
+/// How query text is reported in telemetry. Swapped together with the policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TelemetryQueryMode {
+    /// Report the full query text (default; max forensic detail).
+    #[default]
+    Raw,
+    /// Normalize literals to placeholders before reporting (no user data leaves).
+    Sanitized,
+}
+
+impl TelemetryQueryMode {
+    /// Parses the API token; anything other than "sanitized" is `Raw` (safe default).
+    fn from_api(raw: Option<&str>) -> Self {
+        match raw.map(|s| s.to_ascii_lowercase()) {
+            Some(ref s) if s == "sanitized" => TelemetryQueryMode::Sanitized,
+            _ => TelemetryQueryMode::Raw,
+        }
+    }
+}
+
+/// Shared, hot-swappable telemetry query mode (swapped together with the policy).
+pub type SharedTelemetryMode = Arc<ArcSwap<TelemetryQueryMode>>;
 
 #[derive(Debug, Deserialize)]
 struct SyncResponse {
@@ -59,6 +84,9 @@ struct ApiPolicy {
     parse_error_action: Option<String>,
     #[serde(default)]
     monitor_mode: bool,
+    /// "raw" | "sanitized" — how query text is reported in telemetry.
+    #[serde(default)]
+    telemetry_query_mode: Option<String>,
 }
 
 impl ApiRule {
@@ -96,7 +124,10 @@ fn parse_action(raw: &str) -> EnforcementAction {
         "flag" => EnforcementAction::Flag,
         "monitor" => EnforcementAction::Monitor,
         other => {
-            tracing::warn!(action = other, "unknown enforcement action, defaulting to flag");
+            tracing::warn!(
+                action = other,
+                "unknown enforcement action, defaulting to flag"
+            );
             EnforcementAction::Flag
         }
     }
@@ -136,7 +167,12 @@ fn build_policy(api: Option<ApiPolicy>) -> EnforcementPolicy {
 /// Runs forever: polls the API on the configured interval and swaps the ruleset
 /// and policy when they change. Failures are logged; the last-good ruleset and
 /// policy stay in effect.
-pub async fn run(cfg: ControlPlaneConfig, ruleset: SharedRuleset, policy: SharedPolicy) {
+pub async fn run(
+    cfg: ControlPlaneConfig,
+    ruleset: SharedRuleset,
+    policy: SharedPolicy,
+    telemetry_mode: SharedTelemetryMode,
+) {
     let url = format!("{}/api/v1/sync/rules", cfg.api_url);
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
@@ -166,16 +202,23 @@ pub async fn run(cfg: ControlPlaneConfig, ruleset: SharedRuleset, policy: Shared
                     .map(|s| s.to_string());
                 match res.json::<SyncResponse>().await {
                     Ok(body) => {
+                        let new_mode = TelemetryQueryMode::from_api(
+                            body.policy
+                                .as_ref()
+                                .and_then(|p| p.telemetry_query_mode.as_deref()),
+                        );
                         let new_policy = build_policy(body.policy);
                         let rules: Vec<Rule> =
                             body.rules.into_iter().map(ApiRule::into_rule).collect();
                         let count = rules.len();
                         ruleset.store(Arc::new(rules));
                         policy.store(Arc::new(new_policy));
+                        telemetry_mode.store(Arc::new(new_mode));
                         etag = new_etag;
                         tracing::info!(
                             count,
                             monitor_mode = new_policy.monitor_mode,
+                            telemetry_query_mode = ?new_mode,
                             "Ruleset and policy updated from API"
                         );
                     }
@@ -210,6 +253,7 @@ mod tests {
             severity_actions,
             parse_error_action: Some("block".to_string()),
             monitor_mode: true,
+            telemetry_query_mode: None,
         };
         let policy = build_policy(Some(api));
         // Overridden level.
@@ -250,5 +294,27 @@ mod tests {
         let rule = api.into_rule();
         assert_eq!(rule.severity, Severity::Medium);
         assert_eq!(rule.default_action, EnforcementAction::Flag);
+    }
+
+    #[test]
+    fn telemetry_query_mode_parses_from_api() {
+        assert_eq!(
+            TelemetryQueryMode::from_api(Some("sanitized")),
+            TelemetryQueryMode::Sanitized
+        );
+        assert_eq!(
+            TelemetryQueryMode::from_api(Some("SANITIZED")),
+            TelemetryQueryMode::Sanitized
+        );
+        assert_eq!(
+            TelemetryQueryMode::from_api(Some("raw")),
+            TelemetryQueryMode::Raw
+        );
+        assert_eq!(
+            TelemetryQueryMode::from_api(Some("bogus")),
+            TelemetryQueryMode::Raw
+        );
+        assert_eq!(TelemetryQueryMode::from_api(None), TelemetryQueryMode::Raw);
+        assert_eq!(TelemetryQueryMode::default(), TelemetryQueryMode::Raw);
     }
 }
