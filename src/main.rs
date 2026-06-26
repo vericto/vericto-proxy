@@ -19,20 +19,25 @@ mod config;
 mod tcp;
 mod telemetry;
 
-use std::sync::Arc;
 use arc_swap::ArcSwap;
+use std::sync::Arc;
 
 use vetro_engine::EnforcementPolicy;
 
 use crate::tcp::evaluator::default_ruleset;
-use crate::tcp::rules_sync::{SharedPolicy, SharedRuleset};
+use crate::tcp::rules_sync::{
+    SharedPolicy, SharedRuleset, SharedTelemetryMode, TelemetryQueryMode,
+};
 
 // vetro-engine re-exports through the tcp evaluator module's imports
-
 
 #[tokio::main]
 async fn main() {
     init_tracing();
+
+    // Install the process-default rustls crypto provider (ring) before any TLS
+    // is used (upstream TLS client + telemetry/rule-sync HTTPS). Idempotent.
+    let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
 
     let Some(tcp_opts) = tcp::TcpProxyOptions::from_env() else {
         tracing::error!(
@@ -44,14 +49,17 @@ async fn main() {
 
     // Shared, hot-swappable ruleset seeded with the built-in critical rules.
     // Protective from the first connection even before the first API sync.
-    let ruleset: SharedRuleset =
-        Arc::new(ArcSwap::from_pointee(default_ruleset()));
+    let ruleset: SharedRuleset = Arc::new(ArcSwap::from_pointee(default_ruleset()));
 
     // Shared, hot-swappable enforcement policy. Defaults until the first API
     // sync (Critical/High → BLOCK, Medium → FLAG, Low/Informational → MONITOR,
     // parse-error → allow_report).
-    let policy: SharedPolicy =
-        Arc::new(ArcSwap::from_pointee(EnforcementPolicy::default()));
+    let policy: SharedPolicy = Arc::new(ArcSwap::from_pointee(EnforcementPolicy::default()));
+
+    // Shared, hot-swappable telemetry query mode. Defaults to Raw until the
+    // first API sync resolves the workspace's reporting privacy preference.
+    let telemetry_mode: SharedTelemetryMode =
+        Arc::new(ArcSwap::from_pointee(TelemetryQueryMode::default()));
 
     // Control-plane link (telemetry + rule sync) — optional.
     let telemetry_sink = match config::ControlPlaneConfig::from_env() {
@@ -67,8 +75,15 @@ async fn main() {
             let sync_cfg = cp.clone();
             let sync_ruleset = ruleset.clone();
             let sync_policy = policy.clone();
+            let sync_telemetry_mode = telemetry_mode.clone();
             tokio::spawn(async move {
-                crate::tcp::rules_sync::run(sync_cfg, sync_ruleset, sync_policy).await
+                crate::tcp::rules_sync::run(
+                    sync_cfg,
+                    sync_ruleset,
+                    sync_policy,
+                    sync_telemetry_mode,
+                )
+                .await
             });
 
             // Telemetry reporter: drains the queue and POSTs to /ingest/events.
@@ -95,7 +110,9 @@ async fn main() {
         "vetro-proxy starting"
     );
 
-    if let Err(e) = tcp::run_pg_proxy(tcp_opts, ruleset, policy, telemetry_sink).await {
+    if let Err(e) =
+        tcp::run_pg_proxy(tcp_opts, ruleset, policy, telemetry_mode, telemetry_sink).await
+    {
         tracing::error!(error = %e, "The PostgreSQL TCP proxy failed");
         std::process::exit(1);
     }

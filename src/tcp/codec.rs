@@ -22,7 +22,8 @@ const MAX_MESSAGE_LEN: usize = 64 * 1024 * 1024;
 /// Result of reading the client's startup message.
 #[derive(Debug)]
 pub enum StartupPacket {
-    /// The client requests TLS. We respond declining ('N').
+    /// The client requests TLS. The proxy answers 'S' (terminate TLS) when
+    /// client TLS is enabled, otherwise 'N' (decline).
     SslRequest,
     /// The client requests GSSAPI encryption. We respond declining ('N').
     GssRequest,

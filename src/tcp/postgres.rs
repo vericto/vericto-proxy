@@ -20,27 +20,41 @@
 
 use std::sync::Arc;
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
+use std::time::Instant;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
 
-use vetro_engine::parser::Dialect;
-use vetro_engine::EnforcementAction;
+use crate::tcp::client_tls::{ClientRead, ClientWrite};
 use crate::tcp::codec::{
     build_error_response, build_ready_for_query, extract_parse_query, extract_simple_query,
     read_message, read_startup_packet, StartupPacket, SQLSTATE_INSUFFICIENT_PRIVILEGE,
 };
 use crate::tcp::evaluator::{evaluate, TcpDecision};
+use vetro_engine::parser::Dialect;
+use vetro_engine::EnforcementAction;
 
 /// PostgreSQL TCP proxy configuration.
 pub struct PgProxyConfig {
     pub upstream_host: String,
     pub upstream_port: u16,
+    /// TLS mode for the proxy→database hop.
+    pub upstream_tls: crate::tcp::upstream::UpstreamTlsMode,
+    /// CA bundle (PEM) for verify-full upstream TLS.
+    pub upstream_ca_path: Option<String>,
+    /// Client certificate (PEM) presented to the database for upstream mutual TLS.
+    pub upstream_client_cert: Option<String>,
+    /// Private key (PEM) for the upstream mutual-TLS client certificate.
+    pub upstream_client_key: Option<String>,
+    /// Server-side TLS acceptor for the client→proxy hop. `None` declines client
+    /// TLS (trusted-network deployment); `Some` terminates TLS as the server.
+    pub client_tls_acceptor: Option<tokio_rustls::TlsAcceptor>,
     /// Hot-swappable ruleset shared with the rule syncer. Read lock-free per query.
     pub ruleset: crate::tcp::rules_sync::SharedRuleset,
     /// Hot-swappable enforcement policy shared with the rule syncer.
     pub policy: crate::tcp::rules_sync::SharedPolicy,
+    /// Hot-swappable telemetry query mode (raw | sanitized) shared with the syncer.
+    pub telemetry_mode: crate::tcp::rules_sync::SharedTelemetryMode,
     /// Optional telemetry sink: when set, each evaluation is reported. The
     /// database_id identifies which connected database this proxy fronts.
     pub telemetry: Option<TelemetrySink>,
@@ -65,23 +79,26 @@ pub async fn handle_connection(client: TcpStream, config: Arc<PgProxyConfig>) {
     }
 }
 
-async fn run_session(mut client: TcpStream, config: Arc<PgProxyConfig>) -> std::io::Result<()> {
-    // ── Phase 1: negotiate startup (decline TLS/GSS until StartupMessage arrives)
-    let startup_raw = negotiate_startup(&mut client).await?;
+async fn run_session(client: TcpStream, config: Arc<PgProxyConfig>) -> std::io::Result<()> {
+    // ── Phase 1: negotiate startup. Optionally terminate client TLS, then read
+    // the StartupMessage. Returns the (possibly TLS) client halves.
+    let (mut client_read, client_write, startup_raw) =
+        negotiate_startup(client, config.client_tls_acceptor.as_ref()).await?;
 
-    // ── Phase 2: connect upstream and forward the StartupMessage
-    let upstream =
-        TcpStream::connect((config.upstream_host.as_str(), config.upstream_port)).await?;
-    // Disable Nagle's algorithm on the upstream socket. Without this, small
-    // forwarded messages interact with TCP delayed-ACK and incur a ~40ms delay
-    // per round-trip (classic Nagle + delayed-ACK stall).
-    let _ = upstream.set_nodelay(true);
-    let (server_read, mut server_write) = upstream.into_split();
+    // ── Phase 2: connect upstream (optionally over TLS) and forward the StartupMessage
+    let (server_read, mut server_write) = crate::tcp::upstream::connect_upstream(
+        &config.upstream_host,
+        config.upstream_port,
+        config.upstream_tls,
+        config.upstream_ca_path.as_deref(),
+        config.upstream_client_cert.as_deref(),
+        config.upstream_client_key.as_deref(),
+    )
+    .await?;
     server_write.write_all(&startup_raw).await?;
     server_write.flush().await?;
 
-    // ── Phase 3: split the client; the write half is shared (relay + errors)
-    let (mut client_read, client_write) = client.into_split();
+    // ── Phase 3: the client write half is shared (relay + errors)
     let client_write = Arc::new(Mutex::new(client_write));
 
     // Relay server→client (auth, data, notices) without intercepting.
@@ -96,14 +113,36 @@ async fn run_session(mut client: TcpStream, config: Arc<PgProxyConfig>) -> std::
     result
 }
 
-/// Declines TLS/GSS and returns the raw bytes of the real StartupMessage.
-async fn negotiate_startup(client: &mut TcpStream) -> std::io::Result<Vec<u8>> {
+/// Negotiates the startup phase and returns the client transport halves plus the
+/// raw StartupMessage bytes.
+///
+/// When `acceptor` is `Some` and the client sends an `SSLRequest`, the proxy
+/// answers `'S'`, performs the server-side TLS handshake, and reads the
+/// StartupMessage over the encrypted channel. Otherwise it declines encryption
+/// (`'N'`) and continues in plaintext — the trusted-network deployment model.
+async fn negotiate_startup(
+    mut client: TcpStream,
+    acceptor: Option<&tokio_rustls::TlsAcceptor>,
+) -> std::io::Result<(ClientRead, ClientWrite, Vec<u8>)> {
     loop {
-        match read_startup_packet(client).await? {
-            StartupPacket::SslRequest | StartupPacket::GssRequest => {
-                // Decline proxy-level encryption ('N'). In a TLS deployment, TLS
-                // termination would happen here. The proxy↔upstream traffic goes
-                // over the trusted internal network.
+        match read_startup_packet(&mut client).await? {
+            StartupPacket::SslRequest => {
+                if let Some(acceptor) = acceptor {
+                    // Accept TLS: confirm with 'S', handshake, then read the real
+                    // StartupMessage over the encrypted channel.
+                    client.write_all(b"S").await?;
+                    client.flush().await?;
+                    let (mut read, write) =
+                        crate::tcp::client_tls::accept_tls(acceptor, client).await?;
+                    let raw = read_startup_message(&mut read).await?;
+                    return Ok((read, write, raw));
+                }
+                // TLS not enabled: decline ('N') and keep negotiating in plaintext.
+                client.write_all(b"N").await?;
+                client.flush().await?;
+            }
+            StartupPacket::GssRequest => {
+                // GSSAPI encryption is not supported; decline and continue.
                 client.write_all(b"N").await?;
                 client.flush().await?;
             }
@@ -113,16 +152,36 @@ async fn negotiate_startup(client: &mut TcpStream) -> std::io::Result<Vec<u8>> {
                     database = ?params.database,
                     "StartupMessage received"
                 );
-                return Ok(raw);
+                let (read, write) = tokio::io::split(client);
+                return Ok((Box::new(read), Box::new(write), raw));
             }
         }
     }
 }
 
+/// Reads a single startup packet expecting the StartupMessage (used after a TLS
+/// handshake, where the next message must be the StartupMessage).
+async fn read_startup_message<R: AsyncRead + Unpin>(reader: &mut R) -> std::io::Result<Vec<u8>> {
+    match read_startup_packet(reader).await? {
+        StartupPacket::Startup { raw, params } => {
+            tracing::debug!(
+                user = ?params.user,
+                database = ?params.database,
+                "StartupMessage received (over TLS)"
+            );
+            Ok(raw)
+        }
+        _ => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "expected StartupMessage after TLS handshake",
+        )),
+    }
+}
+
 /// Relays bytes from the server to the client without intercepting.
 async fn relay_server_to_client(
-    mut server_read: OwnedReadHalf,
-    client_write: Arc<Mutex<OwnedWriteHalf>>,
+    mut server_read: crate::tcp::upstream::UpstreamRead,
+    client_write: Arc<Mutex<ClientWrite>>,
 ) {
     let mut buf = vec![0u8; 16 * 1024];
     loop {
@@ -141,9 +200,9 @@ async fn relay_server_to_client(
 
 /// Main loop: reads client messages, intercepts Query/Parse, forwards the rest.
 async fn intercept_client_to_server(
-    client_read: &mut OwnedReadHalf,
-    server_write: &mut OwnedWriteHalf,
-    client_write: &Arc<Mutex<OwnedWriteHalf>>,
+    client_read: &mut ClientRead,
+    server_write: &mut crate::tcp::upstream::UpstreamWrite,
+    client_write: &Arc<Mutex<ClientWrite>>,
     config: &PgProxyConfig,
 ) -> std::io::Result<()> {
     // In the extended protocol, if we block at Parse we must swallow the
@@ -172,9 +231,11 @@ async fn intercept_client_to_server(
                     // Read the current ruleset and policy lock-free (syncer may swap them).
                     let rules = config.ruleset.load();
                     let policy = config.policy.load();
+                    let eval_start = Instant::now();
                     let decision = evaluate(&sql, Dialect::Postgres, &rules, &policy);
+                    let eval_us = eval_start.elapsed().as_micros();
                     // Telemetry is emitted before any forwarding (R5.7).
-                    report_telemetry(config, &sql, &decision);
+                    report_telemetry(config, &sql, &decision, eval_us);
                     if let TcpDecision::Block {
                         rule_code,
                         ast_node_path,
@@ -201,9 +262,11 @@ async fn intercept_client_to_server(
                 if let Some(sql) = extract_parse_query(&msg) {
                     let rules = config.ruleset.load();
                     let policy = config.policy.load();
+                    let eval_start = Instant::now();
                     let decision = evaluate(&sql, Dialect::Postgres, &rules, &policy);
+                    let eval_us = eval_start.elapsed().as_micros();
                     // Telemetry is emitted before any forwarding (R5.7).
-                    report_telemetry(config, &sql, &decision);
+                    report_telemetry(config, &sql, &decision, eval_us);
                     if let TcpDecision::Block {
                         rule_code,
                         ast_node_path,
@@ -241,7 +304,7 @@ async fn intercept_client_to_server(
 
 /// Sends a block in the simple protocol: ErrorResponse + ReadyForQuery.
 async fn send_block_simple(
-    client_write: &Arc<Mutex<OwnedWriteHalf>>,
+    client_write: &Arc<Mutex<ClientWrite>>,
     rule_code: &str,
     ast_node_path: &str,
     suggestion: Option<&str>,
@@ -264,7 +327,7 @@ fn block_message(rule_code: &str, ast_node_path: &str, suggestion: Option<&str>)
 }
 
 async fn send_to_client(
-    client_write: &Arc<Mutex<OwnedWriteHalf>>,
+    client_write: &Arc<Mutex<ClientWrite>>,
     bytes: &[u8],
 ) -> std::io::Result<()> {
     let mut writer = client_write.lock().await;
@@ -272,7 +335,10 @@ async fn send_to_client(
     writer.flush().await
 }
 
-async fn forward(server_write: &mut OwnedWriteHalf, bytes: &[u8]) -> std::io::Result<()> {
+async fn forward(
+    server_write: &mut crate::tcp::upstream::UpstreamWrite,
+    bytes: &[u8],
+) -> std::io::Result<()> {
     server_write.write_all(bytes).await?;
     server_write.flush().await
 }
@@ -303,6 +369,7 @@ fn build_telemetry_event(
     database_id: &str,
     sql: &str,
     decision: &TcpDecision,
+    latency_us: u128,
 ) -> crate::telemetry::TelemetryEvent {
     let mut severity: Option<String> = None;
     let mut enforcement_action: Option<String> = None;
@@ -369,7 +436,7 @@ fn build_telemetry_event(
         severity,
         enforcement_action,
         parse_error,
-        latency_ms: None,
+        latency_ms: Some(latency_us as f64 / 1000.0),
         client_ip: None,
         occurred_at: chrono::Utc::now().to_rfc3339(),
     }
@@ -377,12 +444,34 @@ fn build_telemetry_event(
 
 /// Push a telemetry event for an evaluation. Non-blocking and best-effort: if no
 /// sink is configured this is a no-op, and the queue never blocks the SQL path.
-fn report_telemetry(config: &PgProxyConfig, sql: &str, decision: &TcpDecision) {
+fn report_telemetry(config: &PgProxyConfig, sql: &str, decision: &TcpDecision, latency_us: u128) {
+    use crate::tcp::rules_sync::TelemetryQueryMode;
+
     let Some(sink) = &config.telemetry else {
         return;
     };
-    let event = build_telemetry_event(&sink.database_id, sql, decision);
+
+    // Privacy: when the workspace policy selects "sanitized", normalize literals
+    // to placeholders before the query text leaves the customer network. Rule
+    // evaluation already happened on the full query — this only affects reporting.
+    let reported_sql: std::borrow::Cow<'_, str> = match **config.telemetry_mode.load() {
+        TelemetryQueryMode::Raw => std::borrow::Cow::Borrowed(sql),
+        TelemetryQueryMode::Sanitized => std::borrow::Cow::Owned(sanitize_query(sql)),
+    };
+
+    let event = build_telemetry_event(&sink.database_id, &reported_sql, decision, latency_us);
     sink.queue.push(event);
+}
+
+/// Normalizes a SQL statement so no user data (literals) is reported: constants
+/// are replaced with placeholders ($1, $2, …) via libpg_query. If the query
+/// cannot be parsed (e.g. malformed SQL), nothing is leaked — a fixed redaction
+/// marker is returned instead of the raw text.
+fn sanitize_query(sql: &str) -> String {
+    match pg_query::normalize(sql) {
+        Ok(normalized) => normalized,
+        Err(_) => "<unparseable query redacted>".to_string(),
+    }
 }
 
 #[cfg(test)]
@@ -409,6 +498,7 @@ mod tests {
             "db1",
             "SELECT 1",
             &TcpDecision::Forward { observation: None },
+            42,
         );
         assert_eq!(ev.status, "ALLOWED");
         assert!(ev.rule_code.is_none());
@@ -422,6 +512,7 @@ mod tests {
             "db1",
             "SELECT * FROM t",
             &forward_observation(EnforcementAction::Flag),
+            150,
         );
         assert_eq!(ev.status, "FLAGGED");
         assert_eq!(ev.enforcement_action.as_deref(), Some("flag"));
@@ -435,6 +526,7 @@ mod tests {
             "db1",
             "INSERT INTO t VALUES (1)",
             &forward_observation(EnforcementAction::Monitor),
+            200,
         );
         assert_eq!(ev.status, "MONITORED");
         assert_eq!(ev.enforcement_action.as_deref(), Some("monitor"));
@@ -451,7 +543,7 @@ mod tests {
             suggested_safe_query: None,
             severity: Severity::Critical,
         };
-        let ev = build_telemetry_event("db1", "DELETE FROM t", &decision);
+        let ev = build_telemetry_event("db1", "DELETE FROM t", &decision, 80);
         assert_eq!(ev.status, "BLOCKED");
         assert_eq!(ev.enforcement_action.as_deref(), Some("block"));
         assert_eq!(ev.severity.as_deref(), Some("critical"));
@@ -469,7 +561,7 @@ mod tests {
                 parse_error: Some("boom".to_string()),
             }),
         };
-        let ev = build_telemetry_event("db1", "@@@", &decision);
+        let ev = build_telemetry_event("db1", "@@@", &decision, 10);
         assert_eq!(ev.status, "PARSE_ERROR");
         assert_eq!(ev.parse_error.as_deref(), Some("boom"));
         assert_eq!(ev.enforcement_action.as_deref(), Some("flag"));
@@ -483,9 +575,26 @@ mod tests {
             suggested_safe_query: None,
             severity: Severity::Medium,
         };
-        let ev = build_telemetry_event("db1", "@@@", &decision);
+        let ev = build_telemetry_event("db1", "@@@", &decision, 10);
         assert_eq!(ev.status, "PARSE_ERROR");
         assert_eq!(ev.enforcement_action.as_deref(), Some("block"));
         assert_eq!(ev.parse_error.as_deref(), Some("PARSE_ERROR: boom"));
+    }
+
+    #[test]
+    fn sanitize_query_normalizes_literals() {
+        let out =
+            sanitize_query("DELETE FROM users WHERE email = 'alice@acme.com' AND tenant_id = 42");
+        // Literals are replaced with placeholders; no user data remains.
+        assert!(out.contains("$1"), "expected placeholder, got: {out}");
+        assert!(out.contains("$2"), "expected placeholder, got: {out}");
+        assert!(!out.contains("alice@acme.com"), "PII leaked: {out}");
+    }
+
+    #[test]
+    fn sanitize_query_redacts_unparseable() {
+        // Malformed SQL must not leak — a fixed marker is returned instead.
+        let out = sanitize_query("SELEC * FORM users WHER id = 1");
+        assert_eq!(out, "<unparseable query redacted>");
     }
 }

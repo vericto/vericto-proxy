@@ -1,6 +1,6 @@
 [package]
 name = "vetro-proxy"
-version = "2.0.0"
+version = "2.1.0"
 edition = "2021"
 rust-version = "1.88"
 description = "Vetro — Deterministic SQL firewall — TCP wire-protocol proxy for customer infrastructure"
@@ -15,6 +15,10 @@ path = "src/main.rs"
 [dependencies]
 # AST engine (open-core shared library)
 vetro-engine = { git = "https://github.com/donkan168/vetro-engine", tag = "v2.0.0" }
+
+# PostgreSQL query normalization for sanitized telemetry (literals → $1, $2…).
+# Same major version the engine uses, so libpg_query resolves to a single build.
+pg_query = "5.1"
 
 # Async runtime
 tokio = { version = "1.38", features = ["full"] }
@@ -31,6 +35,12 @@ serde_yaml = "0.9"
 
 # Outbound HTTP client for telemetry reporting + rule sync to the Vetro API.
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
+# Upstream TLS client: encrypts the proxy→database hop (PostgreSQL SSLRequest +
+# rustls handshake) when UPSTREAM_PG_SSLMODE is require/verify-full.
+tokio-rustls = "0.26"
+webpki-roots = "0.26"
+rustls-pemfile = "2"
 
 # Hot-swappable ruleset (rule syncer replaces it without locking the hot path).
 arc-swap = "1.7"

@@ -8,13 +8,17 @@
 pub mod codec;
 pub mod evaluator;
 pub mod postgres;
+pub mod upstream;
 
 use std::sync::Arc;
 
 use tokio::net::TcpListener;
 
-use crate::tcp::rules_sync::{SharedPolicy, SharedRuleset};
+use crate::tcp::client_tls::ClientTlsMode;
 use crate::tcp::postgres::{handle_connection, PgProxyConfig, TelemetrySink};
+use crate::tcp::rules_sync::{SharedPolicy, SharedRuleset, SharedTelemetryMode};
+
+pub mod client_tls;
 
 /// TCP proxy startup configuration, resolved from the environment.
 pub struct TcpProxyOptions {
@@ -23,6 +27,20 @@ pub struct TcpProxyOptions {
     pub upstream_port: u16,
     /// Database this proxy fronts, used to tag telemetry. Optional.
     pub database_id: Option<String>,
+    /// TLS mode for the proxy→database hop (default: disable).
+    pub upstream_tls: crate::tcp::upstream::UpstreamTlsMode,
+    /// CA bundle (PEM) used to verify the upstream cert in verify-full mode.
+    pub upstream_ca_path: Option<String>,
+    /// Client certificate (PEM) for upstream mutual TLS (optional).
+    pub upstream_client_cert: Option<String>,
+    /// Private key (PEM) for the upstream mutual-TLS client certificate.
+    pub upstream_client_key: Option<String>,
+    /// TLS mode for the client→proxy hop (default: disable).
+    pub client_tls: ClientTlsMode,
+    /// Server certificate (PEM) presented to clients when client TLS is enabled.
+    pub client_tls_cert: Option<String>,
+    /// Private key (PEM) for the server certificate.
+    pub client_tls_key: Option<String>,
 }
 
 impl TcpProxyOptions {
@@ -43,6 +61,17 @@ impl TcpProxyOptions {
             upstream_host,
             upstream_port,
             database_id: std::env::var("VETRO_DATABASE_ID").ok(),
+            upstream_tls: crate::tcp::upstream::UpstreamTlsMode::from_env_str(
+                &std::env::var("UPSTREAM_PG_SSLMODE").unwrap_or_default(),
+            ),
+            upstream_ca_path: std::env::var("UPSTREAM_PG_SSLROOTCERT").ok(),
+            upstream_client_cert: std::env::var("UPSTREAM_PG_SSLCERT").ok(),
+            upstream_client_key: std::env::var("UPSTREAM_PG_SSLKEY").ok(),
+            client_tls: ClientTlsMode::from_env_str(
+                &std::env::var("PROXY_TLS_MODE").unwrap_or_default(),
+            ),
+            client_tls_cert: std::env::var("PROXY_TLS_CERT").ok(),
+            client_tls_key: std::env::var("PROXY_TLS_KEY").ok(),
         })
     }
 }
@@ -55,13 +84,42 @@ pub async fn run_pg_proxy(
     opts: TcpProxyOptions,
     ruleset: SharedRuleset,
     policy: SharedPolicy,
+    telemetry_mode: SharedTelemetryMode,
     telemetry: Option<TelemetrySink>,
 ) -> std::io::Result<()> {
+    // Resolve client→proxy TLS once at startup. Fail fast if require mode is set
+    // without a usable certificate/key, rather than per connection.
+    let client_tls_acceptor = match opts.client_tls {
+        ClientTlsMode::Require => {
+            let cert = opts.client_tls_cert.as_deref().ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "PROXY_TLS_MODE=require but PROXY_TLS_CERT is not set",
+                )
+            })?;
+            let key = opts.client_tls_key.as_deref().ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "PROXY_TLS_MODE=require but PROXY_TLS_KEY is not set",
+                )
+            })?;
+            Some(crate::tcp::client_tls::build_acceptor(cert, key)?)
+        }
+        ClientTlsMode::Disable => None,
+    };
+    let client_tls_enabled = client_tls_acceptor.is_some();
+
     let config = Arc::new(PgProxyConfig {
         upstream_host: opts.upstream_host.clone(),
         upstream_port: opts.upstream_port,
+        upstream_tls: opts.upstream_tls,
+        upstream_ca_path: opts.upstream_ca_path.clone(),
+        upstream_client_cert: opts.upstream_client_cert.clone(),
+        upstream_client_key: opts.upstream_client_key.clone(),
+        client_tls_acceptor,
         ruleset,
         policy,
+        telemetry_mode,
         telemetry,
     });
 
@@ -71,6 +129,8 @@ pub async fn run_pg_proxy(
     tracing::info!(
         listen = %addr,
         upstream = %format!("{}:{}", opts.upstream_host, opts.upstream_port),
+        upstream_tls = ?opts.upstream_tls,
+        client_tls = client_tls_enabled,
         "PostgreSQL TCP proxy listening"
     );
 
