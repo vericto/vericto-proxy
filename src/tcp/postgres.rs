@@ -21,11 +21,11 @@
 use std::sync::Arc;
 
 use std::time::Instant;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
 
+use crate::tcp::client_tls::{ClientRead, ClientWrite};
 use crate::tcp::codec::{
     build_error_response, build_ready_for_query, extract_parse_query, extract_simple_query,
     read_message, read_startup_packet, StartupPacket, SQLSTATE_INSUFFICIENT_PRIVILEGE,
@@ -42,6 +42,13 @@ pub struct PgProxyConfig {
     pub upstream_tls: crate::tcp::upstream::UpstreamTlsMode,
     /// CA bundle (PEM) for verify-full upstream TLS.
     pub upstream_ca_path: Option<String>,
+    /// Client certificate (PEM) presented to the database for upstream mutual TLS.
+    pub upstream_client_cert: Option<String>,
+    /// Private key (PEM) for the upstream mutual-TLS client certificate.
+    pub upstream_client_key: Option<String>,
+    /// Server-side TLS acceptor for the client→proxy hop. `None` declines client
+    /// TLS (trusted-network deployment); `Some` terminates TLS as the server.
+    pub client_tls_acceptor: Option<tokio_rustls::TlsAcceptor>,
     /// Hot-swappable ruleset shared with the rule syncer. Read lock-free per query.
     pub ruleset: crate::tcp::rules_sync::SharedRuleset,
     /// Hot-swappable enforcement policy shared with the rule syncer.
@@ -72,9 +79,11 @@ pub async fn handle_connection(client: TcpStream, config: Arc<PgProxyConfig>) {
     }
 }
 
-async fn run_session(mut client: TcpStream, config: Arc<PgProxyConfig>) -> std::io::Result<()> {
-    // ── Phase 1: negotiate startup (decline TLS/GSS until StartupMessage arrives)
-    let startup_raw = negotiate_startup(&mut client).await?;
+async fn run_session(client: TcpStream, config: Arc<PgProxyConfig>) -> std::io::Result<()> {
+    // ── Phase 1: negotiate startup. Optionally terminate client TLS, then read
+    // the StartupMessage. Returns the (possibly TLS) client halves.
+    let (mut client_read, client_write, startup_raw) =
+        negotiate_startup(client, config.client_tls_acceptor.as_ref()).await?;
 
     // ── Phase 2: connect upstream (optionally over TLS) and forward the StartupMessage
     let (server_read, mut server_write) = crate::tcp::upstream::connect_upstream(
@@ -82,13 +91,14 @@ async fn run_session(mut client: TcpStream, config: Arc<PgProxyConfig>) -> std::
         config.upstream_port,
         config.upstream_tls,
         config.upstream_ca_path.as_deref(),
+        config.upstream_client_cert.as_deref(),
+        config.upstream_client_key.as_deref(),
     )
     .await?;
     server_write.write_all(&startup_raw).await?;
     server_write.flush().await?;
 
-    // ── Phase 3: split the client; the write half is shared (relay + errors)
-    let (mut client_read, client_write) = client.into_split();
+    // ── Phase 3: the client write half is shared (relay + errors)
     let client_write = Arc::new(Mutex::new(client_write));
 
     // Relay server→client (auth, data, notices) without intercepting.
@@ -103,14 +113,36 @@ async fn run_session(mut client: TcpStream, config: Arc<PgProxyConfig>) -> std::
     result
 }
 
-/// Declines TLS/GSS and returns the raw bytes of the real StartupMessage.
-async fn negotiate_startup(client: &mut TcpStream) -> std::io::Result<Vec<u8>> {
+/// Negotiates the startup phase and returns the client transport halves plus the
+/// raw StartupMessage bytes.
+///
+/// When `acceptor` is `Some` and the client sends an `SSLRequest`, the proxy
+/// answers `'S'`, performs the server-side TLS handshake, and reads the
+/// StartupMessage over the encrypted channel. Otherwise it declines encryption
+/// (`'N'`) and continues in plaintext — the trusted-network deployment model.
+async fn negotiate_startup(
+    mut client: TcpStream,
+    acceptor: Option<&tokio_rustls::TlsAcceptor>,
+) -> std::io::Result<(ClientRead, ClientWrite, Vec<u8>)> {
     loop {
-        match read_startup_packet(client).await? {
-            StartupPacket::SslRequest | StartupPacket::GssRequest => {
-                // Decline proxy-level encryption ('N'). In a TLS deployment, TLS
-                // termination would happen here. The proxy↔upstream traffic goes
-                // over the trusted internal network.
+        match read_startup_packet(&mut client).await? {
+            StartupPacket::SslRequest => {
+                if let Some(acceptor) = acceptor {
+                    // Accept TLS: confirm with 'S', handshake, then read the real
+                    // StartupMessage over the encrypted channel.
+                    client.write_all(b"S").await?;
+                    client.flush().await?;
+                    let (mut read, write) =
+                        crate::tcp::client_tls::accept_tls(acceptor, client).await?;
+                    let raw = read_startup_message(&mut read).await?;
+                    return Ok((read, write, raw));
+                }
+                // TLS not enabled: decline ('N') and keep negotiating in plaintext.
+                client.write_all(b"N").await?;
+                client.flush().await?;
+            }
+            StartupPacket::GssRequest => {
+                // GSSAPI encryption is not supported; decline and continue.
                 client.write_all(b"N").await?;
                 client.flush().await?;
             }
@@ -120,16 +152,36 @@ async fn negotiate_startup(client: &mut TcpStream) -> std::io::Result<Vec<u8>> {
                     database = ?params.database,
                     "StartupMessage received"
                 );
-                return Ok(raw);
+                let (read, write) = tokio::io::split(client);
+                return Ok((Box::new(read), Box::new(write), raw));
             }
         }
+    }
+}
+
+/// Reads a single startup packet expecting the StartupMessage (used after a TLS
+/// handshake, where the next message must be the StartupMessage).
+async fn read_startup_message<R: AsyncRead + Unpin>(reader: &mut R) -> std::io::Result<Vec<u8>> {
+    match read_startup_packet(reader).await? {
+        StartupPacket::Startup { raw, params } => {
+            tracing::debug!(
+                user = ?params.user,
+                database = ?params.database,
+                "StartupMessage received (over TLS)"
+            );
+            Ok(raw)
+        }
+        _ => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "expected StartupMessage after TLS handshake",
+        )),
     }
 }
 
 /// Relays bytes from the server to the client without intercepting.
 async fn relay_server_to_client(
     mut server_read: crate::tcp::upstream::UpstreamRead,
-    client_write: Arc<Mutex<OwnedWriteHalf>>,
+    client_write: Arc<Mutex<ClientWrite>>,
 ) {
     let mut buf = vec![0u8; 16 * 1024];
     loop {
@@ -148,9 +200,9 @@ async fn relay_server_to_client(
 
 /// Main loop: reads client messages, intercepts Query/Parse, forwards the rest.
 async fn intercept_client_to_server(
-    client_read: &mut OwnedReadHalf,
+    client_read: &mut ClientRead,
     server_write: &mut crate::tcp::upstream::UpstreamWrite,
-    client_write: &Arc<Mutex<OwnedWriteHalf>>,
+    client_write: &Arc<Mutex<ClientWrite>>,
     config: &PgProxyConfig,
 ) -> std::io::Result<()> {
     // In the extended protocol, if we block at Parse we must swallow the
@@ -252,7 +304,7 @@ async fn intercept_client_to_server(
 
 /// Sends a block in the simple protocol: ErrorResponse + ReadyForQuery.
 async fn send_block_simple(
-    client_write: &Arc<Mutex<OwnedWriteHalf>>,
+    client_write: &Arc<Mutex<ClientWrite>>,
     rule_code: &str,
     ast_node_path: &str,
     suggestion: Option<&str>,
@@ -275,7 +327,7 @@ fn block_message(rule_code: &str, ast_node_path: &str, suggestion: Option<&str>)
 }
 
 async fn send_to_client(
-    client_write: &Arc<Mutex<OwnedWriteHalf>>,
+    client_write: &Arc<Mutex<ClientWrite>>,
     bytes: &[u8],
 ) -> std::io::Result<()> {
     let mut writer = client_write.lock().await;

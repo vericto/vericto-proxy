@@ -16,7 +16,7 @@ use std::sync::Arc;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio_rustls::rustls::pki_types::ServerName;
+use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
 use tokio_rustls::rustls::{ClientConfig, RootCertStore};
 use tokio_rustls::TlsConnector;
 
@@ -53,11 +53,18 @@ const SSL_REQUEST: [u8; 8] = [0, 0, 0, 8, 0x04, 0xD2, 0x16, 0x2F];
 
 /// Connects to the upstream database, optionally upgrading to TLS, and returns
 /// the (read, write) halves ready for the StartupMessage and relaying.
+///
+/// When `client_cert_path`/`client_key_path` are set (and TLS is enabled), the
+/// proxy presents that certificate to the database for mutual TLS — covering
+/// the `cert` authentication method (the proxy authenticates as a single
+/// service identity). It is ignored when `mode` is `Disable`.
 pub async fn connect_upstream(
     host: &str,
     port: u16,
     mode: UpstreamTlsMode,
     ca_path: Option<&str>,
+    client_cert_path: Option<&str>,
+    client_key_path: Option<&str>,
 ) -> io::Result<(UpstreamRead, UpstreamWrite)> {
     let mut tcp = TcpStream::connect((host, port)).await?;
     // Disable Nagle to avoid the Nagle + delayed-ACK ~40ms stall on small msgs.
@@ -81,7 +88,8 @@ pub async fn connect_upstream(
         )));
     }
 
-    let config = build_client_config(mode, ca_path)?;
+    let client_auth = load_client_auth(client_cert_path, client_key_path)?;
+    let config = build_client_config(mode, ca_path, client_auth)?;
     let connector = TlsConnector::from(Arc::new(config));
     let server_name = ServerName::try_from(host.to_string()).map_err(|_| {
         io::Error::new(
@@ -94,9 +102,60 @@ pub async fn connect_upstream(
     Ok((Box::new(r), Box::new(w)))
 }
 
-/// Builds the rustls client config for the requested mode.
-fn build_client_config(mode: UpstreamTlsMode, ca_path: Option<&str>) -> io::Result<ClientConfig> {
-    match mode {
+/// Optional client certificate chain + private key for upstream mutual TLS.
+type ClientAuth = (Vec<CertificateDer<'static>>, PrivateKeyDer<'static>);
+
+/// Loads the optional client certificate + key used for upstream mutual TLS.
+/// Returns `None` when neither is configured; errors if only one is set.
+fn load_client_auth(
+    cert_path: Option<&str>,
+    key_path: Option<&str>,
+) -> io::Result<Option<ClientAuth>> {
+    match (cert_path, key_path) {
+        (None, None) => Ok(None),
+        (Some(cert), Some(key)) => {
+            let pem = std::fs::read(cert).map_err(|e| {
+                io::Error::new(e.kind(), format!("reading upstream cert {cert}: {e}"))
+            })?;
+            let mut rd: &[u8] = &pem;
+            let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut rd)
+                .collect::<Result<_, _>>()
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            if certs.is_empty() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("no certificates found in upstream cert {cert}"),
+                ));
+            }
+            let key_pem = std::fs::read(key).map_err(|e| {
+                io::Error::new(e.kind(), format!("reading upstream key {key}: {e}"))
+            })?;
+            let mut krd: &[u8] = &key_pem;
+            let key_der = rustls_pemfile::private_key(&mut krd)?.ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("no private key found in upstream key {key}"),
+                )
+            })?;
+            Ok(Some((certs, key_der)))
+        }
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "upstream mutual TLS requires both UPSTREAM_PG_SSLCERT and UPSTREAM_PG_SSLKEY",
+        )),
+    }
+}
+
+/// Builds the rustls client config for the requested mode, optionally with a
+/// client certificate for mutual TLS.
+fn build_client_config(
+    mode: UpstreamTlsMode,
+    ca_path: Option<&str>,
+    client_auth: Option<ClientAuth>,
+) -> io::Result<ClientConfig> {
+    // Both arms converge on the `WantsClientCert` builder state, so the
+    // client-auth choice is applied once below.
+    let builder = match mode {
         UpstreamTlsMode::VerifyFull => {
             let mut roots = RootCertStore::empty();
             if let Some(path) = ca_path {
@@ -111,15 +170,19 @@ fn build_client_config(mode: UpstreamTlsMode, ca_path: Option<&str>) -> io::Resu
             } else {
                 roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
             }
-            Ok(ClientConfig::builder()
-                .with_root_certificates(roots)
-                .with_no_client_auth())
+            ClientConfig::builder().with_root_certificates(roots)
         }
-        UpstreamTlsMode::Require => Ok(ClientConfig::builder()
+        UpstreamTlsMode::Require => ClientConfig::builder()
             .dangerous()
-            .with_custom_certificate_verifier(Arc::new(danger::NoCertVerification))
-            .with_no_client_auth()),
+            .with_custom_certificate_verifier(Arc::new(danger::NoCertVerification)),
         UpstreamTlsMode::Disable => unreachable!("Disable handled before TLS config"),
+    };
+
+    match client_auth {
+        Some((certs, key)) => builder
+            .with_client_auth_cert(certs, key)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string())),
+        None => Ok(builder.with_no_client_auth()),
     }
 }
 
