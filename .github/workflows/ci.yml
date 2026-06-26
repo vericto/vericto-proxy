@@ -9,6 +9,9 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  # cargo resolves the private vetro-engine git dependency via the git CLI,
+  # which honors the credential rewrite configured in the auth step below.
+  CARGO_NET_GIT_FETCH_WITH_CLI: "true"
 
 jobs:
   test:
@@ -16,6 +19,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4.2.2
+
+      - name: Authenticate to private vetro-engine repo
+        run: |
+          git config --global \
+            url."https://${{ secrets.GH_PAT_PRIVATE_REPOS }}@github.com/".insteadOf \
+            "https://github.com/"
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
