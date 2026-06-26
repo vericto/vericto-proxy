@@ -1,6 +1,6 @@
 [package]
 name = "vetro-proxy"
-version = "2.0.0"
+version = "2.1.0"
 edition = "2021"
 rust-version = "1.88"
 description = "Vetro — Deterministic SQL firewall — TCP wire-protocol proxy for customer infrastructure"
