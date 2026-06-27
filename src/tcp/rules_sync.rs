@@ -55,6 +55,20 @@ struct SyncResponse {
     /// window; falls back to `EnforcementPolicy::default()`.
     #[serde(default)]
     policy: Option<ApiPolicy>,
+    /// Dashboard-configured proxy settings (hot-reloaded).
+    #[serde(default)]
+    proxy_config: Option<ProxyConfig>,
+}
+
+/// Settings configurable from the Vetro dashboard, applied without restart.
+/// TLS to the upstream database (UPSTREAM_PG_SSLMODE + certificate) is NOT here —
+/// it's an env var because it requires mounting a CA certificate in the container.
+#[derive(Debug, Deserialize, Default)]
+struct ProxyConfig {
+    rules_sync_interval_secs: Option<u64>,
+    telemetry_batch_size: Option<usize>,
+    telemetry_flush_secs: Option<u64>,
+    telemetry_memory_capacity: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -173,14 +187,19 @@ pub async fn run(
     policy: SharedPolicy,
     telemetry_mode: SharedTelemetryMode,
 ) {
-    let url = format!("{}/api/v1/sync/rules", cfg.api_url);
+    let mut url = format!("{}/api/v1/sync/rules", cfg.api_url);
+    if let Some(ref db_id) = cfg.database_id {
+        url = format!("{}?database_id={}", url, db_id);
+    }
+
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
         .build()
         .expect("failed to build rule-sync HTTP client");
 
     let mut etag: Option<String> = None;
-    let mut ticker = tokio::time::interval(cfg.rules_sync_interval);
+    let mut sync_interval = cfg.rules_sync_interval;
+    let mut ticker = tokio::time::interval(sync_interval);
 
     loop {
         ticker.tick().await;
@@ -215,6 +234,24 @@ pub async fn run(
                         policy.store(Arc::new(new_policy));
                         telemetry_mode.store(Arc::new(new_mode));
                         etag = new_etag;
+
+                        // Apply dashboard-configured proxy settings (hot-reload)
+                        if let Some(pc) = body.proxy_config {
+                            if let Some(interval_secs) = pc.rules_sync_interval_secs {
+                                let new_interval = Duration::from_secs(interval_secs.max(30));
+                                if new_interval != sync_interval {
+                                    sync_interval = new_interval;
+                                    ticker = tokio::time::interval(sync_interval);
+                                    tracing::info!(secs = interval_secs, "Rules sync interval updated from dashboard");
+                                }
+                            }
+                            // Note: telemetry_batch_size, flush_secs, memory_capacity
+                            // are applied by the Reporter which re-reads config each cycle.
+                            if pc.telemetry_batch_size.is_some() || pc.telemetry_flush_secs.is_some() || pc.telemetry_memory_capacity.is_some() {
+                                tracing::debug!(config = ?pc, "Proxy config received from dashboard");
+                            }
+                        }
+
                         tracing::info!(
                             count,
                             monitor_mode = new_policy.monitor_mode,

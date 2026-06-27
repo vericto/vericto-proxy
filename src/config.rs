@@ -27,6 +27,7 @@ pub enum BufferMode {
 pub struct ControlPlaneConfig {
     pub api_url: String,
     pub api_key: String,
+    pub database_id: Option<String>,
     /// How often to poll GET /sync/rules.
     pub rules_sync_interval: Duration,
     /// Telemetry buffering strategy.
@@ -83,6 +84,7 @@ impl ControlPlaneConfig {
         Some(Self {
             api_url: api_url.trim_end_matches('/').to_string(),
             api_key,
+            database_id: std::env::var("VETRO_DATABASE_ID").ok(),
             rules_sync_interval,
             buffer_mode,
             disk_spool_path,
