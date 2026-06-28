@@ -189,7 +189,7 @@ pub async fn run(
 ) {
     let mut url = format!("{}/api/v1/sync/rules", cfg.api_url);
     if let Some(ref db_id) = cfg.database_id {
-        url = format!("{}?database_id={}", url, db_id);
+        url = format!("{url}?database_id={db_id}");
     }
 
     let client = reqwest::Client::builder()
@@ -242,12 +242,18 @@ pub async fn run(
                                 if new_interval != sync_interval {
                                     sync_interval = new_interval;
                                     ticker = tokio::time::interval(sync_interval);
-                                    tracing::info!(secs = interval_secs, "Rules sync interval updated from dashboard");
+                                    tracing::info!(
+                                        secs = interval_secs,
+                                        "Rules sync interval updated from dashboard"
+                                    );
                                 }
                             }
                             // Note: telemetry_batch_size, flush_secs, memory_capacity
                             // are applied by the Reporter which re-reads config each cycle.
-                            if pc.telemetry_batch_size.is_some() || pc.telemetry_flush_secs.is_some() || pc.telemetry_memory_capacity.is_some() {
+                            if pc.telemetry_batch_size.is_some()
+                                || pc.telemetry_flush_secs.is_some()
+                                || pc.telemetry_memory_capacity.is_some()
+                            {
                                 tracing::debug!(config = ?pc, "Proxy config received from dashboard");
                             }
                         }
