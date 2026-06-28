@@ -1,0 +1,5 @@
+# Pin the toolchain so local builds, rust-analyzer and CI all use the same
+# rustfmt/clippy. Matches the CI build toolchain (1.88.0).
+[toolchain]
+channel = "1.88.0"
+components = ["rustfmt", "clippy"]

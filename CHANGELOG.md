@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.2.0] — 2026-06-27
+
+### Changed
+
+- Bump `vetro-engine` to `v2.1.0`, which closes the rule-coverage gaps
+  ENG-001…ENG-010 (8 new rules, plus fixes to LIMIT handling, nested-SELECT
+  detection, sleep detection, tautology depth, and DROP DATABASE/SCHEMA).
+
+### Added
+
+- Register the 8 new engine rules in the built-in `default_ruleset()` (and its
+  verbatim R13 mirror test): `VETRO-080`/`VETRO-081` (Critical — COPY PROGRAM,
+  DO block) and `VETRO-017`/`018`/`019`/`082`/`083`/`084` (High — ALTER TABLE
+  DROP CONSTRAINT / ALTER COLUMN TYPE / DISABLE TRIGGER, GRANT/REVOKE, MERGE,
+  CREATE TABLE AS). The catalogue now carries 28 rules.
+
 ## [1.0.0] — 2025-06
 
 ### Added
