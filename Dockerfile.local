@@ -1,20 +1,23 @@
 # =============================================================================
 # vetro-proxy — LOCAL BUILD Dockerfile
 #
-# Differs from the production Dockerfile only in how vetro-engine is resolved:
-#   - Production (Dockerfile):       git = "https://github.com/.../vetro-engine", tag = "v1.0.0"
-#   - Local (this file):             path override via inline sed patch + COPY
+# Resolves vetro-engine from the LOCAL workspace instead of a published git tag,
+# so you can test local engine changes without cutting a release.
 #
-# Build from the workspace root (so both vetro-proxy/ and vetro-engine/ are
-# accessible from the same build context):
+# Differs from the production Dockerfile only in how vetro-engine is resolved:
+#   - Production (Dockerfile):  git = "https://github.com/.../vetro-engine", tag = "vX.Y.Z"
+#   - Local (this file):        path override, engine passed as a BuildKit
+#                               named build context (no copy into the repo)
+#
+# Build from vetro-proxy/ with the engine wired as a named context:
 #
 #   docker build \
-#     -f vetro-proxy/Dockerfile.local \
+#     -f Dockerfile.local \
 #     -t vetro/proxy:local \
-#     --build-context engine=vetro-engine \
-#     vetro-proxy/
+#     --build-context engine=../vetro-engine \
+#     .
 #
-# Or using the helper script: scripts/build-local.sh
+# Or use the helper script: ../scripts/build-local.sh
 # =============================================================================
 
 FROM rust:1.88-slim-bookworm AS builder
