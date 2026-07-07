@@ -22,8 +22,12 @@ jobs:
 
       - name: Authenticate to private vetro-engine repo
         run: |
+          # Use the token as the PASSWORD with a fixed username. A bare
+          # `https://<token>@github.com/` rewrite makes git treat the token as
+          # the username and then demand a password, which aborts on a headless
+          # runner ("could not read Password ... No such device or address").
           git config --global \
-            url."https://${{ secrets.GH_PAT_PRIVATE_REPOS }}@github.com/".insteadOf \
+            url."https://x-access-token:${{ secrets.GH_PAT_PRIVATE_REPOS }}@github.com/".insteadOf \
             "https://github.com/"
 
       - name: Install Rust toolchain
@@ -41,12 +45,17 @@ jobs:
       - name: Cache cargo registry and target
         uses: actions/cache@v4.2.3
         with:
+          # `~/.cargo/git` is intentionally NOT cached: restoring a stale git
+          # checkout of the private vetro-engine dep leaves cargo doing an
+          # incremental fetch over a repo whose embedded config lacks the token,
+          # so git prompts for a password and fails on the headless runner. The
+          # git dep is re-fetched fresh each run (one small repo) with the auth
+          # rewrite above. `-v2` retires the poisoned pre-existing caches.
           path: |
             ~/.cargo/registry
-            ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-
+          key: ${{ runner.os }}-cargo-v2-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-v2-
 
       - name: Check formatting
         run: cargo fmt --all --check
