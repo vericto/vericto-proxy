@@ -102,6 +102,32 @@ pub async fn connect_upstream(
     Ok((Box::new(r), Box::new(w)))
 }
 
+/// Upgrades an already-connected TCP stream to a client-side TLS session.
+///
+/// Unlike `connect_upstream` (which owns the Postgres SSL negotiation), this is
+/// for protocols where TLS is initiated mid-handshake AFTER the proxy has
+/// exchanged some plaintext bytes — MySQL, whose SSL Request is a truncated
+/// login packet sent over the already-open TCP connection before TLS begins.
+/// The MySQL-specific packet exchange stays in the session; this only performs
+/// the rustls client handshake and returns the boxed halves.
+pub async fn upgrade_to_tls_client(
+    tcp: TcpStream,
+    host: &str,
+    mode: UpstreamTlsMode,
+) -> io::Result<(UpstreamRead, UpstreamWrite)> {
+    let config = build_client_config(mode, None, None)?;
+    let connector = TlsConnector::from(Arc::new(config));
+    let server_name = ServerName::try_from(host.to_string()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid upstream hostname for TLS",
+        )
+    })?;
+    let tls = connector.connect(server_name, tcp).await?;
+    let (r, w) = tokio::io::split(tls);
+    Ok((Box::new(r), Box::new(w)))
+}
+
 /// Optional client certificate chain + private key for upstream mutual TLS.
 type ClientAuth = (Vec<CertificateDer<'static>>, PrivateKeyDer<'static>);
 

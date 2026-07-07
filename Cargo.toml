@@ -23,6 +23,11 @@ pg_query = "5.1"
 # Async runtime
 tokio = { version = "1.38", features = ["full"] }
 
+# Object-safe async trait for the wire-protocol strategy (WireProtocol), so the
+# active protocol (postgres | mysql | …) is selected at runtime behind a
+# `dyn WireProtocol`. Required until native async-fn-in-trait is object-safe.
+async-trait = "0.1"
+
 # HTTP server (AST evaluation endpoint consumed by the Fastify API)
 axum = "0.7"
 tower = "0.4"

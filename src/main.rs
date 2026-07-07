@@ -105,15 +105,25 @@ async fn main() {
         }
     };
 
+    // Wire protocol selected per deployment (Option A): one protocol per proxy
+    // instance, derived from the fronted database's dialect.
+    let wire_protocol = std::env::var("VETRO_WIRE_PROTOCOL").unwrap_or_else(|_| "postgres".into());
+
     tracing::info!(
         upstream = %format!("{}:{}", tcp_opts.upstream_host, tcp_opts.upstream_port),
+        wire_protocol = %wire_protocol,
         "vetro-proxy starting"
     );
 
-    if let Err(e) =
-        tcp::run_pg_proxy(tcp_opts, ruleset, policy, telemetry_mode, telemetry_sink).await
-    {
-        tracing::error!(error = %e, "The PostgreSQL TCP proxy failed");
+    let result = match wire_protocol.as_str() {
+        "mysql" => {
+            tcp::run_mysql_proxy(tcp_opts, ruleset, policy, telemetry_mode, telemetry_sink).await
+        }
+        _ => tcp::run_pg_proxy(tcp_opts, ruleset, policy, telemetry_mode, telemetry_sink).await,
+    };
+
+    if let Err(e) = result {
+        tracing::error!(error = %e, wire_protocol = %wire_protocol, "The TCP proxy failed");
         std::process::exit(1);
     }
 }

@@ -6,8 +6,11 @@
 //! database.
 
 pub mod codec;
+pub mod codec_mysql;
 pub mod evaluator;
 pub mod postgres;
+pub mod protocol;
+pub mod session;
 pub mod upstream;
 
 use std::sync::Arc;
@@ -46,7 +49,42 @@ pub struct TcpProxyOptions {
 impl TcpProxyOptions {
     /// Reads the TCP proxy configuration from environment variables.
     /// Returns `None` if the upstream is not configured (TCP proxy disabled).
+    ///
+    /// The wire protocol is chosen by `VETRO_WIRE_PROTOCOL` (postgres|mysql,
+    /// default postgres). For MySQL the upstream/listen ports come from the
+    /// `*_MYSQL_*` vars; for Postgres from the existing `*_PG_*` vars.
     pub fn from_env() -> Option<Self> {
+        let is_mysql = matches!(std::env::var("VETRO_WIRE_PROTOCOL").as_deref(), Ok("mysql"));
+        if is_mysql {
+            let upstream_host = std::env::var("UPSTREAM_MYSQL_HOST").ok()?;
+            let listen_port = std::env::var("PROXY_MYSQL_LISTEN_PORT")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(3307);
+            let upstream_port = std::env::var("UPSTREAM_MYSQL_PORT")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(3306);
+            return Some(Self {
+                listen_port,
+                upstream_host,
+                upstream_port,
+                database_id: std::env::var("VETRO_DATABASE_ID").ok(),
+                // Upstream TLS (proxy→MySQL): UPSTREAM_MYSQL_SSLMODE=require|verify-full.
+                upstream_tls: crate::tcp::upstream::UpstreamTlsMode::from_env_str(
+                    &std::env::var("UPSTREAM_MYSQL_SSLMODE").unwrap_or_default(),
+                ),
+                upstream_ca_path: std::env::var("UPSTREAM_MYSQL_SSLROOTCERT").ok(),
+                upstream_client_cert: None,
+                upstream_client_key: None,
+                // Client TLS (client→proxy): PROXY_TLS_MODE + PROXY_TLS_CERT/KEY.
+                client_tls: ClientTlsMode::from_env_str(
+                    &std::env::var("PROXY_TLS_MODE").unwrap_or_default(),
+                ),
+                client_tls_cert: std::env::var("PROXY_TLS_CERT").ok(),
+                client_tls_key: std::env::var("PROXY_TLS_KEY").ok(),
+            });
+        }
         let upstream_host = std::env::var("UPSTREAM_PG_HOST").ok()?;
         let listen_port = std::env::var("PROXY_PG_LISTEN_PORT")
             .ok()
@@ -141,6 +179,79 @@ pub async fn run_pg_proxy(
                 let _ = socket.set_nodelay(true);
                 let config = config.clone();
                 tokio::spawn(handle_connection(socket, config));
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "Error accepting TCP connection");
+            }
+        }
+    }
+}
+
+/// Starts the MySQL TCP proxy listener. Runs indefinitely.
+///
+/// Mirrors `run_pg_proxy` but for the MySQL wire protocol: no client-side TLS
+/// acceptor (Phase 1, trusted network), plaintext upstream. The shared
+/// `PgProxyConfig` carries the ruleset/policy/telemetry regardless of protocol
+/// (the name is historical; it is the generic proxy config).
+pub async fn run_mysql_proxy(
+    opts: TcpProxyOptions,
+    ruleset: SharedRuleset,
+    policy: SharedPolicy,
+    telemetry_mode: SharedTelemetryMode,
+    telemetry: Option<TelemetrySink>,
+) -> std::io::Result<()> {
+    // Optional client→proxy TLS acceptor (same as the PG path).
+    let client_tls_acceptor = match opts.client_tls {
+        ClientTlsMode::Require => {
+            let cert = opts.client_tls_cert.as_deref().ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "PROXY_TLS_MODE=require but PROXY_TLS_CERT is not set",
+                )
+            })?;
+            let key = opts.client_tls_key.as_deref().ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "PROXY_TLS_MODE=require but PROXY_TLS_KEY is not set",
+                )
+            })?;
+            Some(crate::tcp::client_tls::build_acceptor(cert, key)?)
+        }
+        ClientTlsMode::Disable => None,
+    };
+    let client_tls_enabled = client_tls_acceptor.is_some();
+
+    let config = Arc::new(PgProxyConfig {
+        upstream_host: opts.upstream_host.clone(),
+        upstream_port: opts.upstream_port,
+        upstream_tls: opts.upstream_tls,
+        upstream_ca_path: opts.upstream_ca_path.clone(),
+        upstream_client_cert: None,
+        upstream_client_key: None,
+        client_tls_acceptor,
+        ruleset,
+        policy,
+        telemetry_mode,
+        telemetry,
+    });
+
+    let addr = format!("0.0.0.0:{}", opts.listen_port);
+    let listener = TcpListener::bind(&addr).await?;
+
+    tracing::info!(
+        listen = %addr,
+        upstream = %format!("{}:{}", opts.upstream_host, opts.upstream_port),
+        upstream_tls = ?opts.upstream_tls,
+        client_tls = client_tls_enabled,
+        "MySQL TCP proxy listening"
+    );
+
+    loop {
+        match listener.accept().await {
+            Ok((socket, _)) => {
+                let _ = socket.set_nodelay(true);
+                let config = config.clone();
+                tokio::spawn(crate::tcp::session::handle_mysql_connection(socket, config));
             }
             Err(e) => {
                 tracing::warn!(error = %e, "Error accepting TCP connection");
