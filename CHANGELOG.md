@@ -7,6 +7,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.3.0] — 2026-07-07
+
+### Added
+
+- Multi-dialect wire-protocol support via a runtime `WireProtocol` strategy: the
+  active protocol is selected at deploy time with `VETRO_WIRE_PROTOCOL`
+  (`postgres` | `mysql`; defaults to `postgres`, so existing deployments are
+  unchanged). The session loop — evaluation, telemetry, enforcement — is now
+  shared, protocol-agnostic code; each protocol supplies only its framing,
+  classification, and native block response.
+- **MySQL wire protocol (Phase 1)**: transparent proxy for the MySQL classic
+  protocol. Extracts SQL from `COM_QUERY` and `COM_STMT_PREPARE` (including the
+  `CLIENT_QUERY_ATTRIBUTES` prefix added by MySQL 8.0.23+), evaluates it with
+  `Dialect::Mysql`, and blocks destructive statements with a native `ERR_Packet`
+  (`ERROR 1142 … [VETRO-xxx]`) so the driver sees a SQL error, not a broken
+  connection. Configured with `UPSTREAM_MYSQL_HOST`/`PORT` and
+  `PROXY_MYSQL_LISTEN_PORT` (default 3307).
+- **MySQL TLS on both hops** (client→proxy and proxy→MySQL): the proxy
+  participates in the connection-phase handshake as a strict sequential auth
+  state machine (matching ProxySQL/MaxScale), terminating client-side TLS and
+  re-establishing TLS to the upstream. Both hops must share the "secure
+  connection" state or the `caching_sha2_password` scramble mismatches, so
+  single-hop TLS is unsupported by design. Enabled with `PROXY_TLS_MODE`/
+  `PROXY_TLS_CERT`/`PROXY_TLS_KEY` (client hop) and `UPSTREAM_MYSQL_SSLMODE`
+  (upstream hop).
+- Surface the dashboard-configured database `dialect` in `/sync/rules`; the
+  proxy logs a warning when the deployed `VETRO_WIRE_PROTOCOL` does not match it.
+
+### Fixed
+
+- CI could not fetch the private `vetro-engine` git dependency on any branch that
+  changed `Cargo.lock`: the credential rewrite treated the token as a username
+  (headless password prompt) and `~/.cargo/git` was cached with a stale,
+  unauthenticated checkout. Use `x-access-token:<token>` and drop `~/.cargo/git`
+  from the cache.
+
 ## [2.2.0] — 2026-06-27
 
 ### Changed
@@ -43,5 +79,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Optional control-plane link: ruleset hot-sync and telemetry reporting.
 - `/health` and `/metrics` (p50/p99 latency) endpoints.
 
-[Unreleased]: https://github.com/donkan168/vetro-proxy/compare/v1.0.0...HEAD
+[Unreleased]: https://github.com/donkan168/vetro-proxy/compare/v2.3.0...HEAD
+[2.3.0]: https://github.com/donkan168/vetro-proxy/compare/v2.2.0...v2.3.0
+[2.2.0]: https://github.com/donkan168/vetro-proxy/compare/v1.0.0...v2.2.0
 [1.0.0]: https://github.com/donkan168/vetro-proxy/releases/tag/v1.0.0

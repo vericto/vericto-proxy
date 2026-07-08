@@ -7,9 +7,13 @@
 [![Rust 1.88+](https://img.shields.io/badge/rust-1.88%2B-orange.svg)](https://www.rust-lang.org)
 
 `vetro-proxy` is the **customer-facing TCP wire-protocol proxy**. It intercepts
-every query via the PostgreSQL wire protocol, evaluates it with the
+every query on the database wire protocol, evaluates it with the
 [vetro-engine](https://github.com/donkan168/vetro-engine) AST parser, and either
 forwards it to the real database or blocks it — all in <2ms.
+
+The wire protocol is selected at deploy time with `VETRO_WIRE_PROTOCOL`
+(`postgres`, the default, or `mysql`). One proxy instance fronts one database
+and speaks exactly one protocol; see [MySQL support](#mysql-support) below.
 
 No AI, no stochastic heuristics — the same input always produces the same result.
 
@@ -92,6 +96,56 @@ for dev / air-gapped deployments).
 |-----------------|---------|-----------------------------------------------|
 | `RUST_LOG`      | `info`  | Log level (`info`, `debug`, `trace`)          |
 | `RUST_BACKTRACE`| `0`     | Set to `1` to enable backtraces on panic      |
+
+---
+
+## MySQL support
+
+Set `VETRO_WIRE_PROTOCOL=mysql` to front a MySQL database instead of PostgreSQL.
+The proxy speaks the MySQL classic protocol: it extracts SQL from `COM_QUERY`
+and `COM_STMT_PREPARE` (including the `CLIENT_QUERY_ATTRIBUTES` prefix that MySQL
+8.0.23+ prepends), evaluates it with the engine's `Mysql` dialect, and blocks
+destructive statements with a **native `ERR_Packet`** — the driver sees
+`ERROR 1142 (42000): … [VETRO-xxx]`, a normal SQL error, not a dropped
+connection. Safe queries are forwarded transparently.
+
+Internally the protocol is a runtime strategy (`WireProtocol`): the session
+loop — evaluation, telemetry, enforcement — is shared, and each protocol only
+supplies its own framing, classification, and native block response. The active
+protocol is fixed at startup (a live listener cannot change protocol), so the
+value must match the database it fronts. When the control-plane link is on, the
+proxy logs a warning if `VETRO_WIRE_PROTOCOL` disagrees with the dialect
+configured for that database in the dashboard.
+
+| Variable                  | Default | Description                                  |
+|---------------------------|---------|----------------------------------------------|
+| `VETRO_WIRE_PROTOCOL`     | `postgres` | `postgres` or `mysql`                     |
+| `UPSTREAM_MYSQL_HOST`     | —       | Hostname of the real MySQL database (required for `mysql`) |
+| `UPSTREAM_MYSQL_PORT`     | `3306`  | Port of the upstream MySQL database          |
+| `PROXY_MYSQL_LISTEN_PORT` | `3307`  | Port the MySQL proxy listens on              |
+| `UPSTREAM_MYSQL_SSLMODE`  | `disable` | `disable` \| `require` \| `verify-full` — TLS to the upstream (see below) |
+
+### TLS
+
+For MySQL, TLS must be enabled on **both** hops or neither — never just one.
+Unlike a byte-blind relay, the proxy participates in the connection-phase
+handshake (terminating client-side TLS, then re-establishing TLS to the
+upstream) because it has to read the queries. MySQL's `caching_sha2_password`
+and `mysql_native_password` derive their auth scramble from the "is this a
+secure connection" state, which must be identical on both sides — so a
+plaintext hop paired with a TLS hop breaks authentication by protocol design,
+not by a proxy limitation. This mirrors how ProxySQL/MaxScale treat each hop as
+an independently-authenticated connection.
+
+Enable both hops together:
+
+- **Client → proxy:** `PROXY_TLS_MODE=require` + `PROXY_TLS_CERT` / `PROXY_TLS_KEY`
+  (the proxy terminates TLS as the server; connect the client with
+  `--ssl-mode=REQUIRED`).
+- **Proxy → MySQL:** `UPSTREAM_MYSQL_SSLMODE=require` (or `verify-full`).
+
+For a trusted network (sidecar / private subnet) leave both plaintext, which is
+the default.
 
 ---
 

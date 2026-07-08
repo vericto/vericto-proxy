@@ -69,6 +69,13 @@ struct ProxyConfig {
     telemetry_batch_size: Option<usize>,
     telemetry_flush_secs: Option<u64>,
     telemetry_memory_capacity: Option<usize>,
+    /// SQL dialect of the fronted database, as configured in the dashboard
+    /// (postgres | mysql | oracle | mssql). The wire protocol is fixed at
+    /// startup by `VETRO_WIRE_PROTOCOL`; this is surfaced so an operator can
+    /// detect a mismatch between the deployed protocol and the dashboard's
+    /// dialect (logged as a warning on sync).
+    #[serde(default)]
+    dialect: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -255,6 +262,28 @@ pub async fn run(
                                 || pc.telemetry_memory_capacity.is_some()
                             {
                                 tracing::debug!(config = ?pc, "Proxy config received from dashboard");
+                            }
+                            // Warn if the dashboard's dialect for this database does not
+                            // match the wire protocol this proxy was started with. The
+                            // protocol is fixed at startup (a live listener can't change
+                            // protocol), so a mismatch means the proxy was deployed with
+                            // the wrong VETRO_WIRE_PROTOCOL for this database.
+                            if let Some(dialect) = pc.dialect.as_deref() {
+                                let proto = std::env::var("VETRO_WIRE_PROTOCOL")
+                                    .unwrap_or_else(|_| "postgres".into());
+                                let expected = matches!(
+                                    (proto.as_str(), dialect),
+                                    ("postgres", "postgres") | ("mysql", "mysql")
+                                );
+                                if !expected {
+                                    tracing::warn!(
+                                        wire_protocol = %proto,
+                                        dashboard_dialect = %dialect,
+                                        "Wire protocol does not match the database dialect configured \
+                                         in the dashboard — this proxy may be fronting the wrong database. \
+                                         Redeploy with the correct VETRO_WIRE_PROTOCOL."
+                                    );
+                                }
                             }
                         }
 

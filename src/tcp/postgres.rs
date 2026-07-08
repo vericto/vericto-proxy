@@ -20,18 +20,13 @@
 
 use std::sync::Arc;
 
-use std::time::Instant;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
 
 use crate::tcp::client_tls::{ClientRead, ClientWrite};
-use crate::tcp::codec::{
-    build_error_response, build_ready_for_query, extract_parse_query, extract_simple_query,
-    read_message, read_startup_packet, StartupPacket, SQLSTATE_INSUFFICIENT_PRIVILEGE,
-};
-use crate::tcp::evaluator::{evaluate, TcpDecision};
-use vetro_engine::parser::Dialect;
+use crate::tcp::codec::{read_startup_packet, StartupPacket};
+use crate::tcp::evaluator::TcpDecision;
 use vetro_engine::EnforcementAction;
 
 /// PostgreSQL TCP proxy configuration.
@@ -198,152 +193,29 @@ async fn relay_server_to_client(
     }
 }
 
-/// Main loop: reads client messages, intercepts Query/Parse, forwards the rest.
+/// Main loop: delegates to the protocol-agnostic interception loop with the
+/// PostgreSQL wire-protocol strategy. The framing/classification/block bytes
+/// (previously inline here) now live in `protocol::postgres`; evaluation,
+/// telemetry and enforcement live in `session`. Behavior is unchanged — the
+/// regression suite guards the Postgres path.
 async fn intercept_client_to_server(
     client_read: &mut ClientRead,
     server_write: &mut crate::tcp::upstream::UpstreamWrite,
     client_write: &Arc<Mutex<ClientWrite>>,
     config: &PgProxyConfig,
 ) -> std::io::Result<()> {
-    // In the extended protocol, if we block at Parse we must swallow the
-    // following messages until Sync ('S') and then send ReadyForQuery.
-    let mut skip_until_sync = false;
-
-    loop {
-        let msg = match read_message(client_read).await? {
-            Some(m) => m,
-            None => break, // client closed
-        };
-
-        if skip_until_sync {
-            if msg.tag == b'S' {
-                // Sync: close the aborted extended sequence.
-                send_to_client(client_write, &build_ready_for_query()).await?;
-                skip_until_sync = false;
-            }
-            continue; // swallow Bind/Describe/Execute/Flush
-        }
-
-        match msg.tag {
-            // Simple Query
-            b'Q' => {
-                if let Some(sql) = extract_simple_query(&msg) {
-                    // Read the current ruleset and policy lock-free (syncer may swap them).
-                    let rules = config.ruleset.load();
-                    let policy = config.policy.load();
-                    let eval_start = Instant::now();
-                    let decision = evaluate(&sql, Dialect::Postgres, &rules, &policy);
-                    let eval_us = eval_start.elapsed().as_micros();
-                    // Telemetry is emitted before any forwarding (R5.7).
-                    report_telemetry(config, &sql, &decision, eval_us);
-                    if let TcpDecision::Block {
-                        rule_code,
-                        ast_node_path,
-                        suggested_safe_query,
-                        ..
-                    } = decision
-                    {
-                        log_block(&sql, &rule_code, &ast_node_path);
-                        send_block_simple(
-                            client_write,
-                            &rule_code,
-                            &ast_node_path,
-                            suggested_safe_query.as_deref(),
-                        )
-                        .await?;
-                        continue;
-                    }
-                }
-                forward(server_write, &msg.encode()).await?;
-            }
-
-            // Parse (extended protocol)
-            b'P' => {
-                if let Some(sql) = extract_parse_query(&msg) {
-                    let rules = config.ruleset.load();
-                    let policy = config.policy.load();
-                    let eval_start = Instant::now();
-                    let decision = evaluate(&sql, Dialect::Postgres, &rules, &policy);
-                    let eval_us = eval_start.elapsed().as_micros();
-                    // Telemetry is emitted before any forwarding (R5.7).
-                    report_telemetry(config, &sql, &decision, eval_us);
-                    if let TcpDecision::Block {
-                        rule_code,
-                        ast_node_path,
-                        ..
-                    } = decision
-                    {
-                        log_block(&sql, &rule_code, &ast_node_path);
-                        let err = build_error_response(
-                            SQLSTATE_INSUFFICIENT_PRIVILEGE,
-                            &block_message(&rule_code, &ast_node_path, None),
-                        );
-                        send_to_client(client_write, &err).await?;
-                        skip_until_sync = true;
-                        continue;
-                    }
-                }
-                forward(server_write, &msg.encode()).await?;
-            }
-
-            // Terminate
-            b'X' => {
-                forward(server_write, &msg.encode()).await?;
-                break;
-            }
-
-            // Rest (Bind, Execute, Sync, PasswordMessage, etc.): forward as-is.
-            _ => {
-                forward(server_write, &msg.encode()).await?;
-            }
-        }
-    }
-
-    Ok(())
+    let proto = crate::tcp::protocol::postgres::PostgresProtocol;
+    crate::tcp::session::intercept_client_to_server(
+        &proto,
+        client_read,
+        server_write,
+        client_write,
+        config,
+    )
+    .await
 }
 
-/// Sends a block in the simple protocol: ErrorResponse + ReadyForQuery.
-async fn send_block_simple(
-    client_write: &Arc<Mutex<ClientWrite>>,
-    rule_code: &str,
-    ast_node_path: &str,
-    suggestion: Option<&str>,
-) -> std::io::Result<()> {
-    let err = build_error_response(
-        SQLSTATE_INSUFFICIENT_PRIVILEGE,
-        &block_message(rule_code, ast_node_path, suggestion),
-    );
-    let mut out = err;
-    out.extend_from_slice(&build_ready_for_query());
-    send_to_client(client_write, &out).await
-}
-
-fn block_message(rule_code: &str, ast_node_path: &str, suggestion: Option<&str>) -> String {
-    let base = format!("Vetro blocked this query [{rule_code}] — AST node: {ast_node_path}");
-    match suggestion {
-        Some(s) => format!("{base}. Suggestion: {s}"),
-        None => base,
-    }
-}
-
-async fn send_to_client(
-    client_write: &Arc<Mutex<ClientWrite>>,
-    bytes: &[u8],
-) -> std::io::Result<()> {
-    let mut writer = client_write.lock().await;
-    writer.write_all(bytes).await?;
-    writer.flush().await
-}
-
-async fn forward(
-    server_write: &mut crate::tcp::upstream::UpstreamWrite,
-    bytes: &[u8],
-) -> std::io::Result<()> {
-    server_write.write_all(bytes).await?;
-    server_write.flush().await
-}
-
-fn log_block(sql: &str, rule_code: &str, ast_node_path: &str) {
+pub(crate) fn log_block(sql: &str, rule_code: &str, ast_node_path: &str) {
     let preview: String = sql.chars().take(80).collect();
     tracing::info!(
         rule_code,
@@ -444,7 +316,12 @@ fn build_telemetry_event(
 
 /// Push a telemetry event for an evaluation. Non-blocking and best-effort: if no
 /// sink is configured this is a no-op, and the queue never blocks the SQL path.
-fn report_telemetry(config: &PgProxyConfig, sql: &str, decision: &TcpDecision, latency_us: u128) {
+pub(crate) fn report_telemetry(
+    config: &PgProxyConfig,
+    sql: &str,
+    decision: &TcpDecision,
+    latency_us: u128,
+) {
     use crate::tcp::rules_sync::TelemetryQueryMode;
 
     let Some(sink) = &config.telemetry else {
