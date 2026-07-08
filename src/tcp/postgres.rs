@@ -77,11 +77,11 @@ pub async fn handle_connection(client: TcpStream, config: Arc<PgProxyConfig>) {
 async fn run_session(client: TcpStream, config: Arc<PgProxyConfig>) -> std::io::Result<()> {
     // ── Phase 1: negotiate startup. Optionally terminate client TLS, then read
     // the StartupMessage. Returns the (possibly TLS) client halves.
-    let (mut client_read, client_write, startup_raw) =
+    let (mut client_read, mut client_write, startup_raw) =
         negotiate_startup(client, config.client_tls_acceptor.as_ref()).await?;
 
     // ── Phase 2: connect upstream (optionally over TLS) and forward the StartupMessage
-    let (server_read, mut server_write) = crate::tcp::upstream::connect_upstream(
+    let (server_read, mut server_write) = match crate::tcp::upstream::connect_upstream(
         &config.upstream_host,
         config.upstream_port,
         config.upstream_tls,
@@ -89,22 +89,87 @@ async fn run_session(client: TcpStream, config: Arc<PgProxyConfig>) -> std::io::
         config.upstream_client_cert.as_deref(),
         config.upstream_client_key.as_deref(),
     )
-    .await?;
+    .await
+    {
+        Ok(halves) => halves,
+        Err(e) => {
+            // The database is unreachable. The client is still in the connection
+            // phase (nothing has been sent to it yet), so it's safe and far more
+            // useful to answer with a native ErrorResponse than to drop the
+            // socket. The detail (host/port/cause) goes to logs only — the client
+            // gets a generic message so we don't leak internal topology.
+            tracing::warn!(
+                host = %config.upstream_host,
+                port = config.upstream_port,
+                error = %e,
+                "upstream connect failed; returning ErrorResponse to client"
+            );
+            let _ = client_write
+                .write_all(&crate::tcp::codec::build_error_response(
+                    crate::tcp::codec::SQLSTATE_CONNECTION_FAILURE,
+                    "Vetro: the database is temporarily unavailable",
+                ))
+                .await;
+            let _ = client_write.flush().await;
+            return Err(e);
+        }
+    };
     server_write.write_all(&startup_raw).await?;
     server_write.flush().await?;
 
     // ── Phase 3: the client write half is shared (relay + errors)
     let client_write = Arc::new(Mutex::new(client_write));
 
+    // Tracks whether the relay has forwarded any server byte to the client. Once
+    // it has, the client is mid-stream and injecting an ErrorResponse would
+    // corrupt the protocol; before then we can still surface a typed error.
+    let relay_wrote = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
     // Relay server→client (auth, data, notices) without intercepting.
-    let relay_handle = tokio::spawn(relay_server_to_client(server_read, client_write.clone()));
+    let relay_handle = tokio::spawn(relay_server_to_client(
+        server_read,
+        client_write.clone(),
+        relay_wrote.clone(),
+    ));
 
     // ── Phase 4: client→server interception loop
-    let result =
-        intercept_client_to_server(&mut client_read, &mut server_write, &client_write, &config)
-            .await;
+    //
+    // Run the intercept loop and the relay CONCURRENTLY and let whichever ends
+    // first tear down the other. This matters for resilience: if the upstream
+    // dies (e.g. mid-auth), the relay task finishes on EOF while the intercept
+    // loop is still blocked reading from the client — the client is waiting for
+    // a server reply that will never come. Without this join, `run_session`
+    // would await the intercept forever and leak a hung client connection.
+    // `select!` returns as soon as the relay completes, and dropping this
+    // function's futures closes the sockets, unwinding the client side too.
+    let mut relay_handle = relay_handle;
+    let result = tokio::select! {
+        r = intercept_client_to_server(&mut client_read, &mut server_write, &client_write, &config) => {
+            // Client ended or a block/forward error unwound the loop: stop the relay.
+            relay_handle.abort();
+            r
+        }
+        _ = &mut relay_handle => {
+            // Upstream closed/errored: the relay ended. If it never delivered a
+            // byte to the client (the upstream died during the connection phase,
+            // e.g. mid-auth), the client is still waiting for a startup reply, so
+            // send a native ErrorResponse before closing. If bytes were already
+            // relayed, the stream is mid-session and injecting one would corrupt
+            // it — fall back to a plain close.
+            if !relay_wrote.load(std::sync::atomic::Ordering::Relaxed) {
+                let mut w = client_write.lock().await;
+                let _ = w
+                    .write_all(&crate::tcp::codec::build_error_response(
+                        crate::tcp::codec::SQLSTATE_CONNECTION_FAILURE,
+                        "Vetro: the database connection was lost",
+                    ))
+                    .await;
+                let _ = w.flush().await;
+            }
+            Ok(())
+        }
+    };
 
-    relay_handle.abort();
     result
 }
 
@@ -174,9 +239,16 @@ async fn read_startup_message<R: AsyncRead + Unpin>(reader: &mut R) -> std::io::
 }
 
 /// Relays bytes from the server to the client without intercepting.
+///
+/// `wrote_any` is flipped to `true` the first time a byte is successfully
+/// written to the client. `run_session` reads it when the relay ends to decide
+/// whether it is still safe to inject a native `ErrorResponse`: once server
+/// bytes have reached the client (auth/rows in flight), injecting one would
+/// corrupt the protocol stream, so it must fall back to a plain close.
 async fn relay_server_to_client(
     mut server_read: crate::tcp::upstream::UpstreamRead,
     client_write: Arc<Mutex<ClientWrite>>,
+    wrote_any: Arc<std::sync::atomic::AtomicBool>,
 ) {
     let mut buf = vec![0u8; 16 * 1024];
     loop {
@@ -187,6 +259,7 @@ async fn relay_server_to_client(
                 if writer.write_all(&buf[..n]).await.is_err() || writer.flush().await.is_err() {
                     break;
                 }
+                wrote_any.store(true, std::sync::atomic::Ordering::Relaxed);
             }
             Err(_) => break,
         }
@@ -473,5 +546,284 @@ mod tests {
         // Malformed SQL must not leak — a fixed marker is returned instead.
         let out = sanitize_query("SELEC * FORM users WHER id = 1");
         assert_eq!(out, "<unparseable query redacted>");
+    }
+
+    // ── Upstream-failure resilience ──────────────────────────────────────────
+    //
+    // The proxy sits in the production hot path, so its behavior when the real
+    // database is unreachable or drops mid-session must be verified, not
+    // assumed. These tests drive the REAL session entrypoint (`handle_connection`
+    // → `run_session`) against a controllable fake upstream and assert the
+    // observable contract from the client's side:
+    //
+    //   * connection phase: if the upstream refuses or dies before startup is
+    //     forwarded, the client connection is closed (fail-closed to traffic —
+    //     no query ever reaches a database), and the proxy task terminates
+    //     rather than hanging a connection open.
+    //   * command phase: if the upstream dies after startup, the relay/intercept
+    //     loops unwind and the session ends (no dangling task, no deadlock).
+    //
+    // During the connection phase the proxy answers a native ErrorResponse
+    // (SQLSTATE 08006, connection_failure) so the driver surfaces a typed error
+    // instead of a bare closed socket. Once server bytes are already flowing the
+    // stream is mid-session and it falls back to a plain close (injecting there
+    // would corrupt the protocol).
+    use crate::tcp::codec::{PgMessage, SQLSTATE_CONNECTION_FAILURE};
+    use arc_swap::ArcSwap;
+    use tokio::net::{TcpListener, TcpStream};
+
+    /// Reads one message from the client socket and asserts it is a PostgreSQL
+    /// `ErrorResponse` ('E') carrying the given SQLSTATE (field 'C'). Returns the
+    /// decoded fields for further inspection.
+    async fn read_error_response(client: &mut TcpStream, expect_sqlstate: &str) {
+        let mut header = [0u8; 5]; // tag + Int32 len
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            client.read_exact(&mut header),
+        )
+        .await
+        .expect("client read must not hang")
+        .expect("expected an ErrorResponse, got EOF/error");
+        assert_eq!(header[0], b'E', "expected ErrorResponse tag 'E'");
+        let len = i32::from_be_bytes([header[1], header[2], header[3], header[4]]) as usize;
+        let mut body = vec![0u8; len - 4];
+        client
+            .read_exact(&mut body)
+            .await
+            .expect("short ErrorResponse body");
+        // Body is a sequence of [field-byte][cstring]; find the 'C' (SQLSTATE).
+        let mut i = 0;
+        let mut sqlstate = None;
+        while i < body.len() && body[i] != 0 {
+            let field = body[i];
+            i += 1;
+            let start = i;
+            while i < body.len() && body[i] != 0 {
+                i += 1;
+            }
+            let value = std::str::from_utf8(&body[start..i]).unwrap_or("");
+            if field == b'C' {
+                sqlstate = Some(value.to_string());
+            }
+            i += 1; // skip the cstring terminator
+        }
+        assert_eq!(
+            sqlstate.as_deref(),
+            Some(expect_sqlstate),
+            "ErrorResponse must carry SQLSTATE {expect_sqlstate}"
+        );
+    }
+
+    /// Builds a minimal `PgProxyConfig` pointing at `upstream` (host, port), with
+    /// the built-in ruleset, default policy, no client TLS and no telemetry.
+    fn test_config(upstream_host: &str, upstream_port: u16) -> Arc<PgProxyConfig> {
+        Arc::new(PgProxyConfig {
+            upstream_host: upstream_host.to_string(),
+            upstream_port,
+            upstream_tls: crate::tcp::upstream::UpstreamTlsMode::Disable,
+            upstream_ca_path: None,
+            upstream_client_cert: None,
+            upstream_client_key: None,
+            client_tls_acceptor: None,
+            ruleset: Arc::new(ArcSwap::from_pointee(
+                crate::tcp::evaluator::default_ruleset(),
+            )),
+            policy: Arc::new(ArcSwap::from_pointee(
+                vetro_engine::EnforcementPolicy::default(),
+            )),
+            telemetry_mode: Arc::new(ArcSwap::from_pointee(
+                crate::tcp::rules_sync::TelemetryQueryMode::default(),
+            )),
+            telemetry: None,
+        })
+    }
+
+    /// A minimal, well-formed pgwire v3 StartupMessage (protocol 3.0) carrying
+    /// `user=app`. Enough to get the proxy past startup parsing and into the
+    /// upstream-connect phase.
+    fn startup_message() -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(&196_608i32.to_be_bytes()); // protocol 3.0
+        body.extend_from_slice(b"user\0app\0");
+        body.push(0); // terminator
+        let mut msg = Vec::new();
+        msg.extend_from_slice(&((body.len() + 4) as i32).to_be_bytes());
+        msg.extend_from_slice(&body);
+        msg
+    }
+
+    /// Reserves a TCP port and immediately drops the listener, yielding an
+    /// address where `connect` will be refused (nothing is listening).
+    async fn dead_upstream_addr() -> std::net::SocketAddr {
+        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        drop(l);
+        addr
+    }
+
+    #[tokio::test]
+    async fn upstream_connection_refused_closes_client_without_hanging() {
+        let dead = dead_upstream_addr().await;
+        let config = test_config(&dead.ip().to_string(), dead.port());
+
+        // The proxy listens; a client connects and completes startup.
+        let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (client, _) = proxy.accept().await.unwrap();
+            // Drive the real session handler; it must return (not hang) once the
+            // upstream connect fails.
+            handle_connection(client, config).await;
+        });
+
+        let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+        client.write_all(&startup_message()).await.unwrap();
+        client.flush().await.unwrap();
+
+        // Fail-closed to traffic (no query ever reaches a database), but the
+        // client gets a typed error rather than a bare EOF: a native
+        // ErrorResponse with SQLSTATE 08006 (connection_failure).
+        read_error_response(&mut client, SQLSTATE_CONNECTION_FAILURE).await;
+
+        // The session task must have terminated (no dangling connection).
+        tokio::time::timeout(std::time::Duration::from_secs(5), server)
+            .await
+            .expect("session task must terminate when upstream connect fails")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn upstream_accepts_then_drops_during_auth_ends_session() {
+        // Fake upstream that accepts the TCP connection, reads the forwarded
+        // StartupMessage, then drops the socket — simulating a DB that dies
+        // right after accepting (before completing the auth handshake).
+        let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream.local_addr().unwrap();
+        let upstream_task = tokio::spawn(async move {
+            let (mut sock, _) = upstream.accept().await.unwrap();
+            let mut buf = [0u8; 128];
+            let _ = sock.read(&mut buf).await; // read the forwarded startup
+            drop(sock); // die mid-auth
+        });
+
+        let config = test_config(&upstream_addr.ip().to_string(), upstream_addr.port());
+        let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (client, _) = proxy.accept().await.unwrap();
+            handle_connection(client, config).await;
+        });
+
+        let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+        client.write_all(&startup_message()).await.unwrap();
+        client.flush().await.unwrap();
+
+        // The upstream dropped after startup but before any byte reached the
+        // client, so the client is still in the connection phase: it must get a
+        // native ErrorResponse (08006), not a hang and not a bare EOF. This is
+        // the case that used to deadlock.
+        read_error_response(&mut client, SQLSTATE_CONNECTION_FAILURE).await;
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), server)
+            .await
+            .expect("session task must terminate when upstream drops mid-auth")
+            .unwrap();
+        let _ = upstream_task.await;
+    }
+
+    #[tokio::test]
+    async fn no_query_reaches_a_database_when_upstream_is_down() {
+        // Guard the security-relevant invariant explicitly: with the upstream
+        // unreachable, the session ends during connect — the interception loop
+        // (which forwards allowed queries) is never entered, so no client SQL
+        // can slip through to a database. We assert the session returns quickly
+        // and the client is closed before any command-phase byte is exchanged.
+        let dead = dead_upstream_addr().await;
+        let config = test_config(&dead.ip().to_string(), dead.port());
+        let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (client, _) = proxy.accept().await.unwrap();
+            handle_connection(client, config).await;
+        });
+
+        let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+        client.write_all(&startup_message()).await.unwrap();
+        client.flush().await.unwrap();
+        // Try to push a query as if authenticated; it must never be forwarded
+        // (there is no upstream to forward to and the session is unwinding).
+        let query = PgMessage {
+            tag: b'Q',
+            body: b"SELECT 1\0".to_vec(),
+        }
+        .encode();
+        let _ = client.write_all(&query).await; // may error if already closed
+
+        // The only thing the client receives is the connection-failure
+        // ErrorResponse — never a result for its query, because the upstream was
+        // unreachable and the interception loop (which forwards allowed queries)
+        // was never entered.
+        read_error_response(&mut client, SQLSTATE_CONNECTION_FAILURE).await;
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), server)
+            .await
+            .expect("session must terminate")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn upstream_death_after_data_flowing_falls_back_to_close() {
+        // Once the upstream has sent bytes that the relay forwarded to the client
+        // (session established), a later upstream death must NOT inject an
+        // ErrorResponse — that would corrupt the mid-stream protocol. The client
+        // instead sees the relayed bytes followed by a clean close (EOF).
+        let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream.local_addr().unwrap();
+        let upstream_task = tokio::spawn(async move {
+            let (mut sock, _) = upstream.accept().await.unwrap();
+            let mut buf = [0u8; 128];
+            let _ = sock.read(&mut buf).await; // read forwarded startup
+                                               // Send a byte pattern that is NOT an ErrorResponse (tag 'R' =
+                                               // Authentication), so the test can tell relayed data from an injected
+                                               // error, then die.
+            let _ = sock.write_all(&[b'R', 0, 0, 0, 8, 0, 0, 0, 0]).await;
+            let _ = sock.flush().await;
+            drop(sock);
+        });
+
+        let config = test_config(&upstream_addr.ip().to_string(), upstream_addr.port());
+        let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (client, _) = proxy.accept().await.unwrap();
+            handle_connection(client, config).await;
+        });
+
+        let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+        client.write_all(&startup_message()).await.unwrap();
+        client.flush().await.unwrap();
+
+        // First byte the client sees is the relayed server message (tag 'R'),
+        // NOT an injected ErrorResponse ('E').
+        let mut tag = [0u8; 1];
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            client.read_exact(&mut tag),
+        )
+        .await
+        .expect("must not hang")
+        .expect("expected relayed server bytes");
+        assert_eq!(
+            tag[0], b'R',
+            "expected relayed server byte, not an injected error"
+        );
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), server)
+            .await
+            .expect("session must terminate after upstream dies mid-session")
+            .unwrap();
+        let _ = upstream_task.await;
     }
 }

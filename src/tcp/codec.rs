@@ -16,6 +16,12 @@ pub const GSS_REQUEST_CODE: i32 = 80_877_104;
 /// SQLSTATE returned when blocking a query (insufficient_privilege).
 pub const SQLSTATE_INSUFFICIENT_PRIVILEGE: &str = "42501";
 
+/// SQLSTATE returned when the upstream database is unreachable
+/// (connection_failure, class 08). Sent to the client as a native
+/// `ErrorResponse` during the connection phase so the driver surfaces a typed
+/// error instead of a bare closed socket.
+pub const SQLSTATE_CONNECTION_FAILURE: &str = "08006";
+
 /// Maximum accepted message size (anti-DoS defense). 64MB.
 const MAX_MESSAGE_LEN: usize = 64 * 1024 * 1024;
 
