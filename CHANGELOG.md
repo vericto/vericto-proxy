@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.0.0] — 2026-07-08
+
+### Changed (breaking)
+
+- **Dialect-agnostic environment variables.** The upstream/listen configuration
+  is no longer prefixed per engine. Rename in every deployment:
+  - `UPSTREAM_PG_HOST` / `UPSTREAM_MYSQL_HOST` → `UPSTREAM_HOST`
+  - `UPSTREAM_PG_PORT` / `UPSTREAM_MYSQL_PORT` → `UPSTREAM_PORT`
+  - `PROXY_PG_LISTEN_PORT` / `PROXY_MYSQL_LISTEN_PORT` → `PROXY_LISTEN_PORT`
+  - `UPSTREAM_PG_SSLMODE` / `UPSTREAM_MYSQL_SSLMODE` → `UPSTREAM_SSLMODE`
+  - `UPSTREAM_PG_SSLROOTCERT` → `UPSTREAM_SSLROOTCERT`
+  - `UPSTREAM_PG_SSLCERT` / `UPSTREAM_PG_SSLKEY` → `UPSTREAM_SSLCERT` / `UPSTREAM_SSLKEY`
+
+  The wire protocol is still selected by `VETRO_WIRE_PROTOCOL` (`postgres` |
+  `mysql`), which now only changes the DEFAULT ports (Postgres 5432/5433, MySQL
+  3306/3307) when they are not set explicitly. There is no backward-compatible
+  fallback — the old names are ignored.
+
+### Fixed
+
+- **Upstream-failure resilience.** If the upstream ended while the intercept
+  loop was blocked reading from the client (e.g. the database dies mid-auth),
+  the session used to leak a hung client connection. The relay and intercept are
+  now joined so either end tears down the other. During the connection phase the
+  proxy also answers a native `ErrorResponse` (`SQLSTATE 08006`) instead of a
+  bare closed socket; once bytes are already flowing it falls back to a clean
+  close to avoid corrupting the stream.
+- **Docker image build.** The production `Dockerfile` produced a stub binary
+  (missing `Cargo.toml`/lockfile in the builder stage) and failed the private
+  git-dependency fetch (token treated as username, missing
+  `CARGO_NET_GIT_FETCH_WITH_CLI`). It now builds the real binary.
+
 ## [2.3.0] — 2026-07-07
 
 ### Added
@@ -79,7 +111,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Optional control-plane link: ruleset hot-sync and telemetry reporting.
 - `/health` and `/metrics` (p50/p99 latency) endpoints.
 
-[Unreleased]: https://github.com/donkan168/vetro-proxy/compare/v2.3.0...HEAD
+[Unreleased]: https://github.com/donkan168/vetro-proxy/compare/v3.0.0...HEAD
+[3.0.0]: https://github.com/donkan168/vetro-proxy/compare/v2.3.0...v3.0.0
 [2.3.0]: https://github.com/donkan168/vetro-proxy/compare/v2.2.0...v2.3.0
 [2.2.0]: https://github.com/donkan168/vetro-proxy/compare/v1.0.0...v2.2.0
 [1.0.0]: https://github.com/donkan168/vetro-proxy/releases/tag/v1.0.0

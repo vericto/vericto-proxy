@@ -50,61 +50,43 @@ impl TcpProxyOptions {
     /// Reads the TCP proxy configuration from environment variables.
     /// Returns `None` if the upstream is not configured (TCP proxy disabled).
     ///
-    /// The wire protocol is chosen by `VETRO_WIRE_PROTOCOL` (postgres|mysql,
-    /// default postgres). For MySQL the upstream/listen ports come from the
-    /// `*_MYSQL_*` vars; for Postgres from the existing `*_PG_*` vars.
+    /// The variables are dialect-agnostic — the same `UPSTREAM_*` / `PROXY_*`
+    /// names apply to every engine. The wire protocol is chosen by
+    /// `VETRO_WIRE_PROTOCOL` (postgres|mysql, default postgres); it only changes
+    /// the DEFAULT ports (Postgres 5432/5433, MySQL 3306/3307) when they are not
+    /// set explicitly.
     pub fn from_env() -> Option<Self> {
         let is_mysql = matches!(std::env::var("VETRO_WIRE_PROTOCOL").as_deref(), Ok("mysql"));
-        if is_mysql {
-            let upstream_host = std::env::var("UPSTREAM_MYSQL_HOST").ok()?;
-            let listen_port = std::env::var("PROXY_MYSQL_LISTEN_PORT")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(3307);
-            let upstream_port = std::env::var("UPSTREAM_MYSQL_PORT")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(3306);
-            return Some(Self {
-                listen_port,
-                upstream_host,
-                upstream_port,
-                database_id: std::env::var("VETRO_DATABASE_ID").ok(),
-                // Upstream TLS (proxy→MySQL): UPSTREAM_MYSQL_SSLMODE=require|verify-full.
-                upstream_tls: crate::tcp::upstream::UpstreamTlsMode::from_env_str(
-                    &std::env::var("UPSTREAM_MYSQL_SSLMODE").unwrap_or_default(),
-                ),
-                upstream_ca_path: std::env::var("UPSTREAM_MYSQL_SSLROOTCERT").ok(),
-                upstream_client_cert: None,
-                upstream_client_key: None,
-                // Client TLS (client→proxy): PROXY_TLS_MODE + PROXY_TLS_CERT/KEY.
-                client_tls: ClientTlsMode::from_env_str(
-                    &std::env::var("PROXY_TLS_MODE").unwrap_or_default(),
-                ),
-                client_tls_cert: std::env::var("PROXY_TLS_CERT").ok(),
-                client_tls_key: std::env::var("PROXY_TLS_KEY").ok(),
-            });
-        }
-        let upstream_host = std::env::var("UPSTREAM_PG_HOST").ok()?;
-        let listen_port = std::env::var("PROXY_PG_LISTEN_PORT")
+        // Protocol-derived port defaults (upstream, listen). Only used when the
+        // corresponding env var is absent.
+        let (default_upstream_port, default_listen_port) =
+            if is_mysql { (3306, 3307) } else { (5432, 5433) };
+
+        let upstream_host = std::env::var("UPSTREAM_HOST").ok()?;
+        let upstream_port = std::env::var("UPSTREAM_PORT")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(5433);
-        let upstream_port = std::env::var("UPSTREAM_PG_PORT")
+            .unwrap_or(default_upstream_port);
+        let listen_port = std::env::var("PROXY_LISTEN_PORT")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(5432);
+            .unwrap_or(default_listen_port);
+
         Some(Self {
             listen_port,
             upstream_host,
             upstream_port,
             database_id: std::env::var("VETRO_DATABASE_ID").ok(),
+            // Upstream TLS (proxy→database): UPSTREAM_SSLMODE=require|verify-full.
             upstream_tls: crate::tcp::upstream::UpstreamTlsMode::from_env_str(
-                &std::env::var("UPSTREAM_PG_SSLMODE").unwrap_or_default(),
+                &std::env::var("UPSTREAM_SSLMODE").unwrap_or_default(),
             ),
-            upstream_ca_path: std::env::var("UPSTREAM_PG_SSLROOTCERT").ok(),
-            upstream_client_cert: std::env::var("UPSTREAM_PG_SSLCERT").ok(),
-            upstream_client_key: std::env::var("UPSTREAM_PG_SSLKEY").ok(),
+            upstream_ca_path: std::env::var("UPSTREAM_SSLROOTCERT").ok(),
+            // Upstream mutual TLS (client cert the proxy presents to the DB).
+            // Currently honored on the Postgres hop; ignored by the MySQL path.
+            upstream_client_cert: std::env::var("UPSTREAM_SSLCERT").ok(),
+            upstream_client_key: std::env::var("UPSTREAM_SSLKEY").ok(),
+            // Client TLS (client→proxy): PROXY_TLS_MODE + PROXY_TLS_CERT/KEY.
             client_tls: ClientTlsMode::from_env_str(
                 &std::env::var("PROXY_TLS_MODE").unwrap_or_default(),
             ),

@@ -8,7 +8,8 @@
 //! pulled from the API on a configurable polling interval (default: 5 min).
 //!
 //! Required env vars for TCP mode:
-//!   UPSTREAM_PG_HOST — the real PostgreSQL host to forward safe queries to
+//!   UPSTREAM_HOST — the real database host to forward safe queries to
+//!                   (dialect-agnostic; VETRO_WIRE_PROTOCOL selects the protocol)
 //!
 //! Optional env vars for control-plane link:
 //!   VETRO_API_URL    — e.g. https://api.vetro.dev
@@ -41,8 +42,8 @@ async fn main() {
 
     let Some(tcp_opts) = tcp::TcpProxyOptions::from_env() else {
         tracing::error!(
-            "UPSTREAM_PG_HOST is not set — vetro-proxy requires a PostgreSQL upstream to proxy to. \
-             Set UPSTREAM_PG_HOST to the hostname of your production database."
+            "UPSTREAM_HOST is not set — vetro-proxy requires a database upstream to proxy to. \
+             Set UPSTREAM_HOST to the hostname of your production database."
         );
         std::process::exit(1);
     };

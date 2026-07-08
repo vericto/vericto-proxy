@@ -61,7 +61,7 @@ struct SyncResponse {
 }
 
 /// Settings configurable from the Vetro dashboard, applied without restart.
-/// TLS to the upstream database (UPSTREAM_PG_SSLMODE + certificate) is NOT here —
+/// TLS to the upstream database (UPSTREAM_SSLMODE + certificate) is NOT here —
 /// it's an env var because it requires mounting a CA certificate in the container.
 #[derive(Debug, Deserialize, Default)]
 struct ProxyConfig {
