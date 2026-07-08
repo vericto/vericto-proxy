@@ -1,6 +1,6 @@
 # Vetro Proxy
 
-> Transparent PostgreSQL TCP proxy — deterministic SQL firewall in the wire path.
+> Transparent SQL TCP proxy — deterministic SQL firewall in the wire path.
 
 [![CI](https://github.com/donkan168/vetro-proxy/actions/workflows/ci.yml/badge.svg)](https://github.com/donkan168/vetro-proxy/actions/workflows/ci.yml)
 [![License: ELv2](https://img.shields.io/badge/license-Elastic--2.0-blue.svg)](LICENSE)
@@ -11,14 +11,22 @@ every query on the database wire protocol, evaluates it with the
 [vetro-engine](https://github.com/donkan168/vetro-engine) AST parser, and either
 forwards it to the real database or blocks it — all in <2ms.
 
-The wire protocol is selected at deploy time with `VETRO_WIRE_PROTOCOL`
-(`postgres`, the default, or `mysql`). One proxy instance fronts one database
-and speaks exactly one protocol; see [MySQL support](#mysql-support) below.
+One proxy instance fronts one database and speaks exactly one wire protocol,
+chosen at deploy time with `VETRO_WIRE_PROTOCOL`:
+
+| `VETRO_WIRE_PROTOCOL` | Databases | Block response |
+|-----------------------|-----------|----------------|
+| `postgres` (default)  | PostgreSQL | native `ErrorResponse` `SQLSTATE 42501` |
+| `mysql`               | MySQL      | native `ERR_Packet` `ERROR 1142` |
+
+Everything else — configuration, evaluation, telemetry — is **the same across
+engines**. Only the value above and (optionally) the default ports change.
 
 No AI, no stochastic heuristics — the same input always produces the same result.
 
-> **For HTTP evaluation** (CI/CD dry-runs, dashboard): use
-> [vetro-eval](https://github.com/donkan168/vetro-eval) instead.
+> **Other dialects** (Oracle, SQL Server): evaluate via the HTTP API
+> ([vetro-eval](https://github.com/donkan168/vetro-eval)); there is no wire
+> proxy for them.
 
 ---
 
@@ -27,13 +35,13 @@ No AI, no stochastic heuristics — the same input always produces the same resu
 ```
 Your app / ORM
      │
-     │  PostgreSQL wire protocol (port 5433)
+     │  SQL wire protocol (proxy listen port, default 5433)
      ▼
  vetro-proxy   ──── vetro-engine (lib) ────►  ALLOWED / BLOCKED
      │
      │  (if ALLOWED) forwards query
      ▼
- PostgreSQL upstream
+ Real database upstream
 ```
 
 Point your `DATABASE_URL` host at `vetro-proxy` instead of your real database.
@@ -51,44 +59,74 @@ No code changes required — your ORM/driver is unaware of the proxy.
 - `SELECT *` without `WHERE`, `SELECT` without `LIMIT`
 - … [full rule list →](https://vetro.dev/rules)
 
-Blocked queries return a native PostgreSQL error `SQLSTATE 42501`
-(insufficient_privilege) — no special handling needed in your application.
+A blocked query is returned as a **native error** for the active protocol (see
+the table above), so no special handling is needed in your application.
 
 ---
 
-## Environment variables
+## Configuration
+
+All variables are **dialect-agnostic** — the same names apply to every engine.
 
 ### Required
 
-| Variable           | Description                                            |
-|--------------------|--------------------------------------------------------|
-| `UPSTREAM_PG_HOST` | Hostname of the real PostgreSQL database to proxy to  |
+| Variable       | Description                                             |
+|----------------|---------------------------------------------------------|
+| `UPSTREAM_HOST`| Hostname of the real database to proxy to               |
 
-### Optional — TCP proxy
+### Ports
 
-| Variable              | Default | Description                                     |
-|-----------------------|---------|------------------------------------------------|
-| `PROXY_PG_LISTEN_PORT`| `5433`  | Port the TCP proxy listens on                  |
-| `UPSTREAM_PG_PORT`    | `5432`  | Port of the upstream PostgreSQL database       |
+| Variable            | Default | Description                                   |
+|---------------------|---------|-----------------------------------------------|
+| `UPSTREAM_PORT`     | protocol default¹ | Port of the upstream database        |
+| `PROXY_LISTEN_PORT` | protocol default¹ | Port the proxy listens on            |
 
-### Optional — control-plane link (telemetry + rule sync)
+¹ Defaults follow `VETRO_WIRE_PROTOCOL`: **Postgres** `5432` upstream / `5433`
+listen; **MySQL** `3306` upstream / `3307` listen.
 
-When `VETRO_API_URL` and `VETRO_API_KEY` are set, the proxy reports blocked
-queries to the Vetro API and polls the active ruleset every 5 minutes.
-Without them the proxy runs with the built-in default ruleset only (suitable
-for dev / air-gapped deployments).
+### Control-plane link (telemetry + rule sync)
+
+Recommended for production. When `VETRO_API_URL`, `VETRO_API_KEY` **and**
+`VETRO_DATABASE_ID` are set, the proxy reports every decision and polls the
+active ruleset. Without the link it still protects using the built-in ruleset
+(dev / air-gapped), but reports nothing.
+
+> **All three are needed for telemetry.** Without `VETRO_DATABASE_ID` no events
+> are emitted at all (there is nothing to attribute them to) — even if the API
+> URL and key are set. It is also the key the control-plane uses to correlate
+> telemetry and resolve per-database rules.
 
 | Variable                          | Default | Description                                      |
 |-----------------------------------|---------|--------------------------------------------------|
 | `VETRO_API_URL`                   | —       | e.g. `https://api.vetro.dev`                     |
 | `VETRO_API_KEY`                   | —       | Workspace API key (`vtro_...`)                   |
-| `VETRO_DATABASE_ID`               | —       | UUID of the database record in the Vetro platform|
-| `VETRO_RULES_SYNC_INTERVAL_SECS`  | `300`   | How often to poll `/sync/rules` (seconds, minimum: 30) |
+| `VETRO_DATABASE_ID`               | —       | UUID of the database record; enables + correlates telemetry |
+| `VETRO_RULES_SYNC_INTERVAL_SECS`  | `300`   | How often to poll `/sync/rules` (min 30)         |
 | `VETRO_TELEMETRY_BUFFER`          | `memory`| `memory` or `disk` (survives restarts)           |
-| `VETRO_TELEMETRY_DISK_PATH`       | `/var/lib/vetro/spool` | Spool dir when `buffer_mode=disk`  |
-| `VETRO_TELEMETRY_MEMORY_CAPACITY` | `10000` | Max events in memory ring buffer                 |
+| `VETRO_TELEMETRY_DISK_PATH`       | `/var/lib/vetro/spool` | Spool dir when buffer=disk        |
+| `VETRO_TELEMETRY_MEMORY_CAPACITY` | `10000` | Max events in the memory ring buffer             |
 | `VETRO_TELEMETRY_BATCH_SIZE`      | `100`   | Max events per POST `/ingest/events`             |
-| `VETRO_TELEMETRY_FLUSH_SECS`      | `5`     | How often the reporter flushes (seconds)         |
+| `VETRO_TELEMETRY_FLUSH_SECS`      | `5`     | How often the reporter flushes                   |
+
+### TLS (optional)
+
+Encrypts each hop independently. `UPSTREAM_SSLMODE` covers the proxy→database
+hop; `PROXY_TLS_MODE` covers the client→proxy hop.
+
+| Variable             | Values / Default | Description                              |
+|----------------------|------------------|------------------------------------------|
+| `UPSTREAM_SSLMODE`   | `disable` (def) \| `require` \| `verify-full` | TLS to the database |
+| `UPSTREAM_SSLROOTCERT`| —               | CA bundle (PEM) for `verify-full`        |
+| `UPSTREAM_SSLCERT` / `UPSTREAM_SSLKEY` | —  | Client cert for upstream mutual TLS (Postgres) |
+| `PROXY_TLS_MODE`     | `disable` (def) \| `require` | Terminate client-side TLS     |
+| `PROXY_TLS_CERT` / `PROXY_TLS_KEY` | —  | Server cert/key presented to clients     |
+
+> **MySQL TLS caveat:** TLS must be on **both** hops or neither — never one. The
+> proxy participates in the handshake, and MySQL derives its auth scramble from
+> the "secure connection" state, so a plaintext hop paired with a TLS hop breaks
+> authentication by protocol design. Set `PROXY_TLS_MODE=require` **and**
+> `UPSTREAM_SSLMODE=require` together (or leave both off). See
+> [engine-specific notes](#engine-specific-notes).
 
 ### Observability
 
@@ -99,64 +137,38 @@ for dev / air-gapped deployments).
 
 ---
 
-## MySQL support
+## Engine-specific notes
 
-Set `VETRO_WIRE_PROTOCOL=mysql` to front a MySQL database instead of PostgreSQL.
-The proxy speaks the MySQL classic protocol: it extracts SQL from `COM_QUERY`
-and `COM_STMT_PREPARE` (including the `CLIENT_QUERY_ATTRIBUTES` prefix that MySQL
-8.0.23+ prepends), evaluates it with the engine's `Mysql` dialect, and blocks
-destructive statements with a **native `ERR_Packet`** — the driver sees
-`ERROR 1142 (42000): … [VETRO-xxx]`, a normal SQL error, not a dropped
-connection. Safe queries are forwarded transparently.
+Only two things differ per engine; everything above is shared.
 
-Internally the protocol is a runtime strategy (`WireProtocol`): the session
-loop — evaluation, telemetry, enforcement — is shared, and each protocol only
-supplies its own framing, classification, and native block response. The active
-protocol is fixed at startup (a live listener cannot change protocol), so the
-value must match the database it fronts. When the control-plane link is on, the
-proxy logs a warning if `VETRO_WIRE_PROTOCOL` disagrees with the dialect
-configured for that database in the dashboard.
+- **`VETRO_WIRE_PROTOCOL`** selects the protocol and the default ports (see
+  [Ports](#ports)).
+- **Block response** is native to each protocol: Postgres `ErrorResponse`
+  (`SQLSTATE 42501`), MySQL `ERR_Packet` (`ERROR 1142`). Either way the driver
+  sees a normal SQL error and the connection stays open.
 
-| Variable                  | Default | Description                                  |
-|---------------------------|---------|----------------------------------------------|
-| `VETRO_WIRE_PROTOCOL`     | `postgres` | `postgres` or `mysql`                     |
-| `UPSTREAM_MYSQL_HOST`     | —       | Hostname of the real MySQL database (required for `mysql`) |
-| `UPSTREAM_MYSQL_PORT`     | `3306`  | Port of the upstream MySQL database          |
-| `PROXY_MYSQL_LISTEN_PORT` | `3307`  | Port the MySQL proxy listens on              |
-| `UPSTREAM_MYSQL_SSLMODE`  | `disable` | `disable` \| `require` \| `verify-full` — TLS to the upstream (see below) |
+### MySQL details
 
-### TLS
-
-For MySQL, TLS must be enabled on **both** hops or neither — never just one.
-Unlike a byte-blind relay, the proxy participates in the connection-phase
-handshake (terminating client-side TLS, then re-establishing TLS to the
-upstream) because it has to read the queries. MySQL's `caching_sha2_password`
-and `mysql_native_password` derive their auth scramble from the "is this a
-secure connection" state, which must be identical on both sides — so a
-plaintext hop paired with a TLS hop breaks authentication by protocol design,
-not by a proxy limitation. This mirrors how ProxySQL/MaxScale treat each hop as
-an independently-authenticated connection.
-
-Enable both hops together:
-
-- **Client → proxy:** `PROXY_TLS_MODE=require` + `PROXY_TLS_CERT` / `PROXY_TLS_KEY`
-  (the proxy terminates TLS as the server; connect the client with
-  `--ssl-mode=REQUIRED`).
-- **Proxy → MySQL:** `UPSTREAM_MYSQL_SSLMODE=require` (or `verify-full`).
-
-For a trusted network (sidecar / private subnet) leave both plaintext, which is
-the default.
+- The proxy speaks the MySQL classic protocol: it extracts SQL from `COM_QUERY`
+  and `COM_STMT_PREPARE` (including the `CLIENT_QUERY_ATTRIBUTES` prefix MySQL
+  8.0.23+ prepends) and evaluates it with the engine's `Mysql` dialect.
+- **TLS is both-hops-or-neither** (see the TLS caveat above). For a trusted
+  network (sidecar / private subnet) leave both plaintext — the default. When
+  running the client plaintext, connect it with `--ssl-mode=DISABLED`.
 
 ---
 
 ## Quick start
 
 ```bash
-# Run locally (requires a local Postgres on 5432)
-UPSTREAM_PG_HOST=localhost cargo run
+# Postgres (default). Requires a local Postgres on 5432.
+UPSTREAM_HOST=localhost cargo run
 
-# With control-plane link
-UPSTREAM_PG_HOST=localhost \
+# MySQL. Requires a local MySQL on 3306.
+VETRO_WIRE_PROTOCOL=mysql UPSTREAM_HOST=localhost cargo run
+
+# With the control-plane link (telemetry + rule sync)
+UPSTREAM_HOST=localhost \
 VETRO_API_URL=https://api.vetro.dev \
 VETRO_API_KEY=vtro_... \
 VETRO_DATABASE_ID=your-db-uuid \
@@ -174,9 +186,15 @@ cargo fmt
 
 ```bash
 docker build -t vetro/proxy:local .
+
+# Postgres
+docker run --rm -e UPSTREAM_HOST=host.docker.internal -p 5433:5433 vetro/proxy:local
+
+# MySQL
 docker run --rm \
-  -e UPSTREAM_PG_HOST=host.docker.internal \
-  -p 5433:5433 \
+  -e VETRO_WIRE_PROTOCOL=mysql \
+  -e UPSTREAM_HOST=host.docker.internal \
+  -p 3307:3307 \
   vetro/proxy:local
 ```
 
@@ -184,24 +202,18 @@ In `docker-compose.yml` (vetro-fmw monorepo):
 
 ```yaml
 proxy:
-  image: ${VETRO_PROXY_IMAGE:-ghcr.io/donkan168/vetro-proxy:1.0.0}
+  image: ${VETRO_PROXY_IMAGE:-vetro/proxy:local}
   ports:
     - "5433:5433"
   environment:
-    PROXY_PG_LISTEN_PORT: "5433"
-    UPSTREAM_PG_HOST: postgres
-    UPSTREAM_PG_PORT: "5432"
-    # Optional — uncomment for telemetry + rule sync:
+    UPSTREAM_HOST: postgres
+    UPSTREAM_PORT: "5432"
+    PROXY_LISTEN_PORT: "5433"
+    # For MySQL: VETRO_WIRE_PROTOCOL: "mysql" + the matching ports.
+    # Optional — uncomment for telemetry + rule sync (all three together):
     # VETRO_API_URL: "http://api:4000"
     # VETRO_API_KEY: "${VETRO_API_KEY}"
     # VETRO_DATABASE_ID: "${VETRO_DATABASE_ID}"
-```
-
-To build and run a local image:
-
-```bash
-docker build -t vetro/proxy:local .
-VETRO_PROXY_IMAGE=vetro/proxy:local docker compose up -d proxy
 ```
 
 ---
@@ -210,8 +222,10 @@ VETRO_PROXY_IMAGE=vetro/proxy:local docker compose up -d proxy
 
 | | Connection string |
 |-|-------------------|
-| **Via proxy (protected)** | `postgres://postgres:postgres@localhost:5433/vetro_dev` |
-| **Direct (unprotected)**  | `postgres://postgres:postgres@localhost:54322/vetro_dev` |
+| **Postgres via proxy** | `postgres://user:pass@localhost:5433/mydb` |
+| **MySQL via proxy**    | `mysql://user:pass@localhost:3307/mydb` |
+
+Same credentials as a direct connection — only the host/port change.
 
 ---
 

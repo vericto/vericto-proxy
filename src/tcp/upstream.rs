@@ -1,7 +1,7 @@
 //! Upstream connection establishment, with optional TLS to the real database.
 //!
 //! The proxy→database hop is the one that typically crosses an untrusted /
-//! remote network (e.g. a managed RDS instance). When `UPSTREAM_PG_SSLMODE` is
+//! remote network (e.g. a managed RDS instance). When `UPSTREAM_SSLMODE` is
 //! `require` or `verify-full`, the proxy performs the PostgreSQL SSL negotiation
 //! (an `SSLRequest` followed by a rustls handshake) and tunnels the rest of the
 //! session through TLS.
@@ -38,7 +38,7 @@ pub enum UpstreamTlsMode {
 }
 
 impl UpstreamTlsMode {
-    /// Parses the `UPSTREAM_PG_SSLMODE` token. Unknown/empty → `Disable`.
+    /// Parses the `UPSTREAM_SSLMODE` token. Unknown/empty → `Disable`.
     pub fn from_env_str(s: &str) -> Self {
         match s.trim().to_ascii_lowercase().as_str() {
             "require" => UpstreamTlsMode::Require,
@@ -83,7 +83,7 @@ pub async fn connect_upstream(
     tcp.read_exact(&mut reply).await?;
     if reply[0] != b'S' {
         return Err(io::Error::other(format!(
-            "upstream declined TLS (replied '{}') but UPSTREAM_PG_SSLMODE requires it",
+            "upstream declined TLS (replied '{}') but UPSTREAM_SSLMODE requires it",
             reply[0] as char
         )));
     }
@@ -167,7 +167,7 @@ fn load_client_auth(
         }
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "upstream mutual TLS requires both UPSTREAM_PG_SSLCERT and UPSTREAM_PG_SSLKEY",
+            "upstream mutual TLS requires both UPSTREAM_SSLCERT and UPSTREAM_SSLKEY",
         )),
     }
 }
