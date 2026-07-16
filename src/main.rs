@@ -1,20 +1,20 @@
-//! vetro-proxy — Deterministic SQL firewall (TCP wire-protocol mode).
+//! vericto-proxy — Deterministic SQL firewall (TCP wire-protocol mode).
 //!
 //! Customer-facing component: intercepts every query via the PostgreSQL wire
-//! protocol, evaluates it with the vetro-engine AST parser, and either forwards
+//! protocol, evaluates it with the vericto-engine AST parser, and either forwards
 //! it to the real database or blocks it — all in <2ms.
 //!
-//! Telemetry is reported to the Vetro API (HTTPS) in batches; the ruleset is
+//! Telemetry is reported to the Vericto API (HTTPS) in batches; the ruleset is
 //! pulled from the API on a configurable polling interval (default: 5 min).
 //!
 //! Required env vars for TCP mode:
 //!   UPSTREAM_HOST — the real database host to forward safe queries to
-//!                   (dialect-agnostic; VETRO_WIRE_PROTOCOL selects the protocol)
+//!                   (dialect-agnostic; VERICTO_WIRE_PROTOCOL selects the protocol)
 //!
 //! Optional env vars for control-plane link:
-//!   VETRO_API_URL    — e.g. https://api.vetro.dev
-//!   VETRO_API_KEY    — workspace API key (vtro_...)
-//!   VETRO_DATABASE_ID — UUID of the database record in the Vetro platform
+//!   VERICTO_API_URL    — e.g. https://api.vericto.com
+//!   VERICTO_API_KEY    — workspace API key (vtro_...)
+//!   VERICTO_DATABASE_ID — UUID of the database record in the Vericto platform
 
 mod config;
 mod tcp;
@@ -23,14 +23,14 @@ mod telemetry;
 use arc_swap::ArcSwap;
 use std::sync::Arc;
 
-use vetro_engine::EnforcementPolicy;
+use vericto_engine::EnforcementPolicy;
 
 use crate::tcp::evaluator::default_ruleset;
 use crate::tcp::rules_sync::{
     SharedPolicy, SharedRuleset, SharedTelemetryMode, TelemetryQueryMode,
 };
 
-// vetro-engine re-exports through the tcp evaluator module's imports
+// vericto-engine re-exports through the tcp evaluator module's imports
 
 #[tokio::main]
 async fn main() {
@@ -42,7 +42,7 @@ async fn main() {
 
     let Some(tcp_opts) = tcp::TcpProxyOptions::from_env() else {
         tracing::error!(
-            "UPSTREAM_HOST is not set — vetro-proxy requires a database upstream to proxy to. \
+            "UPSTREAM_HOST is not set — vericto-proxy requires a database upstream to proxy to. \
              Set UPSTREAM_HOST to the hostname of your production database."
         );
         std::process::exit(1);
@@ -100,7 +100,7 @@ async fn main() {
         None => {
             tracing::info!(
                 "Control-plane link disabled \
-                 (set VETRO_API_URL and VETRO_API_KEY to enable telemetry and rule sync)"
+                 (set VERICTO_API_URL and VERICTO_API_KEY to enable telemetry and rule sync)"
             );
             None
         }
@@ -108,12 +108,13 @@ async fn main() {
 
     // Wire protocol selected per deployment (Option A): one protocol per proxy
     // instance, derived from the fronted database's dialect.
-    let wire_protocol = std::env::var("VETRO_WIRE_PROTOCOL").unwrap_or_else(|_| "postgres".into());
+    let wire_protocol =
+        std::env::var("VERICTO_WIRE_PROTOCOL").unwrap_or_else(|_| "postgres".into());
 
     tracing::info!(
         upstream = %format!("{}:{}", tcp_opts.upstream_host, tcp_opts.upstream_port),
         wire_protocol = %wire_protocol,
-        "vetro-proxy starting"
+        "vericto-proxy starting"
     );
 
     let result = match wire_protocol.as_str() {
@@ -132,6 +133,6 @@ async fn main() {
 fn init_tracing() {
     use tracing_subscriber::{fmt, EnvFilter};
     let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("info,vetro_proxy=debug"));
+        .unwrap_or_else(|_| EnvFilter::new("info,vericto_proxy=debug"));
     fmt().with_env_filter(filter).json().init();
 }

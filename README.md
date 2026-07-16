@@ -1,20 +1,20 @@
-# Vetro Proxy
+# Vericto Proxy
 
 > Transparent SQL TCP proxy — deterministic SQL firewall in the wire path.
 
-[![CI](https://github.com/donkan168/vetro-proxy/actions/workflows/ci.yml/badge.svg)](https://github.com/donkan168/vetro-proxy/actions/workflows/ci.yml)
+[![CI](https://github.com/donkan168/vericto-proxy/actions/workflows/ci.yml/badge.svg)](https://github.com/donkan168/vericto-proxy/actions/workflows/ci.yml)
 [![License: ELv2](https://img.shields.io/badge/license-Elastic--2.0-blue.svg)](LICENSE)
 [![Rust 1.88+](https://img.shields.io/badge/rust-1.88%2B-orange.svg)](https://www.rust-lang.org)
 
-`vetro-proxy` is the **customer-facing TCP wire-protocol proxy**. It intercepts
+`vericto-proxy` is the **customer-facing TCP wire-protocol proxy**. It intercepts
 every query on the database wire protocol, evaluates it with the
-[vetro-engine](https://github.com/donkan168/vetro-engine) AST parser, and either
+[vericto-engine](https://github.com/donkan168/vericto-engine) AST parser, and either
 forwards it to the real database or blocks it — all in <2ms.
 
 One proxy instance fronts one database and speaks exactly one wire protocol,
-chosen at deploy time with `VETRO_WIRE_PROTOCOL`:
+chosen at deploy time with `VERICTO_WIRE_PROTOCOL`:
 
-| `VETRO_WIRE_PROTOCOL` | Databases | Block response |
+| `VERICTO_WIRE_PROTOCOL` | Databases | Block response |
 |-----------------------|-----------|----------------|
 | `postgres` (default)  | PostgreSQL | native `ErrorResponse` `SQLSTATE 42501` |
 | `mysql`               | MySQL      | native `ERR_Packet` `ERROR 1142` |
@@ -25,7 +25,7 @@ engines**. Only the value above and (optionally) the default ports change.
 No AI, no stochastic heuristics — the same input always produces the same result.
 
 > **Other dialects** (Oracle, SQL Server): evaluate via the HTTP API
-> ([vetro-eval](https://github.com/donkan168/vetro-eval)); there is no wire
+> ([vericto-eval](https://github.com/donkan168/vericto-eval)); there is no wire
 > proxy for them.
 
 ---
@@ -37,14 +37,14 @@ Your app / ORM
      │
      │  SQL wire protocol (proxy listen port, default 5433)
      ▼
- vetro-proxy   ──── vetro-engine (lib) ────►  ALLOWED / BLOCKED
+ vericto-proxy   ──── vericto-engine (lib) ────►  ALLOWED / BLOCKED
      │
      │  (if ALLOWED) forwards query
      ▼
  Real database upstream
 ```
 
-Point your `DATABASE_URL` host at `vetro-proxy` instead of your real database.
+Point your `DATABASE_URL` host at `vericto-proxy` instead of your real database.
 No code changes required — your ORM/driver is unaware of the proxy.
 
 ---
@@ -57,7 +57,7 @@ No code changes required — your ORM/driver is unaware of the proxy.
 - `ALTER TABLE DROP COLUMN` / `RENAME`
 - `INSERT` without explicit column list
 - `SELECT *` without `WHERE`, `SELECT` without `LIMIT`
-- … [full rule list →](https://vetro.dev/rules)
+- … [full rule list →](https://vericto.com/rules)
 
 A blocked query is returned as a **native error** for the active protocol (see
 the table above), so no special handling is needed in your application.
@@ -81,32 +81,32 @@ All variables are **dialect-agnostic** — the same names apply to every engine.
 | `UPSTREAM_PORT`     | protocol default¹ | Port of the upstream database        |
 | `PROXY_LISTEN_PORT` | protocol default¹ | Port the proxy listens on            |
 
-¹ Defaults follow `VETRO_WIRE_PROTOCOL`: **Postgres** `5432` upstream / `5433`
+¹ Defaults follow `VERICTO_WIRE_PROTOCOL`: **Postgres** `5432` upstream / `5433`
 listen; **MySQL** `3306` upstream / `3307` listen.
 
 ### Control-plane link (telemetry + rule sync)
 
-Recommended for production. When `VETRO_API_URL`, `VETRO_API_KEY` **and**
-`VETRO_DATABASE_ID` are set, the proxy reports every decision and polls the
+Recommended for production. When `VERICTO_API_URL`, `VERICTO_API_KEY` **and**
+`VERICTO_DATABASE_ID` are set, the proxy reports every decision and polls the
 active ruleset. Without the link it still protects using the built-in ruleset
 (dev / air-gapped), but reports nothing.
 
-> **All three are needed for telemetry.** Without `VETRO_DATABASE_ID` no events
+> **All three are needed for telemetry.** Without `VERICTO_DATABASE_ID` no events
 > are emitted at all (there is nothing to attribute them to) — even if the API
 > URL and key are set. It is also the key the control-plane uses to correlate
 > telemetry and resolve per-database rules.
 
 | Variable                          | Default | Description                                      |
 |-----------------------------------|---------|--------------------------------------------------|
-| `VETRO_API_URL`                   | —       | e.g. `https://api.vetro.dev`                     |
-| `VETRO_API_KEY`                   | —       | Workspace API key (`vtro_...`)                   |
-| `VETRO_DATABASE_ID`               | —       | UUID of the database record; enables + correlates telemetry |
-| `VETRO_RULES_SYNC_INTERVAL_SECS`  | `300`   | How often to poll `/sync/rules` (min 30)         |
-| `VETRO_TELEMETRY_BUFFER`          | `memory`| `memory` or `disk` (survives restarts)           |
-| `VETRO_TELEMETRY_DISK_PATH`       | `/var/lib/vetro/spool` | Spool dir when buffer=disk        |
-| `VETRO_TELEMETRY_MEMORY_CAPACITY` | `10000` | Max events in the memory ring buffer             |
-| `VETRO_TELEMETRY_BATCH_SIZE`      | `100`   | Max events per POST `/ingest/events`             |
-| `VETRO_TELEMETRY_FLUSH_SECS`      | `5`     | How often the reporter flushes                   |
+| `VERICTO_API_URL`                   | —       | e.g. `https://api.vericto.com`                     |
+| `VERICTO_API_KEY`                   | —       | Workspace API key (`vtro_...`)                   |
+| `VERICTO_DATABASE_ID`               | —       | UUID of the database record; enables + correlates telemetry |
+| `VERICTO_RULES_SYNC_INTERVAL_SECS`  | `300`   | How often to poll `/sync/rules` (min 30)         |
+| `VERICTO_TELEMETRY_BUFFER`          | `memory`| `memory` or `disk` (survives restarts)           |
+| `VERICTO_TELEMETRY_DISK_PATH`       | `/var/lib/vericto/spool` | Spool dir when buffer=disk        |
+| `VERICTO_TELEMETRY_MEMORY_CAPACITY` | `10000` | Max events in the memory ring buffer             |
+| `VERICTO_TELEMETRY_BATCH_SIZE`      | `100`   | Max events per POST `/ingest/events`             |
+| `VERICTO_TELEMETRY_FLUSH_SECS`      | `5`     | How often the reporter flushes                   |
 
 ### TLS (optional)
 
@@ -141,7 +141,7 @@ hop; `PROXY_TLS_MODE` covers the client→proxy hop.
 
 Only two things differ per engine; everything above is shared.
 
-- **`VETRO_WIRE_PROTOCOL`** selects the protocol and the default ports (see
+- **`VERICTO_WIRE_PROTOCOL`** selects the protocol and the default ports (see
   [Ports](#ports)).
 - **Block response** is native to each protocol: Postgres `ErrorResponse`
   (`SQLSTATE 42501`), MySQL `ERR_Packet` (`ERROR 1142`). Either way the driver
@@ -165,13 +165,13 @@ Only two things differ per engine; everything above is shared.
 UPSTREAM_HOST=localhost cargo run
 
 # MySQL. Requires a local MySQL on 3306.
-VETRO_WIRE_PROTOCOL=mysql UPSTREAM_HOST=localhost cargo run
+VERICTO_WIRE_PROTOCOL=mysql UPSTREAM_HOST=localhost cargo run
 
 # With the control-plane link (telemetry + rule sync)
 UPSTREAM_HOST=localhost \
-VETRO_API_URL=https://api.vetro.dev \
-VETRO_API_KEY=vtro_... \
-VETRO_DATABASE_ID=your-db-uuid \
+VERICTO_API_URL=https://api.vericto.com \
+VERICTO_API_KEY=vtro_... \
+VERICTO_DATABASE_ID=your-db-uuid \
 cargo run
 
 # Tests
@@ -185,35 +185,35 @@ cargo fmt
 ## Docker
 
 ```bash
-docker build -t vetro/proxy:local .
+docker build -t vericto/proxy:local .
 
 # Postgres
-docker run --rm -e UPSTREAM_HOST=host.docker.internal -p 5433:5433 vetro/proxy:local
+docker run --rm -e UPSTREAM_HOST=host.docker.internal -p 5433:5433 vericto/proxy:local
 
 # MySQL
 docker run --rm \
-  -e VETRO_WIRE_PROTOCOL=mysql \
+  -e VERICTO_WIRE_PROTOCOL=mysql \
   -e UPSTREAM_HOST=host.docker.internal \
   -p 3307:3307 \
-  vetro/proxy:local
+  vericto/proxy:local
 ```
 
-In `docker-compose.yml` (vetro-fmw monorepo):
+In `docker-compose.yml` (vericto-fmw monorepo):
 
 ```yaml
 proxy:
-  image: ${VETRO_PROXY_IMAGE:-vetro/proxy:local}
+  image: ${VERICTO_PROXY_IMAGE:-vericto/proxy:local}
   ports:
     - "5433:5433"
   environment:
     UPSTREAM_HOST: postgres
     UPSTREAM_PORT: "5432"
     PROXY_LISTEN_PORT: "5433"
-    # For MySQL: VETRO_WIRE_PROTOCOL: "mysql" + the matching ports.
+    # For MySQL: VERICTO_WIRE_PROTOCOL: "mysql" + the matching ports.
     # Optional — uncomment for telemetry + rule sync (all three together):
-    # VETRO_API_URL: "http://api:4000"
-    # VETRO_API_KEY: "${VETRO_API_KEY}"
-    # VETRO_DATABASE_ID: "${VETRO_DATABASE_ID}"
+    # VERICTO_API_URL: "http://api:4000"
+    # VERICTO_API_KEY: "${VERICTO_API_KEY}"
+    # VERICTO_DATABASE_ID: "${VERICTO_DATABASE_ID}"
 ```
 
 ---
@@ -237,4 +237,4 @@ contributions. See [CONTRIBUTING.md](CONTRIBUTING.md) and [SECURITY.md](SECURITY
 ## License
 
 Elastic License 2.0 — source-available, no managed-service resale.
-For a commercial license contact [hola@vetro.dev](mailto:hola@vetro.dev).
+For a commercial license contact [hola@vericto.com](mailto:hola@vericto.com).

@@ -1,5 +1,5 @@
 # =============================================================================
-# Vetro Rust AST Proxy — Multi-stage Dockerfile
+# Vericto Rust AST Proxy — Multi-stage Dockerfile
 # Uses cargo-chef to cache dependency compilation separately from source.
 #
 # Stages:
@@ -25,7 +25,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 ENV LIBCLANG_PATH=/usr/lib/llvm-14/lib
-# Resolve the private vetro-engine git dependency through the git CLI, which
+# Resolve the private vericto-engine git dependency through the git CLI, which
 # honors the credential rewrite configured in each build step. Without this
 # cargo uses its built-in fetcher and ignores the rewrite, failing with
 # "revision not found" on the private repo.
@@ -68,13 +68,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libssl3 \
     && rm -rf /var/lib/apt/lists/*
 
-RUN groupadd --system --gid 1001 vetro && \
-    useradd --system --uid 1001 --gid vetro vetro
+RUN groupadd --system --gid 1001 vericto && \
+    useradd --system --uid 1001 --gid vericto vericto
 
-COPY --from=builder /app/target/release/vetro-proxy /usr/local/bin/vetro-proxy
-RUN chown vetro:vetro /usr/local/bin/vetro-proxy
+COPY --from=builder /app/target/release/vericto-proxy /usr/local/bin/vericto-proxy
+RUN chown vericto:vericto /usr/local/bin/vericto-proxy
 
-USER vetro
+USER vericto
 
 ENV PROXY_EVAL_PORT=5434
 ENV RUST_LOG=info
@@ -86,4 +86,4 @@ EXPOSE 5434
 HEALTHCHECK --interval=15s --timeout=5s --start-period=10s --retries=3 \
     CMD curl -fsS "http://localhost:${PROXY_EVAL_PORT}/health" || exit 1
 
-CMD ["/usr/local/bin/vetro-proxy"]
+CMD ["/usr/local/bin/vericto-proxy"]

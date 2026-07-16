@@ -9,7 +9,7 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
-  # cargo resolves the private vetro-engine git dependency via the git CLI,
+  # cargo resolves the private vericto-engine git dependency via the git CLI,
   # which honors the credential rewrite configured in the auth step below.
   CARGO_NET_GIT_FETCH_WITH_CLI: "true"
 
@@ -20,7 +20,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4.2.2
 
-      - name: Authenticate to private vetro-engine repo
+      - name: Authenticate to private vericto-engine repo
         run: |
           # Use the token as the PASSWORD with a fixed username. A bare
           # `https://<token>@github.com/` rewrite makes git treat the token as
@@ -46,7 +46,7 @@ jobs:
         uses: actions/cache@v4.2.3
         with:
           # `~/.cargo/git` is intentionally NOT cached: restoring a stale git
-          # checkout of the private vetro-engine dep leaves cargo doing an
+          # checkout of the private vericto-engine dep leaves cargo doing an
           # incremental fetch over a repo whose embedded config lacks the token,
           # so git prompts for a password and fails on the headless runner. The
           # git dep is re-fetched fresh each run (one small repo) with the auth

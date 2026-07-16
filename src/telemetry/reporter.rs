@@ -1,5 +1,5 @@
 //! Background reporter: periodically drains the event queue and POSTs batches
-//! to the Vetro API. Delivery failures never propagate to the SQL path.
+//! to the Vericto API. Delivery failures never propagate to the SQL path.
 
 use std::sync::Arc;
 use std::time::Duration;

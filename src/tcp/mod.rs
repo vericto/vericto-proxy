@@ -1,6 +1,6 @@
 //! Transparent PostgreSQL wire-protocol TCP proxy.
 //!
-//! Lets any driver/ORM connect to Vetro as if it were Postgres (only the
+//! Lets any driver/ORM connect to Vericto as if it were Postgres (only the
 //! connection string host changes), without modifying application code. Every
 //! query passes through the AST evaluation engine before reaching the real
 //! database.
@@ -52,11 +52,14 @@ impl TcpProxyOptions {
     ///
     /// The variables are dialect-agnostic — the same `UPSTREAM_*` / `PROXY_*`
     /// names apply to every engine. The wire protocol is chosen by
-    /// `VETRO_WIRE_PROTOCOL` (postgres|mysql, default postgres); it only changes
+    /// `VERICTO_WIRE_PROTOCOL` (postgres|mysql, default postgres); it only changes
     /// the DEFAULT ports (Postgres 5432/5433, MySQL 3306/3307) when they are not
     /// set explicitly.
     pub fn from_env() -> Option<Self> {
-        let is_mysql = matches!(std::env::var("VETRO_WIRE_PROTOCOL").as_deref(), Ok("mysql"));
+        let is_mysql = matches!(
+            std::env::var("VERICTO_WIRE_PROTOCOL").as_deref(),
+            Ok("mysql")
+        );
         // Protocol-derived port defaults (upstream, listen). Only used when the
         // corresponding env var is absent.
         let (default_upstream_port, default_listen_port) =
@@ -76,7 +79,7 @@ impl TcpProxyOptions {
             listen_port,
             upstream_host,
             upstream_port,
-            database_id: std::env::var("VETRO_DATABASE_ID").ok(),
+            database_id: std::env::var("VERICTO_DATABASE_ID").ok(),
             // Upstream TLS (proxy→database): UPSTREAM_SSLMODE=require|verify-full.
             upstream_tls: crate::tcp::upstream::UpstreamTlsMode::from_env_str(
                 &std::env::var("UPSTREAM_SSLMODE").unwrap_or_default(),

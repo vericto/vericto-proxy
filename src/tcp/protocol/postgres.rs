@@ -6,7 +6,7 @@
 //! used to live in `postgres.rs` now lives generically in `session.rs`; this
 //! module supplies only the Postgres-specific framing and block bytes.
 
-use vetro_engine::parser::Dialect;
+use vericto_engine::parser::Dialect;
 
 use crate::tcp::codec::{
     build_error_response, build_ready_for_query, extract_parse_query, extract_simple_query,
@@ -91,7 +91,7 @@ impl WireProtocol for PostgresProtocol {
 
 /// Block message shown to the client. Unchanged from the original path.
 pub fn block_message(rule_code: &str, ast_node_path: &str, suggestion: Option<&str>) -> String {
-    let base = format!("Vetro blocked this query [{rule_code}] — AST node: {ast_node_path}");
+    let base = format!("Vericto blocked this query [{rule_code}] — AST node: {ast_node_path}");
     match suggestion {
         Some(s) => format!("{base}. Suggestion: {s}"),
         None => base,

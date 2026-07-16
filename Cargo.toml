@@ -1,20 +1,20 @@
 [package]
-name = "vetro-proxy"
-version = "3.0.0"
+name = "vericto-proxy"
+version = "4.0.0"
 edition = "2021"
 rust-version = "1.88"
-description = "Vetro — Deterministic SQL firewall — TCP wire-protocol proxy for customer infrastructure"
+description = "Vericto — Deterministic SQL firewall — TCP wire-protocol proxy for customer infrastructure"
 license = "Elastic-2.0"
-repository = "https://github.com/donkan168/vetro-proxy"
+repository = "https://github.com/donkan168/vericto-proxy"
 readme = "README.md"
 
 [[bin]]
-name = "vetro-proxy"
+name = "vericto-proxy"
 path = "src/main.rs"
 
 [dependencies]
 # AST engine (open-core shared library)
-vetro-engine = { git = "https://github.com/donkan168/vetro-engine", tag = "v2.1.0" }
+vericto-engine = { git = "https://github.com/donkan168/vericto-engine", tag = "v3.0.0" }
 
 # PostgreSQL query normalization for sanitized telemetry (literals → $1, $2…).
 # Same major version the engine uses, so libpg_query resolves to a single build.
@@ -38,7 +38,7 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 serde_yaml = "0.9"
 
-# Outbound HTTP client for telemetry reporting + rule sync to the Vetro API.
+# Outbound HTTP client for telemetry reporting + rule sync to the Vericto API.
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 
 # Upstream TLS client: encrypts the proxy→database hop (PostgreSQL SSLRequest +

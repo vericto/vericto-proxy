@@ -22,7 +22,7 @@
 //! handled by protocol-specific session entrypoints rather than a single trait
 //! method — see `session.rs` and each `protocol/*.rs`.
 
-use vetro_engine::parser::Dialect;
+use vericto_engine::parser::Dialect;
 
 pub mod mysql;
 pub mod postgres;
@@ -129,5 +129,5 @@ pub trait WireProtocol: Send + Sync {
 }
 
 // Protocol selection lives in `main.rs` (it picks the listener — run_pg_proxy vs
-// run_mysql_proxy — from VETRO_WIRE_PROTOCOL). The `WireProtocol` impls are
+// run_mysql_proxy — from VERICTO_WIRE_PROTOCOL). The `WireProtocol` impls are
 // instantiated directly by each session entrypoint.
