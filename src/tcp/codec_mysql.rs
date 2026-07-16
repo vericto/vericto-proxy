@@ -248,7 +248,7 @@ fn strip_query_attributes(body: &[u8]) -> &[u8] {
         return body;
     };
     // With bound params a null-bitmap + params follow, which we don't skip
-    // (Vetro evaluates SQL text, not bound values). For the overwhelming common
+    // (Vericto evaluates SQL text, not bound values). For the overwhelming common
     // case (0 params) the SQL starts right after the two ints.
     if param_count != 0 {
         return body;
@@ -315,12 +315,12 @@ pub fn build_err_packet(seq: u8, error_code: u16, sql_state: &str, message: &str
     MySqlPacket { seq, payload }.encode()
 }
 
-/// MySQL error code + SQLSTATE for a Vetro block. 1142 = ER_TABLEACCESS_DENIED
+/// MySQL error code + SQLSTATE for a Vericto block. 1142 = ER_TABLEACCESS_DENIED
 /// ("command denied") with SQLSTATE 42000 (syntax/access) — the closest native
 /// analogue to Postgres' insufficient_privilege (42501), so drivers classify it
 /// as an authorization/permission error rather than a connection fault.
-pub const VETRO_BLOCK_ERR_CODE: u16 = 1142;
-pub const VETRO_BLOCK_SQLSTATE: &str = "42000";
+pub const VERICTO_BLOCK_ERR_CODE: u16 = 1142;
+pub const VERICTO_BLOCK_SQLSTATE: &str = "42000";
 
 #[cfg(test)]
 mod tests {
@@ -391,7 +391,7 @@ mod tests {
 
     #[test]
     fn err_packet_has_expected_shape() {
-        let bytes = build_err_packet(1, VETRO_BLOCK_ERR_CODE, VETRO_BLOCK_SQLSTATE, "blocked");
+        let bytes = build_err_packet(1, VERICTO_BLOCK_ERR_CODE, VERICTO_BLOCK_SQLSTATE, "blocked");
         // header: len (3) + seq
         let len = (bytes[0] as usize) | ((bytes[1] as usize) << 8) | ((bytes[2] as usize) << 16);
         assert_eq!(len, bytes.len() - 4);

@@ -6,11 +6,11 @@
 //! packets through (classified as PassThrough), so caching_sha2_password /
 //! mysql_native_password work untouched.
 
-use vetro_engine::parser::Dialect;
+use vericto_engine::parser::Dialect;
 
 use crate::tcp::codec_mysql::{
-    build_err_packet, read_packet, MySqlPacket, COM_QUIT, VETRO_BLOCK_ERR_CODE,
-    VETRO_BLOCK_SQLSTATE,
+    build_err_packet, read_packet, MySqlPacket, COM_QUIT, VERICTO_BLOCK_ERR_CODE,
+    VERICTO_BLOCK_SQLSTATE,
 };
 use crate::tcp::protocol::{
     BlockContext, BlockResponse, Classified, QueryKind, RawClientMessage, WireProtocol,
@@ -75,8 +75,8 @@ impl WireProtocol for MysqlProtocol {
         BlockResponse {
             bytes: build_err_packet(
                 reply_seq,
-                VETRO_BLOCK_ERR_CODE,
-                VETRO_BLOCK_SQLSTATE,
+                VERICTO_BLOCK_ERR_CODE,
+                VERICTO_BLOCK_SQLSTATE,
                 &message,
             ),
             // MySQL has no extended skip-until-Sync equivalent: the single
@@ -96,7 +96,7 @@ fn prepared_or_simple(pkt: &MySqlPacket) -> QueryKind {
 
 /// Block message shown to the client (same wording as the Postgres path).
 fn block_message(rule_code: &str, ast_node_path: &str, suggestion: Option<&str>) -> String {
-    let base = format!("Vetro blocked this query [{rule_code}] — AST node: {ast_node_path}");
+    let base = format!("Vericto blocked this query [{rule_code}] — AST node: {ast_node_path}");
     match suggestion {
         Some(s) => format!("{base}. Suggestion: {s}"),
         None => base,
@@ -159,7 +159,7 @@ mod tests {
     fn block_response_targets_reply_sequence() {
         let p = MysqlProtocol;
         let ctx = BlockContext {
-            rule_code: "VETRO-001",
+            rule_code: "VERICTO-001",
             ast_node_path: "DeleteStmt",
             suggested_safe_query: None,
             kind: QueryKind::Simple,

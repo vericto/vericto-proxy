@@ -21,7 +21,7 @@ A clear and concise description of what is wrong.
 
 **Expected decision**
 - [ ] ALLOWED
-- [ ] BLOCKED (which rule? e.g. VETRO-001)
+- [ ] BLOCKED (which rule? e.g. VERICTO-001)
 - [ ] PARSE_ERROR
 
 **Actual decision**

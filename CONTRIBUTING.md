@@ -1,6 +1,6 @@
-# Contributing to Vetro Proxy
+# Contributing to Vericto Proxy
 
-Thanks for your interest in improving Vetro Proxy. This guide covers the
+Thanks for your interest in improving Vericto Proxy. This guide covers the
 open-source AST engine in this repository. Contributions are accepted under the
 project's [Elastic License 2.0](LICENSE).
 
@@ -20,8 +20,8 @@ respectful, constructive, and technically precise.
 ## Getting started
 
 ```bash
-git clone https://github.com/<you>/vetro-proxy.git
-cd vetro-proxy
+git clone https://github.com/<you>/vericto-proxy.git
+cd vericto-proxy
 cargo build
 cargo test
 ```
@@ -44,7 +44,7 @@ the Dockerfile for the exact system dependencies).
 ## Adding a new rule
 
 1. Implement the evaluator in `src/rules/evaluator.rs`.
-2. Register it with a `VETRO-XXX` code and a severity (`critical`/`high`/`medium`).
+2. Register it with a `VERICTO-XXX` code and a severity (`critical`/`high`/`medium`).
 3. Add unit tests in the same module covering:
    - A query that **must** be blocked (positive case).
    - A safe variant that **must** be allowed (regression guard against false positives).
@@ -61,7 +61,7 @@ We use [Conventional Commits](https://www.conventionalcommits.org/):
 feat(rules): add MERGE statement detection for SQL Server
 fix(parser): handle nested CTE in DELETE for postgres
 perf(engine): cache compiled YAML conditions per ruleset
-test(rules): add false-positive guards for VETRO-051
+test(rules): add false-positive guards for VERICTO-051
 ```
 
 Scopes for this repo: `engine`, `parser`, `rules`, `tcp`, `cli`, `docs`.

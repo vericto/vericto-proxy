@@ -13,7 +13,7 @@ use arc_swap::ArcSwap;
 use serde::Deserialize;
 
 use crate::config::ControlPlaneConfig;
-use vetro_engine::{
+use vericto_engine::{
     EnforcementAction, EnforcementPolicy, ParseErrorAction, Rule, RuleType, Severity,
 };
 
@@ -60,7 +60,7 @@ struct SyncResponse {
     proxy_config: Option<ProxyConfig>,
 }
 
-/// Settings configurable from the Vetro dashboard, applied without restart.
+/// Settings configurable from the Vericto dashboard, applied without restart.
 /// TLS to the upstream database (UPSTREAM_SSLMODE + certificate) is NOT here —
 /// it's an env var because it requires mounting a CA certificate in the container.
 #[derive(Debug, Deserialize, Default)]
@@ -71,7 +71,7 @@ struct ProxyConfig {
     telemetry_memory_capacity: Option<usize>,
     /// SQL dialect of the fronted database, as configured in the dashboard
     /// (postgres | mysql | oracle | mssql). The wire protocol is fixed at
-    /// startup by `VETRO_WIRE_PROTOCOL`; this is surfaced so an operator can
+    /// startup by `VERICTO_WIRE_PROTOCOL`; this is surfaced so an operator can
     /// detect a mismatch between the deployed protocol and the dashboard's
     /// dialect (logged as a warning on sync).
     #[serde(default)]
@@ -267,9 +267,9 @@ pub async fn run(
                             // match the wire protocol this proxy was started with. The
                             // protocol is fixed at startup (a live listener can't change
                             // protocol), so a mismatch means the proxy was deployed with
-                            // the wrong VETRO_WIRE_PROTOCOL for this database.
+                            // the wrong VERICTO_WIRE_PROTOCOL for this database.
                             if let Some(dialect) = pc.dialect.as_deref() {
-                                let proto = std::env::var("VETRO_WIRE_PROTOCOL")
+                                let proto = std::env::var("VERICTO_WIRE_PROTOCOL")
                                     .unwrap_or_else(|_| "postgres".into());
                                 let expected = matches!(
                                     (proto.as_str(), dialect),
@@ -281,7 +281,7 @@ pub async fn run(
                                         dashboard_dialect = %dialect,
                                         "Wire protocol does not match the database dialect configured \
                                          in the dashboard — this proxy may be fronting the wrong database. \
-                                         Redeploy with the correct VETRO_WIRE_PROTOCOL."
+                                         Redeploy with the correct VERICTO_WIRE_PROTOCOL."
                                     );
                                 }
                             }
@@ -341,7 +341,7 @@ mod tests {
     fn into_rule_uses_from_legacy_and_default_action_fallback() {
         let api = ApiRule {
             rule_id: "r1".to_string(),
-            code: "VETRO-050".to_string(),
+            code: "VERICTO-050".to_string(),
             severity: "warning".to_string(), // legacy → High
             default_action: None,
             rule_type: "standard".to_string(),
@@ -357,7 +357,7 @@ mod tests {
     fn into_rule_respects_explicit_default_action() {
         let api = ApiRule {
             rule_id: "r2".to_string(),
-            code: "VETRO-050".to_string(),
+            code: "VERICTO-050".to_string(),
             severity: "medium".to_string(),
             default_action: Some("flag".to_string()),
             rule_type: "standard".to_string(),

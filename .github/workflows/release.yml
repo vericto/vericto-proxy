@@ -119,8 +119,8 @@ jobs:
             type=semver,pattern={{major}}.{{minor}}
             type=semver,pattern={{major}}
           labels: |
-            org.opencontainers.image.title=vetro-proxy
-            org.opencontainers.image.description=Vetro SQL security proxy — deterministic AST parsing
+            org.opencontainers.image.title=vericto-proxy
+            org.opencontainers.image.description=Vericto SQL security proxy — deterministic AST parsing
             org.opencontainers.image.licenses=Elastic-2.0
 
       - name: Create and push multi-arch manifest
@@ -132,7 +132,7 @@ jobs:
 
       - name: Summary
         run: |
-          echo "### Published vetro-proxy image" >> "$GITHUB_STEP_SUMMARY"
+          echo "### Published vericto-proxy image" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "Tags:" >> "$GITHUB_STEP_SUMMARY"
           echo '```' >> "$GITHUB_STEP_SUMMARY"

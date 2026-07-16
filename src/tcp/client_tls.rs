@@ -138,7 +138,7 @@ mod tests {
     #[test]
     fn load_certs_errors_on_pem_without_certificate() {
         let dir = std::env::temp_dir();
-        let path = dir.join("vetro_test_empty_cert.pem");
+        let path = dir.join("vericto_test_empty_cert.pem");
         std::fs::write(&path, b"not a pem certificate\n").unwrap();
         let res = load_certs(path.to_str().unwrap());
         let _ = std::fs::remove_file(&path);

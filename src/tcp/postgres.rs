@@ -27,7 +27,7 @@ use tokio::sync::Mutex;
 use crate::tcp::client_tls::{ClientRead, ClientWrite};
 use crate::tcp::codec::{read_startup_packet, StartupPacket};
 use crate::tcp::evaluator::TcpDecision;
-use vetro_engine::EnforcementAction;
+use vericto_engine::EnforcementAction;
 
 /// PostgreSQL TCP proxy configuration.
 pub struct PgProxyConfig {
@@ -107,7 +107,7 @@ async fn run_session(client: TcpStream, config: Arc<PgProxyConfig>) -> std::io::
             let _ = client_write
                 .write_all(&crate::tcp::codec::build_error_response(
                     crate::tcp::codec::SQLSTATE_CONNECTION_FAILURE,
-                    "Vetro: the database is temporarily unavailable",
+                    "Vericto: the database is temporarily unavailable",
                 ))
                 .await;
             let _ = client_write.flush().await;
@@ -161,7 +161,7 @@ async fn run_session(client: TcpStream, config: Arc<PgProxyConfig>) -> std::io::
                 let _ = w
                     .write_all(&crate::tcp::codec::build_error_response(
                         crate::tcp::codec::SQLSTATE_CONNECTION_FAILURE,
-                        "Vetro: the database connection was lost",
+                        "Vericto: the database connection was lost",
                     ))
                     .await;
                 let _ = w.flush().await;
@@ -355,7 +355,7 @@ fn build_telemetry_event(
         } => {
             severity = Some(sev.as_str().to_string());
             enforcement_action = Some("block".to_string());
-            let status = if rule_code == "VETRO-PARSE-ERROR" {
+            let status = if rule_code == "VERICTO-PARSE-ERROR" {
                 // ast_node_path holds "PARSE_ERROR: <msg>".
                 parse_error = Some(ast_node_path.clone());
                 "PARSE_ERROR"
@@ -428,12 +428,12 @@ fn sanitize_query(sql: &str) -> String {
 mod tests {
     use super::*;
     use crate::tcp::evaluator::Observation;
-    use vetro_engine::Severity;
+    use vericto_engine::Severity;
 
     fn forward_observation(action: EnforcementAction) -> TcpDecision {
         TcpDecision::Forward {
             observation: Some(Observation {
-                rule_code: "VETRO-050".to_string(),
+                rule_code: "VERICTO-050".to_string(),
                 ast_node_path: "SelectStmt".to_string(),
                 severity: Severity::Medium,
                 action,
@@ -467,7 +467,7 @@ mod tests {
         assert_eq!(ev.status, "FLAGGED");
         assert_eq!(ev.enforcement_action.as_deref(), Some("flag"));
         assert_eq!(ev.severity.as_deref(), Some("medium"));
-        assert_eq!(ev.rule_code.as_deref(), Some("VETRO-050"));
+        assert_eq!(ev.rule_code.as_deref(), Some("VERICTO-050"));
     }
 
     #[test]
@@ -482,13 +482,13 @@ mod tests {
         assert_eq!(ev.enforcement_action.as_deref(), Some("monitor"));
         assert_eq!(ev.severity.as_deref(), Some("medium"));
         // MONITOR telemetry carries the rule identifier (R7.4).
-        assert_eq!(ev.rule_code.as_deref(), Some("VETRO-050"));
+        assert_eq!(ev.rule_code.as_deref(), Some("VERICTO-050"));
     }
 
     #[test]
     fn telemetry_blocked_populates_action_block() {
         let decision = TcpDecision::Block {
-            rule_code: "VETRO-001".to_string(),
+            rule_code: "VERICTO-001".to_string(),
             ast_node_path: "DeleteStmt".to_string(),
             suggested_safe_query: None,
             severity: Severity::Critical,
@@ -497,14 +497,14 @@ mod tests {
         assert_eq!(ev.status, "BLOCKED");
         assert_eq!(ev.enforcement_action.as_deref(), Some("block"));
         assert_eq!(ev.severity.as_deref(), Some("critical"));
-        assert_eq!(ev.rule_code.as_deref(), Some("VETRO-001"));
+        assert_eq!(ev.rule_code.as_deref(), Some("VERICTO-001"));
     }
 
     #[test]
     fn telemetry_parse_error_fail_open_carries_message() {
         let decision = TcpDecision::Forward {
             observation: Some(Observation {
-                rule_code: "VETRO-PARSE-ERROR".to_string(),
+                rule_code: "VERICTO-PARSE-ERROR".to_string(),
                 ast_node_path: "PARSE_ERROR: boom".to_string(),
                 severity: Severity::Medium,
                 action: EnforcementAction::Flag,
@@ -520,7 +520,7 @@ mod tests {
     #[test]
     fn telemetry_parse_error_fail_closed_is_block() {
         let decision = TcpDecision::Block {
-            rule_code: "VETRO-PARSE-ERROR".to_string(),
+            rule_code: "VERICTO-PARSE-ERROR".to_string(),
             ast_node_path: "PARSE_ERROR: boom".to_string(),
             suggested_safe_query: None,
             severity: Severity::Medium,
@@ -629,7 +629,7 @@ mod tests {
                 crate::tcp::evaluator::default_ruleset(),
             )),
             policy: Arc::new(ArcSwap::from_pointee(
-                vetro_engine::EnforcementPolicy::default(),
+                vericto_engine::EnforcementPolicy::default(),
             )),
             telemetry_mode: Arc::new(ArcSwap::from_pointee(
                 crate::tcp::rules_sync::TelemetryQueryMode::default(),

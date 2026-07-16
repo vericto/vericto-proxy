@@ -1,10 +1,10 @@
-//! Configuration for the control-plane link to the Vetro API.
+//! Configuration for the control-plane link to the Vericto API.
 //!
 //! When the proxy runs in customer infrastructure (wire-protocol mode), it
-//! reports evaluations to the Vetro API and pulls its ruleset from it, both
+//! reports evaluations to the Vericto API and pulls its ruleset from it, both
 //! over HTTPS authenticated with a workspace API key.
 //!
-//! All settings are optional: if `VETRO_API_URL` / `VETRO_API_KEY` are unset,
+//! All settings are optional: if `VERICTO_API_URL` / `VERICTO_API_KEY` are unset,
 //! the control-plane link is disabled (the proxy still evaluates with its local
 //! default ruleset — useful for dev / air-gapped deployments).
 
@@ -45,8 +45,8 @@ pub struct ControlPlaneConfig {
 impl ControlPlaneConfig {
     /// Build from environment. Returns `None` when the link is not configured.
     pub fn from_env() -> Option<Self> {
-        let api_url = std::env::var("VETRO_API_URL").ok()?;
-        let api_key = std::env::var("VETRO_API_KEY").ok()?;
+        let api_url = std::env::var("VERICTO_API_URL").ok()?;
+        let api_key = std::env::var("VERICTO_API_KEY").ok()?;
         if api_url.is_empty() || api_key.is_empty() {
             return None;
         }
@@ -55,13 +55,13 @@ impl ControlPlaneConfig {
             // Minimum 30 seconds to avoid hammering the API.
             // Values below the minimum are silently clamped — a warning is logged
             // so operators can spot the misconfiguration without a hard failure.
-            env_u64("VETRO_RULES_SYNC_INTERVAL_SECS")
+            env_u64("VERICTO_RULES_SYNC_INTERVAL_SECS")
                 .map(|v| {
                     if v < RULES_SYNC_MIN_SECS {
                         tracing::warn!(
                             configured = v,
                             minimum = RULES_SYNC_MIN_SECS,
-                            "VETRO_RULES_SYNC_INTERVAL_SECS is below the minimum — \
+                            "VERICTO_RULES_SYNC_INTERVAL_SECS is below the minimum — \
                              clamping to {} seconds",
                             RULES_SYNC_MIN_SECS
                         );
@@ -73,24 +73,26 @@ impl ControlPlaneConfig {
                 .unwrap_or(300), // default: 5 min
         );
 
-        let buffer_mode = match std::env::var("VETRO_TELEMETRY_BUFFER").as_deref() {
+        let buffer_mode = match std::env::var("VERICTO_TELEMETRY_BUFFER").as_deref() {
             Ok("disk") => BufferMode::Disk,
             _ => BufferMode::Memory,
         };
 
-        let disk_spool_path = std::env::var("VETRO_TELEMETRY_DISK_PATH")
-            .unwrap_or_else(|_| "/var/lib/vetro/spool".to_string());
+        let disk_spool_path = std::env::var("VERICTO_TELEMETRY_DISK_PATH")
+            .unwrap_or_else(|_| "/var/lib/vericto/spool".to_string());
 
         Some(Self {
             api_url: api_url.trim_end_matches('/').to_string(),
             api_key,
-            database_id: std::env::var("VETRO_DATABASE_ID").ok(),
+            database_id: std::env::var("VERICTO_DATABASE_ID").ok(),
             rules_sync_interval,
             buffer_mode,
             disk_spool_path,
-            memory_capacity: env_usize("VETRO_TELEMETRY_MEMORY_CAPACITY").unwrap_or(10_000),
-            batch_size: env_usize("VETRO_TELEMETRY_BATCH_SIZE").unwrap_or(100),
-            flush_interval: Duration::from_secs(env_u64("VETRO_TELEMETRY_FLUSH_SECS").unwrap_or(5)),
+            memory_capacity: env_usize("VERICTO_TELEMETRY_MEMORY_CAPACITY").unwrap_or(10_000),
+            batch_size: env_usize("VERICTO_TELEMETRY_BATCH_SIZE").unwrap_or(100),
+            flush_interval: Duration::from_secs(
+                env_u64("VERICTO_TELEMETRY_FLUSH_SECS").unwrap_or(5),
+            ),
         })
     }
 }

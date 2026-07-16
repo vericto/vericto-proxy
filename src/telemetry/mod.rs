@@ -1,4 +1,4 @@
-//! Outbound telemetry: buffers query evaluations and ships them to the Vetro
+//! Outbound telemetry: buffers query evaluations and ships them to the Vericto
 //! API in batches over HTTPS.
 //!
 //! Hard invariant: telemetry MUST NEVER block or fail the SQL data path. The
