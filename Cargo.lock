@@ -1870,9 +1870,9 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
 
 [[package]]
-name = "vetro-engine"
-version = "2.1.0"
-source = "git+https://github.com/donkan168/vetro-engine?tag=v2.1.0#f7e274cb503d921bfb713db66a0ff3022cd7eb44"
+name = "vericto-engine"
+version = "3.0.0"
+source = "git+https://github.com/donkan168/vericto-engine?tag=v3.0.0#d6125bb953ac727aa8232d21ac91ec84ea40c516"
 dependencies = [
  "anyhow",
  "pg_query",
@@ -1885,8 +1885,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "vetro-proxy"
-version = "3.0.0"
+name = "vericto-proxy"
+version = "4.0.0"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -1909,7 +1909,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
- "vetro-engine",
+ "vericto-engine",
  "webpki-roots 0.26.11",
 ]
 

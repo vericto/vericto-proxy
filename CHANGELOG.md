@@ -1,11 +1,37 @@
 # Changelog
 
-All notable changes to vetro-proxy are documented in this file.
+All notable changes to vericto-proxy are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+
+## [4.0.0] — 2026-07-16
+
+Rebrand from **Vetro** to **Vericto**. Breaking release: environment variables,
+the crate/container image, rule codes, and the contact domain were renamed, and
+the service now targets the rebranded engine.
+
+### Changed (breaking)
+
+- **Environment variables renamed** `VETRO_*` → `VERICTO_*` (e.g.
+  `VETRO_API_KEY` → `VERICTO_API_KEY`, `VETRO_DATABASE_ID`,
+  `VETRO_WIRE_PROTOCOL`, `VETRO_TELEMETRY_*`, …). Deployments and the control
+  plane that set these must migrate.
+- **Renamed** crate and container image `vetro-proxy` → `vericto-proxy`.
+- **Adopt `vericto-engine v3.0.0`** (git dependency updated to the renamed
+  `vericto-engine` repository at tag `v3.0.0`); imports updated to
+  `vericto_engine::…`.
+- **Rule codes** referenced in code, tests and docs renamed `VETRO-NNN` →
+  `VERICTO-NNN` to match the engine.
+- **Contact domain** updated `vetro.dev` → `vericto.com`.
+
+### Notes
+
+- No change to the TCP wire-proxy behaviour; only naming and identifiers.
+- Historical entries below were rewritten to the `vericto-*` / `VERICTO-*`
+  names for readability; they were originally published under `vetro-*`.
 
 ## [3.0.0] — 2026-07-08
 
@@ -20,7 +46,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `UPSTREAM_PG_SSLROOTCERT` → `UPSTREAM_SSLROOTCERT`
   - `UPSTREAM_PG_SSLCERT` / `UPSTREAM_PG_SSLKEY` → `UPSTREAM_SSLCERT` / `UPSTREAM_SSLKEY`
 
-  The wire protocol is still selected by `VETRO_WIRE_PROTOCOL` (`postgres` |
+  The wire protocol is still selected by `VERICTO_WIRE_PROTOCOL` (`postgres` |
   `mysql`), which now only changes the DEFAULT ports (Postgres 5432/5433, MySQL
   3306/3307) when they are not set explicitly. There is no backward-compatible
   fallback — the old names are ignored.
@@ -44,7 +70,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - Multi-dialect wire-protocol support via a runtime `WireProtocol` strategy: the
-  active protocol is selected at deploy time with `VETRO_WIRE_PROTOCOL`
+  active protocol is selected at deploy time with `VERICTO_WIRE_PROTOCOL`
   (`postgres` | `mysql`; defaults to `postgres`, so existing deployments are
   unchanged). The session loop — evaluation, telemetry, enforcement — is now
   shared, protocol-agnostic code; each protocol supplies only its framing,
@@ -53,7 +79,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   protocol. Extracts SQL from `COM_QUERY` and `COM_STMT_PREPARE` (including the
   `CLIENT_QUERY_ATTRIBUTES` prefix added by MySQL 8.0.23+), evaluates it with
   `Dialect::Mysql`, and blocks destructive statements with a native `ERR_Packet`
-  (`ERROR 1142 … [VETRO-xxx]`) so the driver sees a SQL error, not a broken
+  (`ERROR 1142 … [VERICTO-xxx]`) so the driver sees a SQL error, not a broken
   connection. Configured with `UPSTREAM_MYSQL_HOST`/`PORT` and
   `PROXY_MYSQL_LISTEN_PORT` (default 3307).
 - **MySQL TLS on both hops** (client→proxy and proxy→MySQL): the proxy
@@ -65,11 +91,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `PROXY_TLS_CERT`/`PROXY_TLS_KEY` (client hop) and `UPSTREAM_MYSQL_SSLMODE`
   (upstream hop).
 - Surface the dashboard-configured database `dialect` in `/sync/rules`; the
-  proxy logs a warning when the deployed `VETRO_WIRE_PROTOCOL` does not match it.
+  proxy logs a warning when the deployed `VERICTO_WIRE_PROTOCOL` does not match it.
 
 ### Fixed
 
-- CI could not fetch the private `vetro-engine` git dependency on any branch that
+- CI could not fetch the private `vericto-engine` git dependency on any branch that
   changed `Cargo.lock`: the credential rewrite treated the token as a username
   (headless password prompt) and `~/.cargo/git` was cached with a stale,
   unauthenticated checkout. Use `x-access-token:<token>` and drop `~/.cargo/git`
@@ -79,15 +105,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- Bump `vetro-engine` to `v2.1.0`, which closes the rule-coverage gaps
+- Bump `vericto-engine` to `v2.1.0`, which closes the rule-coverage gaps
   ENG-001…ENG-010 (8 new rules, plus fixes to LIMIT handling, nested-SELECT
   detection, sleep detection, tautology depth, and DROP DATABASE/SCHEMA).
 
 ### Added
 
 - Register the 8 new engine rules in the built-in `default_ruleset()` (and its
-  verbatim R13 mirror test): `VETRO-080`/`VETRO-081` (Critical — COPY PROGRAM,
-  DO block) and `VETRO-017`/`018`/`019`/`082`/`083`/`084` (High — ALTER TABLE
+  verbatim R13 mirror test): `VERICTO-080`/`VERICTO-081` (Critical — COPY PROGRAM,
+  DO block) and `VERICTO-017`/`018`/`019`/`082`/`083`/`084` (High — ALTER TABLE
   DROP CONSTRAINT / ALTER COLUMN TYPE / DISABLE TRIGGER, GRANT/REVOKE, MERGE,
   CREATE TABLE AS). The catalogue now carries 28 rules.
 
@@ -99,7 +125,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - PostgreSQL parsing via `pg_query` (libpg_query) — full-fidelity protobuf AST,
   including destructive statements nested in data-modifying CTEs.
 - MySQL, Oracle, and SQL Server parsing via `sqlparser-rs`.
-- 20 built-in rules (VETRO-001 through VETRO-090) covering DELETE/UPDATE without
+- 20 built-in rules (VERICTO-001 through VERICTO-090) covering DELETE/UPDATE without
   WHERE, DROP, TRUNCATE, ALTER TABLE, dangerous function calls, and OR-tautology
   SQL injection.
 - Custom rules defined as YAML AST conditions.
@@ -111,8 +137,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Optional control-plane link: ruleset hot-sync and telemetry reporting.
 - `/health` and `/metrics` (p50/p99 latency) endpoints.
 
-[Unreleased]: https://github.com/donkan168/vetro-proxy/compare/v3.0.0...HEAD
-[3.0.0]: https://github.com/donkan168/vetro-proxy/compare/v2.3.0...v3.0.0
-[2.3.0]: https://github.com/donkan168/vetro-proxy/compare/v2.2.0...v2.3.0
-[2.2.0]: https://github.com/donkan168/vetro-proxy/compare/v1.0.0...v2.2.0
-[1.0.0]: https://github.com/donkan168/vetro-proxy/releases/tag/v1.0.0
+[Unreleased]: https://github.com/donkan168/vericto-proxy/compare/v4.0.0...HEAD
+[4.0.0]: https://github.com/donkan168/vericto-proxy/compare/v3.0.0...v4.0.0
+[3.0.0]: https://github.com/donkan168/vericto-proxy/compare/v2.3.0...v3.0.0
+[2.3.0]: https://github.com/donkan168/vericto-proxy/compare/v2.2.0...v2.3.0
+[2.2.0]: https://github.com/donkan168/vericto-proxy/compare/v1.0.0...v2.2.0
+[1.0.0]: https://github.com/donkan168/vericto-proxy/releases/tag/v1.0.0
