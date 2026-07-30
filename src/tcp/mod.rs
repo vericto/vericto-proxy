@@ -18,7 +18,7 @@ use std::sync::Arc;
 use tokio::net::TcpListener;
 
 use crate::tcp::client_tls::ClientTlsMode;
-use crate::tcp::postgres::{handle_connection, PgProxyConfig, TelemetrySink};
+use crate::tcp::postgres::{PgProxyConfig, TelemetrySink, handle_connection};
 use crate::tcp::rules_sync::{SharedPolicy, SharedRuleset, SharedTelemetryMode};
 
 pub mod client_tls;

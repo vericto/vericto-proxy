@@ -19,7 +19,7 @@ use tokio::sync::Mutex;
 
 use crate::tcp::client_tls::{ClientRead, ClientWrite};
 use crate::tcp::codec::build_ready_for_query;
-use crate::tcp::evaluator::{evaluate, TcpDecision};
+use crate::tcp::evaluator::{TcpDecision, evaluate};
 use crate::tcp::postgres::PgProxyConfig;
 use crate::tcp::protocol::{BlockContext, Classified, RawClientMessage, WireProtocol};
 
@@ -205,8 +205,8 @@ async fn run_mysql_session(
             let caps = mc::read_client_capabilities(&ssl_req.payload).unwrap_or(0);
             if caps & mc::CLIENT_SSL == 0 {
                 return Err(std::io::Error::other(
-                "PROXY_TLS_MODE=require but the MySQL client did not request TLS (add --ssl-mode=REQUIRED)",
-            ));
+                    "PROXY_TLS_MODE=require but the MySQL client did not request TLS (add --ssl-mode=REQUIRED)",
+                ));
             }
             // Terminate TLS as the server on the client hop.
             crate::tcp::client_tls::accept_tls(config.client_tls_acceptor.as_ref().unwrap(), client)

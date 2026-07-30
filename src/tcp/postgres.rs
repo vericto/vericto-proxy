@@ -25,7 +25,7 @@ use tokio::net::TcpStream;
 use tokio::sync::Mutex;
 
 use crate::tcp::client_tls::{ClientRead, ClientWrite};
-use crate::tcp::codec::{read_startup_packet, StartupPacket};
+use crate::tcp::codec::{StartupPacket, read_startup_packet};
 use crate::tcp::evaluator::TcpDecision;
 use vericto_engine::EnforcementAction;
 
@@ -785,9 +785,9 @@ mod tests {
             let (mut sock, _) = upstream.accept().await.unwrap();
             let mut buf = [0u8; 128];
             let _ = sock.read(&mut buf).await; // read forwarded startup
-                                               // Send a byte pattern that is NOT an ErrorResponse (tag 'R' =
-                                               // Authentication), so the test can tell relayed data from an injected
-                                               // error, then die.
+            // Send a byte pattern that is NOT an ErrorResponse (tag 'R' =
+            // Authentication), so the test can tell relayed data from an injected
+            // error, then die.
             let _ = sock.write_all(&[b'R', 0, 0, 0, 8, 0, 0, 0, 0]).await;
             let _ = sock.flush().await;
             drop(sock);
