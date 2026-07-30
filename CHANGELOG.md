@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [4.0.1] — 2026-07-29
+
+Maintenance release: no API, config, or behaviour changes.
+
+### Changed
+
+- **Adopt `vericto-engine v3.1.1`** (git dependency bumped from `v3.0.0`). Brings
+  the full custom-rule predicate schema (nested `condition:` block, `FuncCall`
+  node type, 8 predicates) into the in-process evaluation path. The proxy passes
+  `ast_condition_yaml` straight through, so no code changes were needed.
+- **Migrated to Rust edition 2024** (`edition = "2021"` → `"2024"`). Toolchain is
+  already pinned to 1.88, which supports it; no source changes were required.
+- Updated repository URL and README links from `donkan168/…` to `vericto/…` to
+  reflect the repository transfer.
+
 ## [4.0.0] — 2026-07-16
 
 Rebrand from **Vetro** to **Vericto**. Breaking release: environment variables,

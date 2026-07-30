@@ -9,8 +9,8 @@
 use vericto_engine::parser::Dialect;
 
 use crate::tcp::codec::{
-    build_error_response, build_ready_for_query, extract_parse_query, extract_simple_query,
-    read_message, SQLSTATE_INSUFFICIENT_PRIVILEGE,
+    SQLSTATE_INSUFFICIENT_PRIVILEGE, build_error_response, build_ready_for_query,
+    extract_parse_query, extract_simple_query, read_message,
 };
 use crate::tcp::protocol::{
     BlockContext, BlockResponse, Classified, QueryKind, RawClientMessage, WireProtocol,

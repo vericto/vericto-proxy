@@ -2,13 +2,13 @@
 
 > Transparent SQL TCP proxy — deterministic SQL firewall in the wire path.
 
-[![CI](https://github.com/donkan168/vericto-proxy/actions/workflows/ci.yml/badge.svg)](https://github.com/donkan168/vericto-proxy/actions/workflows/ci.yml)
+[![CI](https://github.com/vericto/vericto-proxy/actions/workflows/ci.yml/badge.svg)](https://github.com/vericto/vericto-proxy/actions/workflows/ci.yml)
 [![License: ELv2](https://img.shields.io/badge/license-Elastic--2.0-blue.svg)](LICENSE)
 [![Rust 1.88+](https://img.shields.io/badge/rust-1.88%2B-orange.svg)](https://www.rust-lang.org)
 
 `vericto-proxy` is the **customer-facing TCP wire-protocol proxy**. It intercepts
 every query on the database wire protocol, evaluates it with the
-[vericto-engine](https://github.com/donkan168/vericto-engine) AST parser, and either
+[vericto-engine](https://github.com/vericto/vericto-engine) AST parser, and either
 forwards it to the real database or blocks it — all in <2ms.
 
 One proxy instance fronts one database and speaks exactly one wire protocol,
@@ -25,7 +25,7 @@ engines**. Only the value above and (optionally) the default ports change.
 No AI, no stochastic heuristics — the same input always produces the same result.
 
 > **Other dialects** (Oracle, SQL Server): evaluate via the HTTP API
-> ([vericto-eval](https://github.com/donkan168/vericto-eval)); there is no wire
+> ([vericto-eval](https://github.com/vericto/vericto-eval)); there is no wire
 > proxy for them.
 
 ---

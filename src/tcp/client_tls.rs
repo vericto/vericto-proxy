@@ -18,9 +18,9 @@ use std::sync::Arc;
 
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
-use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
-use tokio_rustls::rustls::ServerConfig;
 use tokio_rustls::TlsAcceptor;
+use tokio_rustls::rustls::ServerConfig;
+use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
 /// Boxed client read half (plaintext TCP or TLS).
 pub type ClientRead = Box<dyn AsyncRead + Send + Unpin>;

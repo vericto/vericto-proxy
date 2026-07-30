@@ -40,5 +40,5 @@ pub struct TelemetryEvent {
     pub occurred_at: String,
 }
 
-pub use queue::{new_queue, EventQueue};
+pub use queue::{EventQueue, new_queue};
 pub use reporter::Reporter;

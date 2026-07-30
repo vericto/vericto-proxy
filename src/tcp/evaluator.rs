@@ -3,7 +3,7 @@
 //! The TCP proxy calls the existing parser and `RuleEngine` directly, without
 //! going through HTTP. This keeps latency minimal on the critical path.
 
-use vericto_engine::parser::{parser_for, Dialect};
+use vericto_engine::parser::{Dialect, parser_for};
 use vericto_engine::{
     Decision, EnforcementAction, EnforcementPolicy, ParseErrorAction, Rule, RuleEngine, RuleType,
     Severity,

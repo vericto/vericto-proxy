@@ -9,8 +9,8 @@
 use vericto_engine::parser::Dialect;
 
 use crate::tcp::codec_mysql::{
-    build_err_packet, read_packet, MySqlPacket, COM_QUIT, VERICTO_BLOCK_ERR_CODE,
-    VERICTO_BLOCK_SQLSTATE,
+    COM_QUIT, MySqlPacket, VERICTO_BLOCK_ERR_CODE, VERICTO_BLOCK_SQLSTATE, build_err_packet,
+    read_packet,
 };
 use crate::tcp::protocol::{
     BlockContext, BlockResponse, Classified, QueryKind, RawClientMessage, WireProtocol,

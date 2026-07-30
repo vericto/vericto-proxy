@@ -397,7 +397,7 @@ mod tests {
         assert_eq!(len, bytes.len() - 4);
         assert_eq!(bytes[3], 1); // seq
         assert_eq!(bytes[4], 0xFF); // ERR header
-                                    // error code 1142 = 0x0476 → little-endian bytes 0x76, 0x04
+        // error code 1142 = 0x0476 → little-endian bytes 0x76, 0x04
         assert_eq!(bytes[5], 0x76);
         assert_eq!(bytes[6], 0x04);
         assert_eq!(bytes[7], b'#');
