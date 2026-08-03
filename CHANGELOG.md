@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [4.0.2] — 2026-08-02
+
+Maintenance release: dependency bump, no config or API changes.
+
+### Fixed
+
+- **Adopt `vericto-engine v3.2.0`** (git dependency bumped from `v3.1.1`),
+  picking up the VERICTO-010 false-positive fix: `DROP POLICY`, `DROP TRIGGER`,
+  `DROP FUNCTION`, `DROP VIEW`, and `DROP SEQUENCE` are no longer flagged as a
+  critical `DROP TABLE` at runtime. Schema/DDL detection now matches only
+  `DROP TABLE`/`DROP DATABASE` (VERICTO-010); `DROP INDEX`/`DROP SCHEMA` keep
+  their own rules (013 / 012).
+
+  The runtime proxy keeps the full workspace policy (it does not set the new
+  `schema_migration_cap`), so a genuine `DROP TABLE`/`DROP DATABASE` against a
+  live database still blocks — only the mis-classified non-table drops stop
+  firing.
+
 ## [4.0.1] — 2026-07-29
 
 Maintenance release: no API, config, or behaviour changes.
