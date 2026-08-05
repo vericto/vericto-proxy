@@ -424,8 +424,13 @@ pub(crate) fn report_telemetry(
         TelemetryQueryMode::Sanitized => std::borrow::Cow::Owned(sanitize_query(sql)),
     };
 
-    let event =
-        build_telemetry_event(&sink.database_id, &reported_sql, dialect, decision, latency_us);
+    let event = build_telemetry_event(
+        &sink.database_id,
+        &reported_sql,
+        dialect,
+        decision,
+        latency_us,
+    );
     sink.queue.push(event);
 }
 
