@@ -62,6 +62,12 @@ async fn main() {
     let telemetry_mode: SharedTelemetryMode =
         Arc::new(ArcSwap::from_pointee(TelemetryQueryMode::default()));
 
+    // Readiness signal for the health-check listener: not-ready until warm-up
+    // completes. When the control-plane link is enabled, the syncer flips it
+    // after its first sync attempt; when disabled, we're ready immediately (the
+    // built-in default ruleset is already active and protective).
+    let readiness = crate::tcp::healthz::Readiness::new();
+
     // Control-plane link (telemetry + rule sync) — optional.
     let telemetry_sink = match config::ControlPlaneConfig::from_env() {
         Some(cp) => {
@@ -72,17 +78,19 @@ async fn main() {
             );
 
             // Rule syncer: polls GET /sync/rules and swaps the ruleset and
-            // policy in place.
+            // policy in place. Flips `readiness` after its first attempt.
             let sync_cfg = cp.clone();
             let sync_ruleset = ruleset.clone();
             let sync_policy = policy.clone();
             let sync_telemetry_mode = telemetry_mode.clone();
+            let sync_readiness = readiness.clone();
             tokio::spawn(async move {
                 crate::tcp::rules_sync::run(
                     sync_cfg,
                     sync_ruleset,
                     sync_policy,
                     sync_telemetry_mode,
+                    sync_readiness,
                 )
                 .await
             });
@@ -102,9 +110,25 @@ async fn main() {
                 "Control-plane link disabled \
                  (set VERICTO_API_URL and VERICTO_API_KEY to enable telemetry and rule sync)"
             );
+            // No syncer to flip readiness; the default ruleset is already active.
+            readiness.mark_ready();
             None
         }
     };
+
+    // Health-check listener (opt-in via VERICTO_HEALTHZ_PORT): a dedicated TCP
+    // port for load-balancer probes that never touches the upstream. It binds
+    // only once the proxy is ready, so probes fail (connection-refused) during
+    // warm-up and succeed afterwards.
+    if let Some(healthz_port) = tcp_opts.healthz_port {
+        let healthz_readiness = readiness.clone();
+        tokio::spawn(async move {
+            if let Err(e) = crate::tcp::healthz::run_healthz(healthz_port, healthz_readiness).await
+            {
+                tracing::error!(error = %e, port = healthz_port, "healthz listener failed");
+            }
+        });
+    }
 
     // Wire protocol selected per deployment (Option A): one protocol per proxy
     // instance, derived from the fronted database's dialect.

@@ -8,6 +8,7 @@
 pub mod codec;
 pub mod codec_mysql;
 pub mod evaluator;
+pub mod healthz;
 pub mod postgres;
 pub mod protocol;
 pub mod session;
@@ -44,6 +45,10 @@ pub struct TcpProxyOptions {
     pub client_tls_cert: Option<String>,
     /// Private key (PEM) for the server certificate.
     pub client_tls_key: Option<String>,
+    /// Dedicated TCP port for load-balancer health checks (`healthz`). When set,
+    /// a separate listener answers probes without touching the upstream. `None`
+    /// disables it (the default; e.g. dev, or when the LB probes the traffic port).
+    pub healthz_port: Option<u16>,
 }
 
 impl TcpProxyOptions {
@@ -95,6 +100,10 @@ impl TcpProxyOptions {
             ),
             client_tls_cert: std::env::var("PROXY_TLS_CERT").ok(),
             client_tls_key: std::env::var("PROXY_TLS_KEY").ok(),
+            // Dedicated health-check port (opt-in). Ignored if unparseable.
+            healthz_port: std::env::var("VERICTO_HEALTHZ_PORT")
+                .ok()
+                .and_then(|v| v.parse().ok()),
         })
     }
 }
