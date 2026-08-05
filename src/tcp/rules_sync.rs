@@ -193,6 +193,7 @@ pub async fn run(
     ruleset: SharedRuleset,
     policy: SharedPolicy,
     telemetry_mode: SharedTelemetryMode,
+    readiness: Arc<crate::tcp::healthz::Readiness>,
 ) {
     let mut url = format!("{}/api/v1/sync/rules", cfg.api_url);
     if let Some(ref db_id) = cfg.database_id {
@@ -304,6 +305,14 @@ pub async fn run(
                 tracing::warn!(error = %e, "Rule sync request failed; keeping last-good ruleset");
             }
         }
+
+        // Warm-up complete after the FIRST sync attempt — success or failure.
+        // On failure the built-in default ruleset (seeded at startup) stays in
+        // effect and is fully protective, so the proxy is ready to serve even if
+        // the control plane is unreachable. Gating readiness on sync *success*
+        // would couple a control-plane outage to a proxy outage; we deliberately
+        // do not. Idempotent, so calling it every iteration is cheap.
+        readiness.mark_ready();
     }
 }
 
