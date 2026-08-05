@@ -89,7 +89,13 @@ pub async fn intercept_client_to_server(
                 let eval_us = eval_start.elapsed().as_micros();
 
                 // Telemetry before any forwarding (R5.7).
-                crate::tcp::postgres::report_telemetry(config, &sql, &decision, eval_us);
+                crate::tcp::postgres::report_telemetry(
+                    config,
+                    &sql,
+                    proto.dialect(),
+                    &decision,
+                    eval_us,
+                );
 
                 if let TcpDecision::Block {
                     rule_code,

@@ -28,6 +28,7 @@ use crate::tcp::client_tls::{ClientRead, ClientWrite};
 use crate::tcp::codec::{StartupPacket, read_startup_packet};
 use crate::tcp::evaluator::TcpDecision;
 use vericto_engine::EnforcementAction;
+use vericto_engine::parser::Dialect;
 
 /// PostgreSQL TCP proxy configuration.
 pub struct PgProxyConfig {
@@ -310,9 +311,22 @@ fn action_str(action: EnforcementAction) -> &'static str {
 /// Builds a telemetry event from an evaluation decision. Pure (no I/O) so it can
 /// be unit-tested. Returns `None` only when there is nothing to report (never,
 /// currently — every decision maps to a status).
+/// Canonical lowercase name for a dialect, as expected by the control plane
+/// (and accepted back by `Dialect::parse_dialect`). Reported verbatim in
+/// telemetry so the dashboard reflects the wire protocol the proxy is fronting.
+fn dialect_name(dialect: Dialect) -> &'static str {
+    match dialect {
+        Dialect::Postgres => "postgres",
+        Dialect::Mysql => "mysql",
+        Dialect::Oracle => "oracle",
+        Dialect::MsSql => "mssql",
+    }
+}
+
 fn build_telemetry_event(
     database_id: &str,
     sql: &str,
+    dialect: Dialect,
     decision: &TcpDecision,
     latency_us: u128,
 ) -> crate::telemetry::TelemetryEvent {
@@ -374,7 +388,7 @@ fn build_telemetry_event(
         event_id: uuid::Uuid::new_v4().to_string(),
         database_id: database_id.to_string(),
         query_text: sql.to_string(),
-        dialect: "postgres".to_string(),
+        dialect: dialect_name(dialect).to_string(),
         status,
         rule_code,
         ast_node_path,
@@ -392,6 +406,7 @@ fn build_telemetry_event(
 pub(crate) fn report_telemetry(
     config: &PgProxyConfig,
     sql: &str,
+    dialect: Dialect,
     decision: &TcpDecision,
     latency_us: u128,
 ) {
@@ -409,7 +424,13 @@ pub(crate) fn report_telemetry(
         TelemetryQueryMode::Sanitized => std::borrow::Cow::Owned(sanitize_query(sql)),
     };
 
-    let event = build_telemetry_event(&sink.database_id, &reported_sql, decision, latency_us);
+    let event = build_telemetry_event(
+        &sink.database_id,
+        &reported_sql,
+        dialect,
+        decision,
+        latency_us,
+    );
     sink.queue.push(event);
 }
 
@@ -447,6 +468,7 @@ mod tests {
         let ev = build_telemetry_event(
             "db1",
             "SELECT 1",
+            Dialect::Postgres,
             &TcpDecision::Forward { observation: None },
             42,
         );
@@ -461,6 +483,7 @@ mod tests {
         let ev = build_telemetry_event(
             "db1",
             "SELECT * FROM t",
+            Dialect::Postgres,
             &forward_observation(EnforcementAction::Flag),
             150,
         );
@@ -475,6 +498,7 @@ mod tests {
         let ev = build_telemetry_event(
             "db1",
             "INSERT INTO t VALUES (1)",
+            Dialect::Postgres,
             &forward_observation(EnforcementAction::Monitor),
             200,
         );
@@ -493,11 +517,13 @@ mod tests {
             suggested_safe_query: None,
             severity: Severity::Critical,
         };
-        let ev = build_telemetry_event("db1", "DELETE FROM t", &decision, 80);
+        let ev = build_telemetry_event("db1", "DELETE FROM t", Dialect::Mysql, &decision, 80);
         assert_eq!(ev.status, "BLOCKED");
         assert_eq!(ev.enforcement_action.as_deref(), Some("block"));
         assert_eq!(ev.severity.as_deref(), Some("critical"));
         assert_eq!(ev.rule_code.as_deref(), Some("VERICTO-001"));
+        // The reported dialect reflects the wire protocol, not a hardcoded default.
+        assert_eq!(ev.dialect, "mysql");
     }
 
     #[test]
@@ -511,7 +537,7 @@ mod tests {
                 parse_error: Some("boom".to_string()),
             }),
         };
-        let ev = build_telemetry_event("db1", "@@@", &decision, 10);
+        let ev = build_telemetry_event("db1", "@@@", Dialect::Postgres, &decision, 10);
         assert_eq!(ev.status, "PARSE_ERROR");
         assert_eq!(ev.parse_error.as_deref(), Some("boom"));
         assert_eq!(ev.enforcement_action.as_deref(), Some("flag"));
@@ -525,7 +551,7 @@ mod tests {
             suggested_safe_query: None,
             severity: Severity::Medium,
         };
-        let ev = build_telemetry_event("db1", "@@@", &decision, 10);
+        let ev = build_telemetry_event("db1", "@@@", Dialect::Postgres, &decision, 10);
         assert_eq!(ev.status, "PARSE_ERROR");
         assert_eq!(ev.enforcement_action.as_deref(), Some("block"));
         assert_eq!(ev.parse_error.as_deref(), Some("PARSE_ERROR: boom"));
