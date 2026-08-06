@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Adopt `vericto-engine v3.2.1`** (git dependency bumped from `v3.2.0`),
+  picking up the VERICTO-040 false-positive fix. The engine flagged any
+  `INSERT … SELECT` without checking whether the source was filtered, so
+  `INSERT INTO t SELECT … WHERE id = $1` was reported — and **rejected at the
+  wire, since this proxy's default ruleset sets VERICTO-040 to Block**. That
+  made parameterised backfills fail against a live connection. The rule now
+  fires only when the source has no effective `WHERE` and no row limit;
+  `WHERE 1=1` bounds nothing and still fires.
+
+### Changed
+
+- **`pg_query` 5.1 → 6.2**, bumped in the same commit as the engine tag above
+  and not separately. Both crates statically link `libpg_query`, so a
+  major-version split between them would compile and link two copies of it.
+  The engine moved to `pg_query` 6.2 in v3.2.1, so this line has to follow.
+  Vendored PostgreSQL goes 16.1 → 17.7. The only call site here is
+  `pg_query::normalize` in `tcp/postgres.rs`, whose signature is unchanged.
+- **Custom-rule predicate `where_always_true` now matches more queries.** It
+  previously only matched an always-true *OR branch* (`WHERE id = 5 OR 1=1`);
+  it now also matches a WHERE that is trivially true as a whole (`WHERE 1=1`,
+  `WHERE true`). A custom rule using that predicate may start blocking traffic
+  it previously let through. Nothing that matched before stops matching.
+
 ## [4.0.2] — 2026-08-02
 
 Maintenance release: dependency bump, no config or API changes.
