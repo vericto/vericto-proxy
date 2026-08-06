@@ -7,8 +7,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [4.1.0] — 2026-08-06
+
+First release since 4.0.1. The versions 4.0.2 and 4.0.3 were bumped in
+`Cargo.toml` but never tagged, so no image was ever published for them and they
+are not releases; their contents ship here. Everything below is the accumulated
+delta over 4.0.1.
+
+### Added
+
+- **Dedicated TCP health-check listener with a readiness gate**
+  (`tcp/healthz.rs`), opt-in via `VERICTO_HEALTHZ_PORT` and disabled by default.
+  Kept separate from the wire-protocol traffic port because MySQL's handshake is
+  server-first: the proxy must connect upstream the moment it accepts, so a TCP
+  probe on the traffic port would open and immediately discard a real database
+  connection on every check. The `healthz` port answers probes without touching
+  the upstream, and behaves identically for Postgres and MySQL.
+  Readiness is gated by *not binding* the port until warm-up completes, because
+  a TCP check succeeds as soon as the port is listening — before user space ever
+  calls `accept()` — so declining to accept would not read as unhealthy. During
+  warm-up probes get connection-refused; afterwards the port binds and accepts.
+  Readiness flips after the first rule-sync *attempt*, whether it succeeded or
+  failed, so a control-plane outage never pulls the proxy out of rotation. The
+  check deliberately never probes the upstream database, so a database blip
+  cannot cascade into every instance being pulled from rotation.
+
 ### Fixed
 
+- **Adopt `vericto-engine v3.2.0`** (git dependency bumped from `v3.1.1`),
+  picking up the VERICTO-010 false-positive fix: `DROP POLICY`, `DROP TRIGGER`,
+  `DROP FUNCTION`, `DROP VIEW`, and `DROP SEQUENCE` are no longer flagged as a
+  critical `DROP TABLE` at runtime. Schema/DDL detection now matches only
+  `DROP TABLE`/`DROP DATABASE` (VERICTO-010); `DROP INDEX`/`DROP SCHEMA` keep
+  their own rules (013 / 012).
+
+  The runtime proxy keeps the full workspace policy (it does not set the new
+  `schema_migration_cap`), so a genuine `DROP TABLE`/`DROP DATABASE` against a
+  live database still blocks — only the mis-classified non-table drops stop
+  firing.
+- **Telemetry reported `dialect: "postgres"` for every evaluation**, including
+  from a proxy fronting MySQL, because `build_telemetry_event` hardcoded the
+  label. Rule evaluation itself was already dialect-correct — the session has
+  always passed `proto.dialect()` into `evaluate()` — so only the reported label
+  was wrong, and the control plane stores the dialect as reported. The dialect is
+  now threaded from that same source of truth through `report_telemetry` into
+  `build_telemetry_event`. Any MySQL evaluation recorded before this fix is
+  mislabelled at rest in the control plane.
 - **Adopt `vericto-engine v3.2.1`** (git dependency bumped from `v3.2.0`),
   picking up the VERICTO-040 false-positive fix. The engine flagged any
   `INSERT … SELECT` without checking whether the source was filtered, so
@@ -31,24 +75,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   it now also matches a WHERE that is trivially true as a whole (`WHERE 1=1`,
   `WHERE true`). A custom rule using that predicate may start blocking traffic
   it previously let through. Nothing that matched before stops matching.
-
-## [4.0.2] — 2026-08-02
-
-Maintenance release: dependency bump, no config or API changes.
-
-### Fixed
-
-- **Adopt `vericto-engine v3.2.0`** (git dependency bumped from `v3.1.1`),
-  picking up the VERICTO-010 false-positive fix: `DROP POLICY`, `DROP TRIGGER`,
-  `DROP FUNCTION`, `DROP VIEW`, and `DROP SEQUENCE` are no longer flagged as a
-  critical `DROP TABLE` at runtime. Schema/DDL detection now matches only
-  `DROP TABLE`/`DROP DATABASE` (VERICTO-010); `DROP INDEX`/`DROP SCHEMA` keep
-  their own rules (013 / 012).
-
-  The runtime proxy keeps the full workspace policy (it does not set the new
-  `schema_migration_cap`), so a genuine `DROP TABLE`/`DROP DATABASE` against a
-  live database still blocks — only the mis-classified non-table drops stop
-  firing.
 
 ## [4.0.1] — 2026-07-29
 
