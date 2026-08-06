@@ -14,11 +14,13 @@ path = "src/main.rs"
 
 [dependencies]
 # AST engine (open-core shared library)
-vericto-engine = { git = "https://github.com/vericto/vericto-engine", tag = "v3.2.0" }
+vericto-engine = { git = "https://github.com/vericto/vericto-engine", tag = "v3.2.1" }
 
 # PostgreSQL query normalization for sanitized telemetry (literals → $1, $2…).
 # Same major version the engine uses, so libpg_query resolves to a single build.
-pg_query = "5.1"
+# Both statically link libpg_query, so a major-version split here would compile
+# and link two copies of it: bump this line and the engine tag above together.
+pg_query = "6.2"
 
 # Async runtime
 tokio = { version = "1.38", features = ["full"] }
