@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [4.2.0] — 2026-08-06
+
+Read before rolling out: this release **blocks traffic it previously allowed**.
+Minor rather than patch for that reason, even though no API or config changed.
+
+### Changed
+
+- **`vericto-engine` v3.2.1 → v3.2.3. VERICTO-070 now fires on `pg_sleep_until`
+  for MySQL, Oracle and MS SQL**, and this proxy's default ruleset sets that rule
+  to `Block` (`tcp/evaluator.rs`), so those queries are now **rejected at the
+  wire** where they previously passed through.
+  The engine kept its sleep-function list in two walkers and only the PostgreSQL
+  one carried that name, so a time-based blind-injection probe using
+  `pg_sleep_until` was blocked on PostgreSQL and silently forwarded on every other
+  dialect. Closing that gap is the point of the release — but `pg_sleep_until` is
+  a PostgreSQL function, so on a MySQL, Oracle or MS SQL upstream it would not
+  have executed anyway. If a legitimate workload sends that identifier to a
+  non-PostgreSQL database, it will now be refused.
+  The rest of v3.2.2 and all of v3.2.3 are internal to the engine: a corrected
+  dependency snippet in its docs with a guard test, removal of its unused
+  `anyhow`/`tokio-test` dependencies, and removal of its CI cache step. No
+  config, env-var, or wire-protocol change here.
+
 ## [4.1.0] — 2026-08-06
 
 First release since 4.0.1. The versions 4.0.2 and 4.0.3 were bumped in
