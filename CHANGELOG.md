@@ -61,11 +61,14 @@ reached the database**. Minor rather than patch for that reason.
 
 ### Changed
 
-- **CI now runs on pull requests that do not target `main`.** The `pull_request`
-  trigger filtered on `branches: [main]`, so a stacked PR — one based on another
-  open branch — reported no checks at all and could be merged unverified. Found by
-  this release's own stacked PR, which came up with zero checks. `push` is still
-  restricted to `main`.
+- **CI now runs on pull requests that do not target `main`, and can be triggered
+  manually.** The `pull_request` trigger filtered on `branches: [main]`, so a
+  stacked PR — one based on another open branch — reported no checks at all and
+  could be merged unverified; found by this release's own stacked PR, which came up
+  with zero checks. And with no `workflow_dispatch`, re-running CI on a branch
+  required pushing a commit — the hole we fell into during the GitHub Actions
+  outage on 2026-08-06, when runs sat orphaned in `queued` and could be neither
+  cancelled nor re-run. `push` is still restricted to `main`.
 - **Evaluation and telemetry reporting now run on the blocking pool.** Both are
   CPU-bound and synchronous; on the async reactor they stall the worker thread and
   freeze every other connection scheduled on it, turning a per-connection cost
