@@ -11,6 +11,7 @@ pub mod evaluator;
 pub mod healthz;
 pub mod postgres;
 pub mod protocol;
+pub mod query_limit;
 pub mod session;
 pub mod upstream;
 
@@ -153,6 +154,12 @@ pub async fn run_pg_proxy(
         policy,
         telemetry_mode,
         telemetry,
+        // Resolved here rather than per query: the wire protocol is fixed at
+        // startup, so the clamp and its warning belong here too.
+        max_query_bytes: query_limit::effective_max_query_bytes(
+            query_limit::configured_max_query_bytes(),
+            vericto_engine::Dialect::Postgres,
+        ),
     });
 
     let addr = format!("0.0.0.0:{}", opts.listen_port);
@@ -227,6 +234,10 @@ pub async fn run_mysql_proxy(
         policy,
         telemetry_mode,
         telemetry,
+        max_query_bytes: query_limit::effective_max_query_bytes(
+            query_limit::configured_max_query_bytes(),
+            vericto_engine::Dialect::Mysql,
+        ),
     });
 
     let addr = format!("0.0.0.0:{}", opts.listen_port);

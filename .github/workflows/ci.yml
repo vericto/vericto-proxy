@@ -3,8 +3,13 @@ name: CI
 on:
   push:
     branches: [main]
+  # No `branches` filter: a stacked PR targets its parent branch rather than
+  # main, and a base filter here would silently give it zero checks.
   pull_request:
-    branches: [main]
+  # Manual trigger. Without it there is no way to re-run CI on a branch without
+  # pushing a commit — the hole we fell into when a GitHub Actions outage left
+  # runs orphaned in `queued`, unable to be cancelled or re-run.
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
