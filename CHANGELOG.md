@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [4.2.2] — 2026-08-08
+
+### Fixed
+
+- **A single large query could stall all telemetry delivery.** `query_text` was
+  reported in full, so any query over the API's ingest limits produced a batch the
+  API refuses: 400 when a field exceeds the schema's 65 536, 413 when the batch
+  exceeds the 1 MiB body limit. The reporter treated every non-2xx as retryable
+  and `nack`ed the batch, which re-buffers at the *front* of the queue, then broke
+  out of the drain loop. The rejected batch therefore sat at the head being
+  re-sent once per flush tick, blocking every event behind it until the ring
+  buffer churned past it.
+  Two changes, either of which alone would leave a gap:
+  - `query_text` is now truncated to 8 KiB when the event is built, with a visible
+    marker. Applied at build time rather than at send time because the queue holds
+    up to `memory_capacity` (10 000) events and the disk spool writes each one to
+    a file — an unbounded field is a memory and disk problem before it is an HTTP
+    one. The cut lands on a UTF-8 character boundary, since SQL carries arbitrary
+    UTF-8 in identifiers, literals and comments.
+  - The reporter now distinguishes permanent from retryable failures. 400, 413 and
+    422 are properties of the bytes, so the batch is dropped (logged at `error`
+    with the status and event count) instead of retried forever. Everything else
+    still retries, including 401/403: a rotated or mistyped API key is an operator
+    misconfiguration that is fixable without redeploying, so discarding telemetry
+    over it would turn a recoverable mistake into silent data loss.
+
+  The 8 KiB figure is derived, not picked: at the default `batch_size` of 100, the
+  schema's own 65 536 would produce a ~6.5 MiB body, six times the API's limit.
+  8 KiB keeps a full default batch near 800 KiB with room for the rest of each
+  event and for JSON escaping. A compile-time assertion pins the arithmetic, so
+  raising the limit past what the batch budget allows fails the build.
+
 ## [4.2.1] — 2026-08-08
 
 ### Changed
