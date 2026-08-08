@@ -61,6 +61,11 @@ reached the database**. Minor rather than patch for that reason.
 
 ### Changed
 
+- **CI now runs on pull requests that do not target `main`.** The `pull_request`
+  trigger filtered on `branches: [main]`, so a stacked PR — one based on another
+  open branch — reported no checks at all and could be merged unverified. Found by
+  this release's own stacked PR, which came up with zero checks. `push` is still
+  restricted to `main`.
 - **Evaluation and telemetry reporting now run on the blocking pool.** Both are
   CPU-bound and synchronous; on the async reactor they stall the worker thread and
   freeze every other connection scheduled on it, turning a per-connection cost
