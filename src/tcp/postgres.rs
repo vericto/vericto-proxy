@@ -387,7 +387,7 @@ fn build_telemetry_event(
     crate::telemetry::TelemetryEvent {
         event_id: uuid::Uuid::new_v4().to_string(),
         database_id: database_id.to_string(),
-        query_text: sql.to_string(),
+        query_text: crate::telemetry::truncate_reported_query(sql),
         dialect: dialect_name(dialect).to_string(),
         status,
         rule_code,
@@ -507,6 +507,36 @@ mod tests {
         assert_eq!(ev.severity.as_deref(), Some("medium"));
         // MONITOR telemetry carries the rule identifier (R7.4).
         assert_eq!(ev.rule_code.as_deref(), Some("VERICTO-050"));
+    }
+
+    /// The bound has to be applied where the event is built, not where the batch
+    /// is sent: the queue holds up to `memory_capacity` events and the disk spool
+    /// writes each one to a file, so an untruncated field is a memory and disk
+    /// problem before it is ever an HTTP one.
+    #[test]
+    fn telemetry_truncates_an_oversized_query() {
+        let decision = TcpDecision::Forward { observation: None };
+        let sql = format!(
+            "SELECT * FROM t WHERE x IN ({})",
+            "1,".repeat(crate::telemetry::MAX_REPORTED_QUERY_BYTES)
+        );
+        let ev = build_telemetry_event("db1", &sql, Dialect::Postgres, &decision, 10);
+        assert!(
+            ev.query_text.len() <= crate::telemetry::MAX_REPORTED_QUERY_BYTES,
+            "reported query_text is {} bytes",
+            ev.query_text.len()
+        );
+        assert!(ev.query_text.contains("truncated"));
+        // The head of the statement survives, which is what makes the record
+        // useful for an audit trail.
+        assert!(ev.query_text.starts_with("SELECT * FROM t WHERE x IN ("));
+    }
+
+    #[test]
+    fn telemetry_keeps_a_normal_query_verbatim() {
+        let decision = TcpDecision::Forward { observation: None };
+        let ev = build_telemetry_event("db1", "SELECT 1", Dialect::Postgres, &decision, 10);
+        assert_eq!(ev.query_text, "SELECT 1");
     }
 
     #[test]
