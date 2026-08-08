@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [4.2.1] — 2026-08-08
+
+### Changed
+
+- **`vericto-engine` v3.2.3 → v3.2.4.** Equal-severity ties are now broken on the
+  rule code instead of on the order the ruleset happens to arrive in. Previously
+  the first matching rule in the synced slice won, and the control plane serves
+  its ruleset from a query with no `ORDER BY`, so the same query could be reported
+  under different codes between runs.
+  **Nothing changes about what this proxy blocks.** Tied rules share a severity,
+  so the resolved action is identical either way — a query that was blocked stays
+  blocked, and one that passed still passes. What changes is the `rule_code`,
+  `rule_id` and `ast_node_path` attached to the finding and to the native error
+  returned to the client, which now stay stable across rule syncs.
+  Unlike 4.2.0, this release is safe to deploy without auditing workloads.
+
 ## [4.2.0] — 2026-08-06
 
 Read before rolling out: this release **blocks traffic it previously allowed**.
