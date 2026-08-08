@@ -7,6 +7,70 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [4.3.0] — 2026-08-08
+
+Read before rolling out: this release **can reject queries that previously
+reached the database**. Minor rather than patch for that reason.
+
+### Added
+
+- **`VERICTO_MAX_QUERY_BYTES` — an admission limit on the size of a query the
+  proxy will evaluate.** Default **10 MiB**. A statement over the limit is
+  refused with rule code `VERICTO-QUERY-TOO-LARGE` before being parsed, so a
+  refused query costs neither the evaluation parse nor the telemetry sanitize
+  pass.
+
+  Why a limit at all: evaluation runs inline before the query reaches the
+  database, and its cost is linear in input size. Measured on `pg_query` 6.2 with
+  a wide `INSERT … VALUES` — the shape `MAX_AST_DEPTH` does not bound, since it
+  limits nesting depth and not breadth:
+
+  | size | evaluate | + sanitize | total |
+  | --- | --- | --- | --- |
+  | 64 KB | 20 ms | 1.7 ms | 22 ms |
+  | 1 MB | 335 ms | 28 ms | 363 ms |
+  | 4 MB | 1313 ms | 122 ms | 1435 ms |
+  | 10 MB | 3440 ms | 382 ms | 3822 ms |
+
+  About 0.35 ms/KB. Postgres framing accepts 64 MiB, which extrapolates to some
+  23 s for a single statement. The default caps that at about 3.8 s.
+
+  The default errs high on purpose. The statements that legitimately get large are
+  batch inserts and long `IN` lists — 100 000 UUIDs is roughly 3.8 MB, a 5 000-row
+  insert across 20 columns roughly 2 MB — and rejecting a customer's ETL is a
+  worse outcome than evaluating it slowly.
+
+  **The maximum is per wire protocol**, anchored to the codec's own framing cap
+  rather than to a number of our choosing: 64 MiB on Postgres, 16 MiB − 1 on
+  MySQL, whose protocol caps a packet there and which this proxy does not
+  reassemble across packets. A configured value above the cap is clamped with a
+  warning, since beyond it the codec already refuses the message. An unparseable
+  or zero value falls back to the default, also with a warning.
+
+  **`monitor_mode` is honoured**: a workspace in dry-run forwards the query
+  unevaluated instead of rejecting it. The engine documents `monitor_mode` as
+  forcing every blocking action to a non-blocking one and holds it under a
+  property test asserting it never *increases* blocking — a size rejection there
+  would be the one thing that blocks in a dry-run deployment. It is forwarded
+  *unevaluated* because nothing could be enforced on the result, so paying seconds
+  of CPU for an unactionable finding buys nothing.
+
+  Refusal is deliberately not fail-open. Forwarding an unevaluated query would
+  create a rule bypass that does not exist today: padding a statement past the
+  limit would carry it to the database unexamined.
+
+### Changed
+
+- **Evaluation and telemetry reporting now run on the blocking pool.** Both are
+  CPU-bound and synchronous; on the async reactor they stall the worker thread and
+  freeze every other connection scheduled on it, turning a per-connection cost
+  into a multi-tenant one. The measured hop cost is ~7 µs (9.9 µs inline versus
+  16.9 µs offloaded for a small query), negligible next to a database round trip,
+  so the offload is unconditional rather than gated on size.
+  Telemetry moves with evaluation because `sanitize_query` calls
+  `pg_query::normalize`, which parses again — leaving it behind would keep about
+  11% of the cost on the reactor.
+
 ## [4.2.2] — 2026-08-08
 
 ### Fixed

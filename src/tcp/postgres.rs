@@ -54,6 +54,9 @@ pub struct PgProxyConfig {
     /// Optional telemetry sink: when set, each evaluation is reported. The
     /// database_id identifies which connected database this proxy fronts.
     pub telemetry: Option<TelemetrySink>,
+    /// Largest query this proxy will evaluate, already clamped to what the wire
+    /// protocol can deliver. Resolved once at startup — see `tcp::query_limit`.
+    pub max_query_bytes: usize,
 }
 
 /// Where the TCP proxy pushes evaluation telemetry (non-blocking).
@@ -276,7 +279,7 @@ async fn intercept_client_to_server(
     client_read: &mut ClientRead,
     server_write: &mut crate::tcp::upstream::UpstreamWrite,
     client_write: &Arc<Mutex<ClientWrite>>,
-    config: &PgProxyConfig,
+    config: &Arc<PgProxyConfig>,
 ) -> std::io::Result<()> {
     let proto = crate::tcp::protocol::postgres::PostgresProtocol;
     crate::tcp::session::intercept_client_to_server(
@@ -691,6 +694,7 @@ mod tests {
                 crate::tcp::rules_sync::TelemetryQueryMode::default(),
             )),
             telemetry: None,
+            max_query_bytes: crate::tcp::query_limit::DEFAULT_MAX_QUERY_BYTES,
         })
     }
 

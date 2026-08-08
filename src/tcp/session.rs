@@ -34,7 +34,9 @@ pub async fn intercept_client_to_server(
     client_read: &mut ClientRead,
     server_write: &mut crate::tcp::upstream::UpstreamWrite,
     client_write: &Arc<Mutex<ClientWrite>>,
-    config: &PgProxyConfig,
+    // `Arc` rather than `&PgProxyConfig`: evaluation and telemetry run on the
+    // blocking pool, which needs an owned handle.
+    config: &Arc<PgProxyConfig>,
 ) -> std::io::Result<()> {
     // When we block in an extended/prepared sequence, swallow follow-ups until
     // the end-of-sequence marker (Postgres: Sync 'S'). Only the Postgres path
@@ -82,20 +84,91 @@ pub async fn intercept_client_to_server(
             }
             Classified::Query { sql, kind } => {
                 // Read the active ruleset/policy lock-free (syncer may swap them).
-                let rules = config.ruleset.load();
-                let policy = config.policy.load();
-                let eval_start = Instant::now();
-                let decision = evaluate(&sql, proto.dialect(), &rules, &policy);
-                let eval_us = eval_start.elapsed().as_micros();
+                // `load_full` (not `load`) because both cross into the blocking
+                // pool below, which needs owned handles rather than guards.
+                let rules = config.ruleset.load_full();
+                let policy = config.policy.load_full();
 
-                // Telemetry before any forwarding (R5.7).
-                crate::tcp::postgres::report_telemetry(
-                    config,
-                    &sql,
-                    proto.dialect(),
-                    &decision,
-                    eval_us,
-                );
+                // Admission guard, before any parse. Evaluation cost is linear in
+                // input size, so an oversized statement is refused rather than
+                // paid for — and refusing here also skips the telemetry sanitize
+                // pass, which parses again.
+                if sql.len() > config.max_query_bytes {
+                    let oversized = crate::tcp::query_limit::oversized_decision(
+                        sql.len(),
+                        config.max_query_bytes,
+                        policy.monitor_mode,
+                    );
+                    crate::tcp::postgres::report_telemetry(
+                        config,
+                        &crate::tcp::query_limit::oversize_marker(sql.len()),
+                        proto.dialect(),
+                        &oversized,
+                        0,
+                    );
+                    if let TcpDecision::Block {
+                        rule_code,
+                        ast_node_path,
+                        suggested_safe_query,
+                        ..
+                    } = &oversized
+                    {
+                        tracing::warn!(
+                            bytes = sql.len(),
+                            limit = config.max_query_bytes,
+                            "Query exceeds VERICTO_MAX_QUERY_BYTES; rejected without evaluation"
+                        );
+                        let block = proto.build_block_response(&BlockContext {
+                            rule_code,
+                            ast_node_path,
+                            suggested_safe_query: suggested_safe_query.as_deref(),
+                            kind,
+                            client_seq: message_seq(&msg),
+                        });
+                        send_to_client(client_write, &block.bytes).await?;
+                        if block.skip_until_sync {
+                            skip_until_sync = true;
+                        }
+                        continue; // query NOT forwarded upstream
+                    }
+                    // monitor_mode: the workspace has opted out of blocking, and
+                    // `monitor_mode` is documented as never increasing blocking,
+                    // so the query is forwarded. It is forwarded *unevaluated*:
+                    // nothing could be enforced on the result, so paying seconds
+                    // of CPU for an unactionable finding buys nothing.
+                    tracing::warn!(
+                        bytes = sql.len(),
+                        limit = config.max_query_bytes,
+                        "Query exceeds VERICTO_MAX_QUERY_BYTES; forwarded unevaluated (monitor_mode)"
+                    );
+                    forward(server_write, &msg.encode()).await?;
+                    continue;
+                }
+
+                // Evaluation is CPU-bound and synchronous, and so is the sanitize
+                // pass inside `report_telemetry`. Both run on the blocking pool:
+                // on the async reactor they stall the worker thread, freezing every
+                // other connection scheduled on it — a per-connection cost turning
+                // into a multi-tenant one. Measured hop cost is ~7 µs, negligible
+                // next to a database round trip.
+                let eval_start = Instant::now();
+                let (decision, eval_us) = {
+                    let sql = sql.clone();
+                    let dialect = proto.dialect();
+                    let config = Arc::clone(config);
+                    tokio::task::spawn_blocking(move || {
+                        let decision = evaluate(&sql, dialect, &rules, &policy);
+                        let eval_us = eval_start.elapsed().as_micros();
+                        // Telemetry before any forwarding (R5.7).
+                        crate::tcp::postgres::report_telemetry(
+                            &config, &sql, dialect, &decision, eval_us,
+                        );
+                        (decision, eval_us)
+                    })
+                    .await
+                    .expect("evaluation task panicked")
+                };
+                let _ = eval_us;
 
                 if let TcpDecision::Block {
                     rule_code,
