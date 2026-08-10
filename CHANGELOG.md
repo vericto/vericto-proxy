@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [4.3.1] — 2026-08-09
+
+### Changed
+
+- **Adopts `vericto-engine` v3.4.0** (from v3.2.4, three behaviour releases back).
+  No code change here, but the proxy links the engine in-process, so what it
+  blocks on the wire changes with it:
+  - **Constant-only tautologies count as always-true** (engine 3.3.0). A statement
+    whose only `WHERE` is `1 IN (1,2)`, `1 BETWEEN 0 AND 2` or `'x' LIKE '%'` is
+    now refused with the native protocol error instead of being forwarded. This is
+    the one change that rejects traffic the proxy previously passed, which is why
+    the rollout puts workspaces into a timed observe window first — while that
+    window is active the control plane sends `monitor_mode`, so these degrade to
+    FLAG and are reported rather than blocked.
+  - **A bounded set operation is no longer reported as unbounded** (engine 3.3.1).
+    `SELECT … UNION SELECT … LIMIT 10` stops tripping VERICTO-050 on PostgreSQL,
+    matching what the other dialects already did.
+  - **A custom rule's `func_name:` predicate reaches any function** (engine 3.4.0),
+    so a workspace rule naming `pg_read_file` or `dblink` fires where it silently
+    did nothing before. VERICTO-070 still only fires on the sleep family.
+  - `ParsedQuery::statements` is longer for queries containing ordinary functions,
+    since every call is now recorded. Evaluation is linear in that count and the
+    rule predicates short-circuit on `kind`; the wire path is unaffected in shape.
+  `pg_query` still resolves to a single copy in the lock file, so the
+  statically-linked `libpg_query` is not duplicated — the invariant the manifest
+  calls out next to that dependency.
+
 ## [4.3.0] — 2026-08-08
 
 Read before rolling out: this release **can reject queries that previously
