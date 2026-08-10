@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [4.3.2] — 2026-08-10
+
+### Changed
+
+- **Adopts `vericto-engine` v3.5.0** (from v3.4.0). No code change and no
+  behaviour change on the wire: v3.5.0 only *adds* `EvaluationOutcome::violations`,
+  and every field this proxy reads keeps the same value for the same input.
+  The pin is moved now rather than later so the two first-party hosts do not drift
+  again — `vericto-eval` adopted v3.5.0 in 2.1.5, and leaving this one behind is
+  how the stack ended up three releases out of step before.
+  This proxy does not consume the new field yet. It could: reporting every
+  violation in telemetry instead of only the winner is exactly the evidence gap
+  v3.5.0 closes. But `TelemetryEvent` and the API's `/ingest/events` schema carry
+  one rule per event, so that needs the backend's `query_event_violations` table
+  first. Deliberately left for its own change rather than half-done here.
+  Checked the two invariants this component cares about: `pg_query` still resolves
+  to a single copy in the lock file (so the statically-linked `libpg_query` is not
+  duplicated), and `default_ruleset()` still mirrors the engine catalogue.
+
 ## [4.3.1] — 2026-08-09
 
 ### Changed
