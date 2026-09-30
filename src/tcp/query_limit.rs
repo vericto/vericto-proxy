@@ -137,6 +137,10 @@ pub fn oversized_decision(
                 action: EnforcementAction::Monitor,
                 parse_error: Some(detail),
             }),
+            // The size check runs BEFORE parsing, so no rule was ever evaluated
+            // and there is nothing to enumerate. The oversize code itself travels
+            // in `rule_code`, which the API persists on its own.
+            violations: Vec::new(),
         }
     } else {
         TcpDecision::Block {
@@ -147,6 +151,8 @@ pub fn oversized_decision(
                     .to_string(),
             ),
             severity: Severity::High,
+            // Same as above: rejected before parsing, so no evaluated rules.
+            violations: Vec::new(),
         }
     }
 }
@@ -208,7 +214,7 @@ mod tests {
     fn an_oversized_query_never_blocks_in_monitor_mode() {
         let d = oversized_decision(20 * 1024 * 1024, 10 * 1024 * 1024, true);
         match d {
-            TcpDecision::Forward { observation } => {
+            TcpDecision::Forward { observation, .. } => {
                 let obs = observation.expect("monitor_mode still records the event");
                 assert_eq!(obs.rule_code, OVERSIZE_RULE_CODE);
                 assert_eq!(obs.action, EnforcementAction::Monitor);
