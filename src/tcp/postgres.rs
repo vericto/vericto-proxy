@@ -339,11 +339,14 @@ fn build_telemetry_event(
 
     let (status, rule_code, ast_node_path) = match decision {
         // No violation: forwarded silently.
-        TcpDecision::Forward { observation: None } => ("ALLOWED".to_string(), None, None),
+        TcpDecision::Forward {
+            observation: None, ..
+        } => ("ALLOWED".to_string(), None, None),
 
         // Non-blocking violation (Flag/Monitor) or parse-error allow-report.
         TcpDecision::Forward {
             observation: Some(obs),
+            ..
         } => {
             severity = Some(obs.severity.as_str().to_string());
             enforcement_action = Some(action_str(obs.action).to_string());
@@ -387,6 +390,27 @@ fn build_telemetry_event(
         }
     };
 
+    // The full violation set, capped and mapped to the wire shape. Taken from the
+    // decision rather than rebuilt from `rule_code`: the engine's ordering is the
+    // contract that makes entry 0 the winner, and re-deriving it here could
+    // disagree with the decision the proxy already acted on.
+    let violations: Vec<crate::telemetry::ReportedViolationPayload> = match decision {
+        TcpDecision::Forward { violations, .. } | TcpDecision::Block { violations, .. } => {
+            violations
+                .iter()
+                .take(crate::telemetry::MAX_REPORTED_VIOLATIONS)
+                .map(|v| crate::telemetry::ReportedViolationPayload {
+                    rule_code: v.rule_code.clone(),
+                    severity: v.severity.as_str().to_string(),
+                    enforcement_action: action_str(v.action).to_string(),
+                    ast_node_path: Some(v.ast_node_path.clone()),
+                    suggested_safe_query: v.suggested_safe_query.clone(),
+                    estimated_rows_affected: v.estimated_rows_affected,
+                })
+                .collect()
+        }
+    };
+
     crate::telemetry::TelemetryEvent {
         event_id: uuid::Uuid::new_v4().to_string(),
         database_id: database_id.to_string(),
@@ -397,6 +421,7 @@ fn build_telemetry_event(
         ast_node_path,
         severity,
         enforcement_action,
+        violations,
         parse_error,
         latency_ms: Some(latency_us as f64 / 1000.0),
         client_ip: None,
@@ -452,10 +477,146 @@ fn sanitize_query(sql: &str) -> String {
 mod tests {
     use super::*;
     use crate::tcp::evaluator::Observation;
-    use vericto_engine::Severity;
+    use vericto_engine::{ReportedViolation, Severity};
+
+    /// Builds a ReportedViolation without depending on a real evaluation, so the
+    /// mapping can be tested independently of which rules happen to exist.
+    fn violation(code: &str, sev: Severity, action: EnforcementAction) -> ReportedViolation {
+        ReportedViolation {
+            // Inside this proxy a rule's identity IS its code; the field is set
+            // that way by rules_sync and is deliberately not reported.
+            rule_id: code.to_string(),
+            rule_code: code.to_string(),
+            severity: sev,
+            action,
+            ast_node_path: "SelectStmt".to_string(),
+            estimated_rows_affected: Some(7),
+            suggested_safe_query: Some("SELECT id FROM t LIMIT 100".to_string()),
+        }
+    }
+
+    #[test]
+    fn telemetry_reports_every_violation_not_only_the_winner() {
+        // The defect this covers: a SELECT * without LIMIT violates VERICTO-050 and
+        // VERICTO-051, and only the winner used to reach the database.
+        let decision = TcpDecision::Forward {
+            observation: Some(Observation {
+                rule_code: "VERICTO-050".to_string(),
+                ast_node_path: "SelectStmt".to_string(),
+                severity: Severity::Medium,
+                action: EnforcementAction::Flag,
+                parse_error: None,
+            }),
+            violations: vec![
+                violation("VERICTO-050", Severity::Medium, EnforcementAction::Flag),
+                violation("VERICTO-051", Severity::Medium, EnforcementAction::Flag),
+            ],
+        };
+        let ev = build_telemetry_event("db1", "SELECT * FROM t", Dialect::Postgres, &decision, 10);
+
+        assert_eq!(ev.violations.len(), 2);
+        assert_eq!(ev.violations[0].rule_code, "VERICTO-050");
+        assert_eq!(ev.violations[1].rule_code, "VERICTO-051");
+        // The winner stays where it was, so a consumer that ignores the new field
+        // sees exactly what it saw before.
+        assert_eq!(ev.rule_code.as_deref(), Some("VERICTO-050"));
+    }
+
+    #[test]
+    fn telemetry_carries_each_violations_own_action_and_metadata() {
+        // A per-class cap can leave a lower-severity violation resolving to a
+        // stronger action than the winner, so the action cannot be derived from the
+        // event and has to travel per violation.
+        let decision = TcpDecision::Block {
+            rule_code: "VERICTO-001".to_string(),
+            ast_node_path: "DeleteStmt".to_string(),
+            suggested_safe_query: None,
+            severity: Severity::Critical,
+            violations: vec![
+                violation("VERICTO-001", Severity::Critical, EnforcementAction::Block),
+                violation(
+                    "VERICTO-090",
+                    Severity::Critical,
+                    EnforcementAction::Monitor,
+                ),
+            ],
+        };
+        let ev = build_telemetry_event("db1", "DELETE FROM t", Dialect::Postgres, &decision, 10);
+
+        assert_eq!(ev.violations[0].enforcement_action, "block");
+        assert_eq!(ev.violations[1].enforcement_action, "monitor");
+        assert_eq!(ev.violations[0].severity, "critical");
+        assert_eq!(ev.violations[0].estimated_rows_affected, Some(7));
+        assert_eq!(
+            ev.violations[0].ast_node_path.as_deref(),
+            Some("SelectStmt")
+        );
+    }
+
+    #[test]
+    fn telemetry_caps_the_violation_list() {
+        // The cap protects the API's 1 MiB batch body limit. Truncation keeps the
+        // head of the list, which the engine orders most-severe-first, so the
+        // winner is never the entry dropped.
+        let muchas: Vec<ReportedViolation> = (0..20)
+            .map(|i| {
+                violation(
+                    &format!("VERICTO-{i:03}"),
+                    Severity::Medium,
+                    EnforcementAction::Flag,
+                )
+            })
+            .collect();
+        let decision = TcpDecision::Forward {
+            observation: None,
+            violations: muchas,
+        };
+        let ev = build_telemetry_event("db1", "SELECT 1", Dialect::Postgres, &decision, 10);
+
+        assert_eq!(
+            ev.violations.len(),
+            crate::telemetry::MAX_REPORTED_VIOLATIONS
+        );
+        assert_eq!(ev.violations[0].rule_code, "VERICTO-000");
+    }
+
+    #[test]
+    fn telemetry_omits_the_field_for_an_allowed_query() {
+        // `skip_serializing_if` keeps an ALLOWED event exactly as small as before:
+        // these dominate real traffic and must not grow.
+        let decision = TcpDecision::Forward {
+            observation: None,
+            violations: Vec::new(),
+        };
+        let ev = build_telemetry_event("db1", "SELECT 1", Dialect::Postgres, &decision, 10);
+        assert!(ev.violations.is_empty());
+        let json = serde_json::to_string(&ev).expect("event serializes");
+        assert!(
+            !json.contains("violations"),
+            "ALLOWED events must not carry the key"
+        );
+    }
+
+    #[test]
+    fn telemetry_never_reports_rule_id() {
+        // The API types rule_id as a UUID and zod parses the whole body at once, so
+        // sending this proxy's code-shaped rule_id would reject the ENTIRE batch.
+        let decision = TcpDecision::Forward {
+            observation: None,
+            violations: vec![violation(
+                "VERICTO-050",
+                Severity::Medium,
+                EnforcementAction::Flag,
+            )],
+        };
+        let ev = build_telemetry_event("db1", "SELECT 1", Dialect::Postgres, &decision, 10);
+        let json = serde_json::to_string(&ev).expect("event serializes");
+        assert!(!json.contains("rule_id"), "rule_id must not reach the API");
+    }
 
     fn forward_observation(action: EnforcementAction) -> TcpDecision {
         TcpDecision::Forward {
+            violations: Vec::new(),
             observation: Some(Observation {
                 rule_code: "VERICTO-050".to_string(),
                 ast_node_path: "SelectStmt".to_string(),
@@ -472,7 +633,10 @@ mod tests {
             "db1",
             "SELECT 1",
             Dialect::Postgres,
-            &TcpDecision::Forward { observation: None },
+            &TcpDecision::Forward {
+                observation: None,
+                violations: Vec::new(),
+            },
             42,
         );
         assert_eq!(ev.status, "ALLOWED");
@@ -518,7 +682,10 @@ mod tests {
     /// problem before it is ever an HTTP one.
     #[test]
     fn telemetry_truncates_an_oversized_query() {
-        let decision = TcpDecision::Forward { observation: None };
+        let decision = TcpDecision::Forward {
+            observation: None,
+            violations: Vec::new(),
+        };
         let sql = format!(
             "SELECT * FROM t WHERE x IN ({})",
             "1,".repeat(crate::telemetry::MAX_REPORTED_QUERY_BYTES)
@@ -537,7 +704,10 @@ mod tests {
 
     #[test]
     fn telemetry_keeps_a_normal_query_verbatim() {
-        let decision = TcpDecision::Forward { observation: None };
+        let decision = TcpDecision::Forward {
+            observation: None,
+            violations: Vec::new(),
+        };
         let ev = build_telemetry_event("db1", "SELECT 1", Dialect::Postgres, &decision, 10);
         assert_eq!(ev.query_text, "SELECT 1");
     }
@@ -545,6 +715,7 @@ mod tests {
     #[test]
     fn telemetry_blocked_populates_action_block() {
         let decision = TcpDecision::Block {
+            violations: Vec::new(),
             rule_code: "VERICTO-001".to_string(),
             ast_node_path: "DeleteStmt".to_string(),
             suggested_safe_query: None,
@@ -562,6 +733,7 @@ mod tests {
     #[test]
     fn telemetry_parse_error_fail_open_carries_message() {
         let decision = TcpDecision::Forward {
+            violations: Vec::new(),
             observation: Some(Observation {
                 rule_code: "VERICTO-PARSE-ERROR".to_string(),
                 ast_node_path: "PARSE_ERROR: boom".to_string(),
@@ -579,6 +751,7 @@ mod tests {
     #[test]
     fn telemetry_parse_error_fail_closed_is_block() {
         let decision = TcpDecision::Block {
+            violations: Vec::new(),
             rule_code: "VERICTO-PARSE-ERROR".to_string(),
             ast_node_path: "PARSE_ERROR: boom".to_string(),
             suggested_safe_query: None,

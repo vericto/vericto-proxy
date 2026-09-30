@@ -5,8 +5,8 @@
 
 use vericto_engine::parser::{Dialect, parser_for};
 use vericto_engine::{
-    Decision, EnforcementAction, EnforcementPolicy, ParseErrorAction, Rule, RuleEngine, RuleType,
-    Severity,
+    Decision, EnforcementAction, EnforcementPolicy, ParseErrorAction, ReportedViolation, Rule,
+    RuleEngine, RuleType, Severity,
 };
 
 /// Result of evaluating a query on the TCP path.
@@ -14,13 +14,23 @@ pub enum TcpDecision {
     /// Forward to the real DB. `observation` carries violation info when the
     /// action was Flag or Monitor (for telemetry), the parse-error allow-report
     /// observation, or None when no rule matched.
-    Forward { observation: Option<Observation> },
+    Forward {
+        observation: Option<Observation>,
+        /// Every rule the query violated, winner first. Carried alongside the
+        /// observation rather than inside it because a parse-error observation has
+        /// no engine violations to report.
+        violations: Vec<ReportedViolation>,
+    },
     /// Reject the query with SQLSTATE 42501.
     Block {
         rule_code: String,
         ast_node_path: String,
         suggested_safe_query: Option<String>,
         severity: Severity,
+        /// Every rule the query violated, winner first. The block itself is
+        /// decided by the winner alone; this is the audit trail, and reporting it
+        /// cannot change the decision.
+        violations: Vec<ReportedViolation>,
     },
 }
 
@@ -60,6 +70,7 @@ pub fn evaluate(
                     ast_node_path: outcome.ast_node_path.unwrap_or_default(),
                     suggested_safe_query: outcome.suggested_safe_query,
                     severity: outcome.severity.unwrap_or(Severity::Critical),
+                    violations: outcome.violations,
                 },
                 Decision::Flag | Decision::Allow => TcpDecision::Forward {
                     observation: outcome.action.map(|action| Observation {
@@ -72,12 +83,16 @@ pub fn evaluate(
                         action,
                         parse_error: None,
                     }),
+                    violations: outcome.violations,
                 },
             }
         }
         Err(e) => match policy.parse_error {
             // Fail-open default (R5.5): forward + report.
             ParseErrorAction::AllowReport => TcpDecision::Forward {
+                // A query that did not parse violated no rule: there is nothing to
+                // enumerate, and the parse error itself travels in the observation.
+                violations: Vec::new(),
                 observation: Some(Observation {
                     rule_code: "VERICTO-PARSE-ERROR".to_string(),
                     ast_node_path: format!("PARSE_ERROR: {e}"),
@@ -93,6 +108,7 @@ pub fn evaluate(
                 ast_node_path: format!("PARSE_ERROR: {e}"),
                 suggested_safe_query: None,
                 severity: Severity::Medium,
+                violations: Vec::new(),
             },
         },
     }
@@ -279,12 +295,15 @@ mod tests {
         match decision {
             TcpDecision::Forward {
                 observation: Some(obs),
+                ..
             } => {
                 assert_eq!(obs.action, EnforcementAction::Flag);
                 assert!(obs.parse_error.is_none());
                 assert!(obs.rule_code.starts_with("VERICTO-"));
             }
-            TcpDecision::Forward { observation: None } => {
+            TcpDecision::Forward {
+                observation: None, ..
+            } => {
                 panic!("a flagged query must carry an observation")
             }
             TcpDecision::Block { .. } => panic!("a Medium/Flag query must Forward, not Block"),
@@ -306,11 +325,14 @@ mod tests {
         match decision {
             TcpDecision::Forward {
                 observation: Some(obs),
+                ..
             } => {
                 assert_eq!(obs.action, EnforcementAction::Monitor);
                 assert!(obs.parse_error.is_none());
             }
-            TcpDecision::Forward { observation: None } => {
+            TcpDecision::Forward {
+                observation: None, ..
+            } => {
                 panic!("a monitored query must carry an observation")
             }
             TcpDecision::Block { .. } => panic!("a Low/Monitor query must Forward, not Block"),
@@ -329,7 +351,7 @@ mod tests {
             &policy,
         );
         match decision {
-            TcpDecision::Forward { observation } => assert!(
+            TcpDecision::Forward { observation, .. } => assert!(
                 observation.is_none(),
                 "a clean query must not carry an observation"
             ),
@@ -346,6 +368,7 @@ mod tests {
         match decision {
             TcpDecision::Forward {
                 observation: Some(obs),
+                ..
             } => {
                 assert_eq!(obs.rule_code, "VERICTO-PARSE-ERROR");
                 assert_eq!(obs.action, EnforcementAction::Flag);
