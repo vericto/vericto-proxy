@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [4.4.0] — 2026-09-30
+
+### Added
+
+- **`PROXY_TLS_CERT` and `PROXY_TLS_KEY` now accept inline PEM, not only a path.**
+  Anything whose first non-whitespace characters are `-----BEGIN` is read as the
+  material itself; everything else is still read from disk, byte for byte as before,
+  so an existing deployment passing `/etc/vericto/server.crt` is unaffected.
+
+  This exists to get the private key out of the container image. ECS, Kubernetes and
+  most orchestrators inject secrets as **environment variables**, not as files, so a
+  path-only contract left one option: bake the key into the image. That is what the
+  first deployment of this proxy did — a `-tls` image variant with
+  `COPY proxy-key.pem` in it, sitting in a registry. Anyone with pull access could
+  read it (two commands: `docker create`, `docker cp`), it survives in the layer
+  history after the tag is gone, and rotating it means rebuilding and redeploying.
+  With inline PEM the same deployment references a secret ARN and the key never
+  reaches an image at all.
+
+  **A failing load never echoes inline material.** When the key arrives inline, the
+  value *is* the key, so a diagnostic that printed its argument would write a private
+  key into the logs — trading one exposure for a worse one. `describe_source` reports
+  the path verbatim when it is a path, and the fixed string `the inline PEM value`
+  when it is not. Two tests pin this on the two error branches that can be reached
+  with inline material, and both use the realistic trigger: the cert and the key
+  swapped between the two variables. The test bodies are valid base64 on purpose —
+  with invalid base64, rustls fails at decode and its own error propagates before
+  reaching the branch under test, so the test would pass without proving anything.
+
 ## [4.3.3] — 2026-09-30
 
 ### Changed
