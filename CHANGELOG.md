@@ -7,6 +7,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Reports every rule a query violated, not only the reported winner.** This is
+  the follow-up 4.3.2 left explicitly pending: adopting engine v3.5.0 added
+  `EvaluationOutcome::violations` and that entry said consuming it needed the
+  backend's `query_event_violations` table first. That table now exists and the
+  API's `/ingest/events` schema accepts a `violations[]` array, so the gap closes
+  here.
+
+  The evidence gap was measured, not assumed. On a live local stack a
+  `SELECT * FROM t` violates both VERICTO-050 (no LIMIT) and VERICTO-051 (star
+  without WHERE) — the engine says so and `engine.rs` documents the tie-break — and
+  only VERICTO-050 reached the database. For a product whose deliverable is the
+  record of what a query broke, recording one of two findings is a silent loss.
+  Verified after the change: the same query now stores both rows, each with its own
+  resolved action, and a query blocked by VERICTO-003 also records VERICTO-090
+  alongside it.
+
+  `TcpDecision::Forward` and `::Block` now carry the set, and `build_telemetry_event`
+  maps it. The decision is still derived from the winner alone, so reporting more
+  cannot change whether a query is blocked — which is what makes the field safe to
+  add to the hot path. Entry 0 is taken from the engine's own ordering rather than
+  re-derived here, because re-deriving it could disagree with the decision the proxy
+  already acted on.
+
+  `rule_id` is deliberately NOT reported. The API types it as a UUID, while inside
+  this proxy a rule's identity IS its code (`rules_sync` sets
+  `rule_id: code.to_string()`, because that is what the control plane's sync
+  endpoint keys the ruleset by). Sending it would put a non-UUID in a UUID field,
+  and since the API parses the whole request body at once, that single field would
+  reject the ENTIRE batch with a 400 — losing every event in it, not just this
+  violation. The API resolves the code server-side, which is the only side holding
+  the catalogue.
+
+  Capped at 8 violations per event (`MAX_REPORTED_VIOLATIONS`). The binding
+  constraint is the API's 1 MiB body limit for the whole batch, the same one
+  `MAX_REPORTED_QUERY_BYTES` is sized against: at the default `batch_size` of 100
+  the query text already accounts for ~800 KiB, leaving roughly 2.2 KiB per event
+  for everything else, and a serialized violation runs ~150–250 bytes. Truncation
+  keeps the head of the engine-ordered list, so the entry dropped is always the
+  least severe and never the rule that decided the query's fate. An ALLOWED event
+  omits the field entirely (`skip_serializing_if`), so the events that dominate real
+  traffic do not grow by a single byte.
+
 ## [4.3.2] — 2026-08-10
 
 ### Changed

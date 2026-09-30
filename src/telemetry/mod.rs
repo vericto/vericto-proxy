@@ -38,7 +38,77 @@ pub struct TelemetryEvent {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub client_ip: Option<String>,
     pub occurred_at: String,
+    /// Every rule the query violated, not only the reported winner.
+    ///
+    /// The engine already computes the full set and orders it exactly as the
+    /// winner is chosen (severity descending, then rule code ascending), so
+    /// `violations[0]` IS the rule named in `rule_code` above. The proxy used to
+    /// drop everything past that first entry, which made the audit trail record
+    /// one rule for a query that broke several: measured on a live stack, a
+    /// `SELECT * FROM t` violates both VERICTO-050 (no LIMIT) and VERICTO-051
+    /// (star without WHERE) and only VERICTO-050 reached the database.
+    ///
+    /// Empty when no rule matched, and omitted from the payload in that case so
+    /// an ALLOWED event stays exactly as small as it was.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub violations: Vec<ReportedViolationPayload>,
 }
+
+/// One violated rule, shaped for the API's ingest schema.
+///
+/// A local mirror of the engine's `ReportedViolation` rather than a re-export:
+/// the engine type is not `Serialize`, and this is a wire contract with the API
+/// that must not silently change when the engine adds a field.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReportedViolationPayload {
+    pub rule_code: String,
+    pub severity: String,
+    /// This violation's OWN resolved action, not the event's. A per-class cap can
+    /// leave a lower-severity violation resolving to a stronger action than the
+    /// winner, so it cannot be derived from the event.
+    pub enforcement_action: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ast_node_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub suggested_safe_query: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub estimated_rows_affected: Option<i64>,
+}
+
+// `rule_id` is deliberately absent from the payload above.
+//
+// The API's ingest schema types it as `z.string().uuid()`. Inside this proxy a
+// rule's identity IS its code — `rules_sync` stores `rule_id: code.to_string()`
+// because that is what the control plane's sync endpoint keys the ruleset by — so
+// sending it would put a non-UUID in a UUID field. Zod parses the whole request
+// body at once, so that single field would fail validation and reject the ENTIRE
+// batch with a 400, losing every event in it, not just this violation.
+//
+// The API resolves the code to its UUID server-side on ingest, which is the only
+// side that has the catalogue. Do not add `rule_id` here without changing that
+// schema first.
+
+/// Largest number of violations reported per event.
+///
+/// ## Why a cap at all
+///
+/// The binding constraint is the API's 1 MiB HTTP body limit for the whole
+/// batch, the same one [`MAX_REPORTED_QUERY_BYTES`] is sized against. At the
+/// default `batch_size` of 100 the query text alone already accounts for
+/// ~800 KiB, leaving roughly 2.2 KiB per event for every other field. A
+/// serialized violation runs ~150–250 bytes, so 8 fits that headroom with room
+/// for JSON escaping and the event's own fields.
+///
+/// ## Why truncating is safe
+///
+/// The engine's ordering means the entries kept are the most severe ones and the
+/// winner — the rule that actually decided the query's fate — is always first.
+/// Dropping the tail loses the least consequential findings, never the decision.
+/// The catalogue is 28 standard rules plus a per-workspace handful, and a real
+/// statement violates a small number of them, so this bound is not expected to
+/// engage in practice; it exists so a pathological query cannot make one event
+/// unboundedly large.
+pub const MAX_REPORTED_VIOLATIONS: usize = 8;
 
 /// Maximum `query_text` shipped per event, in bytes.
 ///
