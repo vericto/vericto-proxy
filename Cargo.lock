@@ -291,7 +291,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -1248,7 +1248,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.52.0",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -1510,7 +1510,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix 1.1.4",
- "windows-sys 0.52.0",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -1857,8 +1857,8 @@ checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
 
 [[package]]
 name = "vericto-engine"
-version = "3.5.0"
-source = "git+https://github.com/vericto/vericto-engine?tag=v3.5.0#b56f4304544ffb486fd22e664bec608c92a3f2d2"
+version = "3.5.2"
+source = "git+https://github.com/vericto/vericto-engine?tag=v3.5.2#ea6dc249b19a3412df87a5d323f30aea709b5760"
 dependencies = [
  "pg_query",
  "serde",
@@ -1871,7 +1871,7 @@ dependencies = [
 
 [[package]]
 name = "vericto-proxy"
-version = "4.3.2"
+version = "4.3.3"
 dependencies = [
  "anyhow",
  "arc-swap",
