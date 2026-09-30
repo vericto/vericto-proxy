@@ -7,6 +7,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [4.3.3] — 2026-09-30
+
+### Changed
+
+- **Adopts `vericto-engine` v3.5.2** (from v3.5.0). No code change here, and no API
+  change in the engine — but this one does change what the proxy blocks, which is why
+  it gets its own release rather than riding along with the next feature.
+
+  v3.5.2 fixes VERICTO-019 not detecting `ALTER TABLE … DISABLE ROW LEVEL SECURITY`
+  on PostgreSQL. The engine's `pg_ast.rs` mapped only the three `DISABLE TRIGGER`
+  subtypes, so `AtDisableRowSecurity` fell through and no `StatementInfo` was emitted
+  at all — the statement was invisible to the whole evaluator, not merely unmatched by
+  one rule. The sqlparser walker had always mapped it, so MySQL, Oracle and SQL Server
+  detected what PostgreSQL did not, and PostgreSQL is the only dialect that implements
+  RLS.
+
+  Verified against this binary built from this tree, running inline in front of a real
+  PostgreSQL: `DISABLE ROW LEVEL SECURITY` is rejected with VERICTO-019 where it
+  previously returned ALLOWED with no rule attributed, `DISABLE TRIGGER ALL` still
+  blocks, and `ENABLE ROW LEVEL SECURITY`, `ENABLE TRIGGER ALL` and `ADD COLUMN` still
+  pass — widening detection must not start refusing the statements that add protection
+  or the ordinary ones, because inline a false positive is an outage.
+
+  **Operators should know this before deploying:** a migration running
+  `ALTER TABLE … DISABLE ROW LEVEL SECURITY` against a workspace with VERICTO-019
+  active goes from passing to blocked. The blast radius is bounded by the rule's class
+  — VERICTO-019 is `SchemaMigration`, so a channel passing `schema_migration_cap:
+  Some(Flag)` reports instead of blocking — and by the workspace catalogue, which
+  decides whether the rule is active at all.
+
+  Checked the two invariants this component cares about, as in 4.3.2: `pg_query` still
+  resolves to a single copy in the lock file (6.2.0, so the statically-linked
+  `libpg_query` is not duplicated), and `default_ruleset()` still mirrors the engine
+  catalogue at 28 codes.
+
 ## [4.3.2] — 2026-08-10
 
 ### Changed
