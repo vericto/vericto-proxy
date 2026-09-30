@@ -41,7 +41,16 @@ COPY Cargo.toml ./
 COPY src ./src
 
 # Override the git dependency with the local path copy.
-RUN sed -i 's|vericto-engine = { git = "https://github.com/donkan168/vericto-engine".*}|vericto-engine = { path = "/vericto-engine" }|' Cargo.toml
+#
+# The org, not `donkan168`: this sed matched the pre-transfer URL, and `sed` exits 0
+# when its pattern misses, so the override silently did nothing and the build fell
+# through to fetching the private repo — failing with "failed to authenticate" on a
+# Dockerfile whose entire purpose is to build WITHOUT credentials.
+#
+# The pattern is deliberately loose about the owner so a future transfer degrades to
+# a loud failure instead of a silent one: the grep below asserts the rewrite landed.
+RUN sed -i -E 's|vericto-engine = \{ git = "https://github.com/[^"]+/vericto-engine".*\}|vericto-engine = { path = "/vericto-engine" }|' Cargo.toml \
+    && grep -q 'path = "/vericto-engine"' Cargo.toml
 
 # Build.
 RUN cargo build --release
