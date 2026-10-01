@@ -221,17 +221,18 @@ mod tests {
         // misconfiguration (the two env vars are easy to swap), and the one shape
         // that reaches the "no private key found" branch with inline material,
         // because the PEM marker matches while no key parses out of it.
-        // El cuerpo es base64 válido a propósito: si no lo fuera, rustls fallaría al
-        // decodificarlo y su propio error se propagaría antes de llegar a la rama que
-        // esta prueba verifica.
-        let mal_puesto = "-----BEGIN CERTIFICATE-----\nTUFSQ0FET1I=\n-----END CERTIFICATE-----\n";
-        let err = load_private_key(mal_puesto).expect_err("a cert is not a key");
-        let texto = err.to_string();
+        // The body is deliberately valid base64: if it were not, rustls would fail to
+        // decode it and surface its own error before reaching the branch this test
+        // covers.
+        let cert_where_key_belongs =
+            "-----BEGIN CERTIFICATE-----\nTUFSQ0FET1I=\n-----END CERTIFICATE-----\n";
+        let err = load_private_key(cert_where_key_belongs).expect_err("a cert is not a key");
+        let message = err.to_string();
         assert!(
-            !texto.contains("TUFSQ0FET1I"),
-            "el error filtró el material recibido: {texto}"
+            !message.contains("TUFSQ0FET1I"),
+            "el error filtró el material recibido: {message}"
         );
-        assert!(texto.contains("the inline PEM value"), "got {texto}");
+        assert!(message.contains("the inline PEM value"), "got {message}");
     }
 
     #[test]
@@ -242,14 +243,15 @@ mod tests {
         // like a secret — the repository's secret scanner flags that shape on sight,
         // and it is right to: a test fixture is not worth teaching a scanner to ignore
         // the pattern it exists to catch.
-        let no_es_un_cert = "-----BEGIN PUBLIC KEY-----\nTUFSQ0FET1I=\n-----END PUBLIC KEY-----\n";
-        let err = load_certs(no_es_un_cert).expect_err("a public key is not a cert");
-        let texto = err.to_string();
+        let key_where_cert_belongs =
+            "-----BEGIN PUBLIC KEY-----\nTUFSQ0FET1I=\n-----END PUBLIC KEY-----\n";
+        let err = load_certs(key_where_cert_belongs).expect_err("a public key is not a cert");
+        let message = err.to_string();
         assert!(
-            !texto.contains("TUFSQ0FET1I"),
-            "el error filtró material de la clave: {texto}"
+            !message.contains("TUFSQ0FET1I"),
+            "the error leaked key material: {message}"
         );
-        assert!(texto.contains("the inline PEM value"), "got {texto}");
+        assert!(message.contains("the inline PEM value"), "got {message}");
     }
 
     #[test]
