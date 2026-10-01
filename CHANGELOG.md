@@ -7,6 +7,64 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [4.4.1] — 2026-10-01
+
+### Fixed
+
+- **`VERICTO_TELEMETRY_BUFFER=disk` never delivered an event that violated no rule,
+  and one such event was enough to block the whole spool.** `TelemetryEvent` did not
+  round-trip through its own serializer: `violations` carried
+  `skip_serializing_if = "Vec::is_empty"` without `serde(default)`, so the key is
+  omitted for an ALLOWED event and deserialization then fails with
+  `missing field "violations"`. Memory mode never noticed because it never serializes —
+  disk mode is the only path that reads back what it wrote.
+
+  The blast radius is much larger than those events, because `DiskQueue::drain_batch`
+  skipped an unparseable file *without removing it*. The spool drains oldest-first, so
+  the first unreadable event parks at the head of the queue and every later tick
+  re-reads it. Once unreadable files fill a whole `drain_batch` window
+  (`VERICTO_TELEMETRY_BATCH_SIZE`, default 100) the batch comes back empty and the
+  reporter stops on `if batch.events.is_empty() { break }`, so reporting stays silent
+  until the file is removed. The deserialize error was discarded rather than logged, and
+  restarting did not clear it: the spool is durable by design, so the file outlives the
+  process.
+
+  Measured on a staging deployment: 536 events stranded on EFS behind 283 unreadable
+  ones, the oldest nine hours old, while the proxy kept evaluating and blocking
+  correctly and `rules_sync` kept answering 304 — the data path was unaffected
+  throughout, only reporting stopped. Reproduced locally on both wire protocols: the
+  previous build delivered the 2 events of 12 that carried a violation and left the
+  other 10 in the spool, while this one delivers all 12 and empties it. Swapping the
+  image on an already stranded spool drained it with no new traffic, so an existing
+  backlog recovers on deploy.
+
+  Three changes: `serde(default)` on `violations`; `drain_batch` now logs and discards
+  a file it cannot read, because losing one event is strictly better than losing every
+  event behind it; and `push` writes to a temporary name and renames into place, so a
+  task dying mid-write cannot leave a truncated file that reintroduces the same wedge
+  by another route. Five tests cover the queue, which had none.
+
+- **The image's `HEALTHCHECK` now probes the health port over TCP.** It previously ran
+  `curl -fsS "http://localhost:${PROXY_EVAL_PORT}/health"`. The health listener binds
+  `VERICTO_HEALTHZ_PORT` and is a plain TCP accept-and-close that exchanges no bytes
+  (`src/tcp/healthz.rs`), so an HTTP GET against a different variable could not
+  succeed and a container run directly from the image stayed `unhealthy` while the
+  proxy served traffic normally.
+
+  Both deployments already probe it correctly and never relied on this directive:
+  `docker-compose.yml` defines its own TCP check and ECS uses the NLB target group with
+  `HealthCheckProtocol: TCP`. Matching them here makes the image accurate on its own.
+  With `VERICTO_HEALTHZ_PORT` unset the container reports healthy, since the listener is
+  opt-in and the absence of an optional port is not a failure.
+
+### Removed
+
+- **`PROXY_EVAL_PORT`, `EXPOSE 5434` and the `curl` package from the runtime image.**
+  The variable is a leftover from when evaluation was an HTTP call to a sidecar; the
+  engine has run in-process since, and the name appears nowhere in the source — the
+  proxy never listened on 5434. `curl` was installed solely for the healthcheck that
+  no longer needs it, so the runtime image carries one less package.
+
 ## [4.4.0] — 2026-09-30
 
 ### Added
