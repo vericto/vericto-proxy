@@ -50,7 +50,24 @@ pub struct TelemetryEvent {
     ///
     /// Empty when no rule matched, and omitted from the payload in that case so
     /// an ALLOWED event stays exactly as small as it was.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    ///
+    /// `default` is load-bearing: without it this type does not round-trip through its
+    /// own serializer, so keep both attributes together. `skip_serializing_if` omits the key
+    /// for an event with no violations, and a `Vec` field with no default makes
+    /// deserialization fail with "missing field `violations`" when the key is
+    /// absent. That only matters in `BufferMode::Disk`, which is the one path that
+    /// reads its own output back: `DiskQueue::drain_batch` deserializes every
+    /// spool file, so an ALLOWED event written to disk could never be read again.
+    ///
+    /// Observed on staging, where the impact reached beyond those events. The
+    /// spool is drained oldest-first, and a file that fails to parse is skipped
+    /// WITHOUT being removed, so the first unreadable event parks at the head of
+    /// the queue forever: every later tick re-reads the same files, gets an empty
+    /// batch, and stops. 536 events accumulated behind 283 unreadable ones, the
+    /// oldest from nine hours earlier, with no error logged anywhere — telemetry
+    /// looked simply idle. Restarting did not help, because the file is on EFS and
+    /// outlives the task.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub violations: Vec<ReportedViolationPayload>,
 }
 

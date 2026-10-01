@@ -60,7 +60,6 @@ FROM debian:bookworm-slim AS runner
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
-    curl \
     libssl3 \
     && rm -rf /var/lib/apt/lists/*
 
@@ -72,14 +71,28 @@ RUN chown vericto:vericto /usr/local/bin/vericto-proxy
 
 USER vericto
 
-ENV PROXY_EVAL_PORT=5434
+# `PROXY_EVAL_PORT` and `EXPOSE 5434` date from when evaluation was an HTTP call to a
+# sidecar. The engine runs in-process now and the variable is not read anywhere in the
+# source, so the image no longer advertises a port it does not serve.
 ENV RUST_LOG=info
 ENV RUST_BACKTRACE=0
 
 EXPOSE 5433
-EXPOSE 5434
 
+# The health listener is plain TCP: it accepts a connection and closes it without
+# exchanging any bytes (src/tcp/healthz.rs), and it binds `VERICTO_HEALTHZ_PORT`. So the
+# probe is a TCP connect rather than an HTTP GET.
+#
+# Both deployments already check it this way and do not rely on this directive:
+# docker-compose.yml defines its own TCP check, and on ECS the verdict comes from the
+# NLB target group with `HealthCheckProtocol: TCP`. Matching them here keeps the image
+# usable on its own, which is what `docker run` and `docker ps` report against.
+#
+# The listener is opt-in, so with `VERICTO_HEALTHZ_PORT` unset there is nothing to
+# probe and the container reports healthy: the absence of an optional port is not a
+# failure. Using bash's `exec 3<>` keeps the runtime image free of curl.
 HEALTHCHECK --interval=15s --timeout=5s --start-period=10s --retries=3 \
-    CMD curl -fsS "http://localhost:${PROXY_EVAL_PORT}/health" || exit 1
+    CMD bash -c 'if [ -z "${VERICTO_HEALTHZ_PORT:-}" ]; then exit 0; fi; \
+        exec 3<>/dev/tcp/127.0.0.1/"${VERICTO_HEALTHZ_PORT}" && exec 3<&- && exec 3>&-' || exit 1
 
 CMD ["/usr/local/bin/vericto-proxy"]

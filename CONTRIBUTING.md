@@ -66,6 +66,13 @@ test(rules): add false-positive guards for VERICTO-051
 
 Scopes for this repo: `engine`, `parser`, `rules`, `tcp`, `cli`, `docs`.
 
+**Write in English** — commit subjects and bodies, code comments, test names, identifiers,
+`CHANGELOG.md` entries and pull request descriptions. The codebase is source-available
+under Elastic-2.0 and read by people who do not share a first language with its authors,
+so a single language keeps it reviewable. Part of this repository's early history is in
+Spanish; those commits are left as they are rather than rewritten, and everything from
+here forward is English.
+
 ## Pull request acceptance criteria
 
 - ✅ CI passes (`fmt`, `clippy -D warnings`, `cargo test`).

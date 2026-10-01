@@ -149,11 +149,23 @@ impl EventQueue for DiskQueue {
             event.occurred_at.replace([':', '.'], "-"),
             event.event_id
         );
-        let path = self.dir.join(name);
+        let path = self.dir.join(&name);
         match serde_json::to_vec(&event) {
             Ok(bytes) => {
-                if let Ok(mut f) = fs::File::create(&path) {
-                    let _ = f.write_all(&bytes);
+                // Write to a temporary name and rename into place. `rename` within one
+                // directory is atomic, so a reader never observes a partially written
+                // file. Creating the final name directly and writing into it leaves a
+                // truncated file if the task dies mid-write — and a truncated file is
+                // invalid JSON, which is exactly the condition that used to wedge the
+                // whole queue. Cheap insurance against reintroducing that by a different
+                // route than the serde bug.
+                let tmp = self.dir.join(format!(".{name}.tmp"));
+                let wrote = fs::File::create(&tmp)
+                    .and_then(|mut f| f.write_all(&bytes))
+                    .and_then(|()| fs::rename(&tmp, &path));
+                if let Err(e) = wrote {
+                    tracing::warn!(error = %e, "Failed to write telemetry event to spool");
+                    let _ = fs::remove_file(&tmp);
                 }
             }
             Err(e) => tracing::error!(error = %e, "Failed to serialize telemetry event for spool"),
@@ -165,10 +177,34 @@ impl EventQueue for DiskQueue {
         let mut events = Vec::new();
         let mut taken = Vec::new();
         for path in files.into_iter().take(max) {
-            if let Ok(bytes) = fs::read(&path) {
-                if let Ok(ev) = serde_json::from_slice::<TelemetryEvent>(&bytes) {
+            // An unreadable file must NOT be left where it is. The spool is drained
+            // oldest-first, so silently skipping one parks it at the head of the queue
+            // permanently: every later tick re-reads it, produces a short or empty batch,
+            // and the reporter stops when the batch comes back empty. One bad file
+            // therefore blocks every good event behind it, forever, and survives a
+            // restart because the spool is durable by design. That is what happened on
+            // staging — the `violations` round-trip bug made 283 files unreadable and
+            // telemetry went quiet for nine hours with nothing logged.
+            //
+            // So: report it once, and discard it. Discarding loses one event, which is
+            // strictly better than losing every event that follows it, and the log says
+            // which file, so the loss is auditable.
+            let bytes = match fs::read(&path) {
+                Ok(b) => b,
+                Err(e) => {
+                    tracing::warn!(file = %path.display(), error = %e, "Telemetry spool file unreadable; discarding so the queue can advance");
+                    let _ = fs::remove_file(&path);
+                    continue;
+                }
+            };
+            match serde_json::from_slice::<TelemetryEvent>(&bytes) {
+                Ok(ev) => {
                     events.push(ev);
                     taken.push(path);
+                }
+                Err(e) => {
+                    tracing::error!(file = %path.display(), error = %e, "Telemetry spool file failed to deserialize; discarding so the queue can advance");
+                    let _ = fs::remove_file(&path);
                 }
             }
         }
@@ -187,5 +223,156 @@ impl EventQueue for DiskQueue {
 
     fn nack(&self, _batch: Batch) {
         // Leave files in place; they retry on the next flush cycle.
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::telemetry::TelemetryEvent;
+
+    /// A unique scratch directory per test. `tempfile` is deliberately not added as a
+    /// dev-dependency for this — the repo keeps its dependency surface small and a
+    /// counter plus the process id is enough for a handful of tests.
+    fn scratch(tag: &str) -> PathBuf {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static N: AtomicUsize = AtomicUsize::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "vericto-spool-{tag}-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// The shape that broke: a query that violated nothing, so `violations` is empty.
+    fn allowed_event(id: &str) -> TelemetryEvent {
+        TelemetryEvent {
+            event_id: id.to_string(),
+            database_id: "db-1".to_string(),
+            query_text: "SELECT 1".to_string(),
+            dialect: "postgres".to_string(),
+            status: "ALLOWED".to_string(),
+            rule_code: None,
+            ast_node_path: None,
+            severity: None,
+            enforcement_action: None,
+            parse_error: None,
+            latency_ms: Some(0.1),
+            client_ip: None,
+            occurred_at: format!("2026-10-01T03:52:5{}.000000000+00:00", id.len() % 10),
+            violations: Vec::new(),
+        }
+    }
+
+    /// The regression test for the defect that silenced telemetry for nine hours.
+    ///
+    /// `DiskQueue` is the only queue that reads back what it wrote, so it is the only
+    /// one that depends on `TelemetryEvent` round-tripping through its own serializer.
+    /// `skip_serializing_if = "Vec::is_empty"` omits `violations` for an ALLOWED event,
+    /// and without `serde(default)` the read fails with "missing field". Every test of
+    /// the *serializer* passed, because the payload the API receives was always correct.
+    #[test]
+    fn disk_queue_round_trips_an_event_with_no_violations() {
+        let dir = scratch("roundtrip");
+        let q = DiskQueue::new(dir.to_string_lossy().into_owned(), 100).unwrap();
+
+        q.push(allowed_event("e1"));
+        let batch = q.drain_batch(10);
+
+        assert_eq!(
+            batch.events.len(),
+            1,
+            "an ALLOWED event written to the spool must be readable again"
+        );
+        assert_eq!(batch.events[0].event_id, "e1");
+        assert!(batch.events[0].violations.is_empty());
+    }
+
+    /// Why the bug cost everything rather than just the unreadable events.
+    ///
+    /// The spool drains oldest-first. A file that cannot be parsed must not be left in
+    /// place: it would sit at the head of the queue and every later drain would return
+    /// the same short batch, so the reporter stops as soon as that batch is empty and no
+    /// event behind it is ever delivered — including across restarts, since the spool is
+    /// durable on purpose.
+    #[test]
+    fn an_unparseable_file_does_not_block_the_queue() {
+        let dir = scratch("poison");
+        let q = DiskQueue::new(dir.to_string_lossy().into_owned(), 100).unwrap();
+
+        // Lexically first, so it is the oldest and drains first.
+        fs::write(dir.join("0000-oldest__corrupt.json"), b"{ truncated").unwrap();
+        q.push(allowed_event("good"));
+
+        let batch = q.drain_batch(10);
+
+        assert_eq!(
+            batch.events.len(),
+            1,
+            "the good event behind the corrupt one must still be delivered"
+        );
+        assert_eq!(batch.events[0].event_id, "good");
+        assert!(
+            !dir.join("0000-oldest__corrupt.json").exists(),
+            "the corrupt file must be discarded, or it blocks the queue again next tick"
+        );
+    }
+
+    /// ack is what makes delivery durable: the file disappears only after the API
+    /// confirmed it, so a crash between POST and ack re-sends rather than loses.
+    #[test]
+    fn ack_removes_and_nack_keeps() {
+        let dir = scratch("ackmack");
+        let q = DiskQueue::new(dir.to_string_lossy().into_owned(), 100).unwrap();
+        q.push(allowed_event("a"));
+
+        let batch = q.drain_batch(10);
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 1);
+
+        q.nack(batch);
+        assert_eq!(
+            fs::read_dir(&dir).unwrap().count(),
+            1,
+            "nack must leave the event on disk to retry"
+        );
+
+        let batch = q.drain_batch(10);
+        q.ack(&batch);
+        assert_eq!(
+            fs::read_dir(&dir).unwrap().count(),
+            0,
+            "ack must remove the delivered event"
+        );
+    }
+
+    /// The temp file used for the atomic write must never be picked up as an event.
+    #[test]
+    fn partial_writes_are_invisible_to_readers() {
+        let dir = scratch("atomic");
+        let q = DiskQueue::new(dir.to_string_lossy().into_owned(), 100).unwrap();
+        fs::write(dir.join(".something__x.json.tmp"), b"{ half written").unwrap();
+        q.push(allowed_event("z"));
+
+        let batch = q.drain_batch(10);
+        assert_eq!(
+            batch.events.len(),
+            1,
+            "a .tmp file in flight must not be read as a spooled event"
+        );
+        assert_eq!(batch.events[0].event_id, "z");
+    }
+
+    /// Memory mode never serializes, which is why it was unaffected and why the A/B
+    /// against it isolated the bug to the disk path.
+    #[test]
+    fn memory_queue_round_trips_the_same_event() {
+        let q = MemoryQueue::new(10);
+        q.push(allowed_event("m"));
+        let batch = q.drain_batch(10);
+        assert_eq!(batch.events.len(), 1);
+        assert_eq!(batch.events[0].event_id, "m");
     }
 }
