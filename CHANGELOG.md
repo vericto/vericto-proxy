@@ -532,9 +532,9 @@ the service now targets the rebranded engine.
 - Optional control-plane link: ruleset hot-sync and telemetry reporting.
 - `/health` and `/metrics` (p50/p99 latency) endpoints.
 
-[Unreleased]: https://github.com/donkan168/vericto-proxy/compare/v4.0.0...HEAD
-[4.0.0]: https://github.com/donkan168/vericto-proxy/compare/v3.0.0...v4.0.0
-[3.0.0]: https://github.com/donkan168/vericto-proxy/compare/v2.3.0...v3.0.0
-[2.3.0]: https://github.com/donkan168/vericto-proxy/compare/v2.2.0...v2.3.0
-[2.2.0]: https://github.com/donkan168/vericto-proxy/compare/v1.0.0...v2.2.0
-[1.0.0]: https://github.com/donkan168/vericto-proxy/releases/tag/v1.0.0
+[Unreleased]: https://github.com/vericto/vericto-proxy/compare/v4.0.0...HEAD
+[4.0.0]: https://github.com/vericto/vericto-proxy/compare/v3.0.0...v4.0.0
+[3.0.0]: https://github.com/vericto/vericto-proxy/compare/v2.3.0...v3.0.0
+[2.3.0]: https://github.com/vericto/vericto-proxy/compare/v2.2.0...v2.3.0
+[2.2.0]: https://github.com/vericto/vericto-proxy/compare/v1.0.0...v2.2.0
+[1.0.0]: https://github.com/vericto/vericto-proxy/releases/tag/v1.0.0

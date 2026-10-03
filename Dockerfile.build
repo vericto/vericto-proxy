@@ -37,8 +37,12 @@ COPY vericto-engine-local /vericto-engine
 COPY Cargo.toml ./
 COPY src ./src
 
-# Override the git dependency with the local path copy.
-RUN sed -i 's|vericto-engine = { git = "https://github.com/donkan168/vericto-engine".*}|vericto-engine = { path = "/vericto-engine" }|' Cargo.toml
+# Override the git dependency with the local path copy. Same owner-agnostic
+# pattern and assertion as Dockerfile.local: `sed` exits 0 when its pattern
+# misses, so without the grep a stale URL would silently fall through to
+# fetching the private repo.
+RUN sed -i -E 's|vericto-engine = \{ git = "https://github.com/[^"]+/vericto-engine".*\}|vericto-engine = { path = "/vericto-engine" }|' Cargo.toml \
+ && grep -q 'vericto-engine = { path = "/vericto-engine" }' Cargo.toml
 
 # Build.
 RUN cargo build --release
