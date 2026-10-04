@@ -1888,7 +1888,7 @@ dependencies = [
 
 [[package]]
 name = "vericto-proxy"
-version = "4.4.2"
+version = "4.5.0"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -1898,10 +1898,12 @@ dependencies = [
  "once_cell",
  "pg_query",
  "reqwest",
+ "ring",
  "rustls-pemfile",
  "serde",
  "serde_json",
  "serde_yaml",
+ "tempfile",
  "thiserror 1.0.69",
  "tokio",
  "tokio-rustls",
