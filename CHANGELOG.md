@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [4.4.2] — 2026-10-04
+
+### Security
+
+- **rustls 0.23.40 → 0.23.45 (RUSTSEC-2026-0285).** rustls accepted TLS 1.3
+  handshake messages across encryption-level boundaries. The proxy uses rustls for
+  the upstream connection to the database (`UPSTREAM_PG_SSLMODE=require` /
+  `verify-full`) and for its control-plane calls, so this is a dependency-only
+  update with no behaviour change.
+- **quinn-proto 0.11.14 → 0.11.19 (RUSTSEC-2026-0185).** Remote memory exhaustion
+  from unbounded out-of-order stream reassembly. Listed in `Cargo.lock` but not
+  compiled into the proxy (no target pulls in HTTP/3/QUIC); updated so the lockfile
+  carries no known advisory.
+
+Found by the 2026-10-04 vulnerability review (`cargo audit`); `cargo audit` now
+reports no vulnerabilities, only the existing warnings for `rustls-pemfile`
+(unmaintained) and `anyhow` (`downcast_mut` unsoundness, not used).
+
 ## [4.4.1] — 2026-10-01
 
 ### Fixed
