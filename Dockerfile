@@ -25,29 +25,20 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 ENV LIBCLANG_PATH=/usr/lib/llvm-14/lib
-# Resolve the private vericto-engine git dependency through the git CLI, which
-# honors the credential rewrite configured in each build step. Without this
-# cargo uses its built-in fetcher and ignores the rewrite, failing with
-# "revision not found" on the private repo.
-ENV CARGO_NET_GIT_FETCH_WITH_CLI=true
 
 RUN cargo install cargo-chef --locked
 
 # ── Stage 2: generate recipe (dependency fingerprint) ────────────────────────
 FROM chef AS planner
 COPY . .
-RUN --mount=type=secret,id=github_token,required=true \
-    git config --global url."https://x-access-token:$(cat /run/secrets/github_token)@github.com/".insteadOf "https://github.com/" \
-    && cargo chef prepare --recipe-path recipe.json
+RUN cargo chef prepare --recipe-path recipe.json
 
 # ── Stage 3: compile deps (cached layer) + source ────────────────────────────
 FROM chef AS builder
 
 # Deps layer — only invalidated when Cargo.toml changes
 COPY --from=planner /app/recipe.json recipe.json
-RUN --mount=type=secret,id=github_token,required=true \
-    git config --global url."https://x-access-token:$(cat /run/secrets/github_token)@github.com/".insteadOf "https://github.com/" \
-    && cargo chef cook --release --recipe-path recipe.json
+RUN cargo chef cook --release --recipe-path recipe.json
 
 # Source layer — only recompiles your code (seconds on rebuilds). The manifest
 # and lockfile are required here: `cargo chef cook` builds only dependencies
@@ -55,9 +46,7 @@ RUN --mount=type=secret,id=github_token,required=true \
 # this step. Without the manifest, `cargo build` would leave the chef stub.
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
-RUN --mount=type=secret,id=github_token,required=true \
-    git config --global url."https://x-access-token:$(cat /run/secrets/github_token)@github.com/".insteadOf "https://github.com/" \
-    && cargo build --release
+RUN cargo build --release
 
 # ── Stage 4: minimal runtime ──────────────────────────────────────────────────
 FROM debian:bookworm-slim AS runner

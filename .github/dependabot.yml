@@ -1,0 +1,13 @@
+# Keeps the SHA-pinned GitHub Actions in ci.yml and release.yml current. Cargo
+# security fixes are left to Dependabot security updates (a repository setting).
+# Routine Cargo version bumps are deliberately left out: vericto-engine and
+# pg_query move together and can change how SQL is parsed, so they are bumped by
+# hand with their own CHANGELOG entry.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: ci
