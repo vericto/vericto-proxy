@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [4.5.0] — 2026-10-04
+
+### Added
+
+- **The last-good ruleset survives a restart.** The proxy already kept enforcing the
+  last synced ruleset and policy while the control plane was down, but only in memory:
+  a restart during the outage came back with the built-in critical rules alone. The
+  workspace's custom rules were gone, and so was its policy (severity actions, monitor
+  mode, sanitized telemetry), until the control plane returned. A rolling deploy, an
+  OOM kill or a node drain during an API incident was enough to trigger it.
+
+  Each accepted `/sync/rules` response is now written to disk, and the syncer loads it
+  before its first request. The copy is the response body as received, plus its ETag,
+  which goes on that first request: an unchanged ruleset still costs one 304. It is
+  written only after the response parsed and was applied, to a temporary file renamed
+  into place (a crash mid-write leaves the previous copy), with mode `0600`.
+
+  A copy is only reused by the link that wrote it: it records the API URL, the
+  database id and a SHA-256 fingerprint of the API key — never the key. A proxy pointed
+  at another workspace or database ignores the old file rather than enforcing someone
+  else's rules until its first sync. A missing, corrupt or foreign file is logged and
+  ignored; startup never depends on it.
+
+  On by default with `VERICTO_TELEMETRY_BUFFER=disk`, at `<spool dir>/.rules-cache`:
+  that buffer already means a durable volume is mounted there, and the image's
+  non-root user cannot write anywhere else under `/var/lib`. The name is hidden and has
+  no `.json` extension, so the spool never reads it as an event. Off by default with
+  the memory buffer, where there may be no writable volume at all.
+  `VERICTO_RULES_CACHE_PATH` sets another path, or turns it off when empty.
+
 ## [4.4.2] — 2026-10-04
 
 ### Security

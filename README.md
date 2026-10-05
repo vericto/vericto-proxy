@@ -91,6 +91,13 @@ Recommended for production. When `VERICTO_API_URL`, `VERICTO_API_KEY` **and**
 active ruleset. Without the link it still protects using the built-in ruleset
 (dev / air-gapped), but reports nothing.
 
+If the control plane is unreachable, the proxy keeps enforcing the last ruleset and
+policy it synced. With `VERICTO_TELEMETRY_BUFFER=disk` it also keeps a copy of them on
+disk (`<spool dir>/.rules-cache`), so a restart during the outage resumes with the
+workspace's custom rules and policy instead of only the built-in ruleset. Set
+`VERICTO_RULES_CACHE_PATH` to put the copy elsewhere (or enable it with the memory
+buffer), or to an empty value to turn it off.
+
 > **All three are needed for telemetry.** Without `VERICTO_DATABASE_ID` no events
 > are emitted at all (there is nothing to attribute them to) — even if the API
 > URL and key are set. It is also the key the control-plane uses to correlate
@@ -104,6 +111,7 @@ active ruleset. Without the link it still protects using the built-in ruleset
 | `VERICTO_RULES_SYNC_INTERVAL_SECS`  | `300`   | How often to poll `/sync/rules` (min 30)         |
 | `VERICTO_TELEMETRY_BUFFER`          | `memory`| `memory` or `disk` (survives restarts)           |
 | `VERICTO_TELEMETRY_DISK_PATH`       | `/var/lib/vericto/spool` | Spool dir when buffer=disk        |
+| `VERICTO_RULES_CACHE_PATH`          | `<spool dir>/.rules-cache` with buffer=disk, else off | Last-good ruleset kept for restarts; empty = off |
 | `VERICTO_TELEMETRY_MEMORY_CAPACITY` | `10000` | Max events in the memory ring buffer             |
 | `VERICTO_TELEMETRY_BATCH_SIZE`      | `100`   | Max events per POST `/ingest/events`             |
 | `VERICTO_TELEMETRY_FLUSH_SECS`      | `5`     | How often the reporter flushes                   |

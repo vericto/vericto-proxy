@@ -1,6 +1,6 @@
 [package]
 name = "vericto-proxy"
-version = "4.4.2"
+version = "4.5.0"
 edition = "2024"
 rust-version = "1.88"
 description = "Vericto — Deterministic SQL firewall — TCP wire-protocol proxy for customer infrastructure"
@@ -49,6 +49,10 @@ tokio-rustls = "0.26"
 webpki-roots = "0.26"
 rustls-pemfile = "2"
 
+# SHA-256 for the rules-cache link fingerprint (src/tcp/rules_cache.rs). Already
+# compiled in as rustls's crypto provider, so this adds no new code.
+ring = "0.17"
+
 # Hot-swappable ruleset (rule syncer replaces it without locking the hot path).
 arc-swap = "1.7"
 
@@ -64,6 +68,7 @@ once_cell = "1.19"
 chrono = { version = "0.4", features = ["serde"] }
 
 [dev-dependencies]
+tempfile = "3"
 tokio-test = "0.4"
 
 [profile.release]

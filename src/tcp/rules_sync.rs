@@ -13,6 +13,7 @@ use arc_swap::ArcSwap;
 use serde::Deserialize;
 
 use crate::config::ControlPlaneConfig;
+use crate::tcp::rules_cache::RulesCache;
 use vericto_engine::{
     EnforcementAction, EnforcementPolicy, ParseErrorAction, Rule, RuleType, Severity,
 };
@@ -185,9 +186,93 @@ fn build_policy(api: Option<ApiPolicy>) -> EnforcementPolicy {
     policy
 }
 
+/// What [`apply`] put in effect, for logging and the dashboard-driven settings.
+struct Applied {
+    count: usize,
+    monitor_mode: bool,
+    mode: TelemetryQueryMode,
+    proxy_config: Option<ProxyConfig>,
+}
+
+/// Swaps in the ruleset, policy and telemetry mode from one `/sync/rules` response.
+/// Shared by the live sync and the rules cache, so both enforce a response the same way.
+fn apply(
+    body: SyncResponse,
+    ruleset: &SharedRuleset,
+    policy: &SharedPolicy,
+    telemetry_mode: &SharedTelemetryMode,
+) -> Applied {
+    let mode = TelemetryQueryMode::from_api(
+        body.policy
+            .as_ref()
+            .and_then(|p| p.telemetry_query_mode.as_deref()),
+    );
+    let new_policy = build_policy(body.policy);
+    let monitor_mode = new_policy.monitor_mode;
+    let rules: Vec<Rule> = body.rules.into_iter().map(ApiRule::into_rule).collect();
+    let count = rules.len();
+    ruleset.store(Arc::new(rules));
+    policy.store(Arc::new(new_policy));
+    telemetry_mode.store(Arc::new(mode));
+    Applied {
+        count,
+        monitor_mode,
+        mode,
+        proxy_config: body.proxy_config,
+    }
+}
+
+/// Applies the dashboard-configured proxy settings (hot-reload).
+fn apply_proxy_config(
+    pc: &ProxyConfig,
+    sync_interval: &mut Duration,
+    ticker: &mut tokio::time::Interval,
+) {
+    if let Some(interval_secs) = pc.rules_sync_interval_secs {
+        let new_interval = Duration::from_secs(interval_secs.max(30));
+        if new_interval != *sync_interval {
+            *sync_interval = new_interval;
+            *ticker = tokio::time::interval(new_interval);
+            tracing::info!(
+                secs = interval_secs,
+                "Rules sync interval updated from dashboard"
+            );
+        }
+    }
+    // Note: telemetry_batch_size, flush_secs, memory_capacity
+    // are applied by the Reporter which re-reads config each cycle.
+    if pc.telemetry_batch_size.is_some()
+        || pc.telemetry_flush_secs.is_some()
+        || pc.telemetry_memory_capacity.is_some()
+    {
+        tracing::debug!(config = ?pc, "Proxy config received from dashboard");
+    }
+    // Warn if the dashboard's dialect for this database does not
+    // match the wire protocol this proxy was started with. The
+    // protocol is fixed at startup (a live listener can't change
+    // protocol), so a mismatch means the proxy was deployed with
+    // the wrong VERICTO_WIRE_PROTOCOL for this database.
+    if let Some(dialect) = pc.dialect.as_deref() {
+        let proto = std::env::var("VERICTO_WIRE_PROTOCOL").unwrap_or_else(|_| "postgres".into());
+        let expected = matches!(
+            (proto.as_str(), dialect),
+            ("postgres", "postgres") | ("mysql", "mysql")
+        );
+        if !expected {
+            tracing::warn!(
+                wire_protocol = %proto,
+                dashboard_dialect = %dialect,
+                "Wire protocol does not match the database dialect configured \
+                 in the dashboard — this proxy may be fronting the wrong database. \
+                 Redeploy with the correct VERICTO_WIRE_PROTOCOL."
+            );
+        }
+    }
+}
+
 /// Runs forever: polls the API on the configured interval and swaps the ruleset
 /// and policy when they change. Failures are logged; the last-good ruleset and
-/// policy stay in effect.
+/// policy stay in effect, and with a rules cache they also survive a restart.
 pub async fn run(
     cfg: ControlPlaneConfig,
     ruleset: SharedRuleset,
@@ -209,6 +294,30 @@ pub async fn run(
     let mut sync_interval = cfg.rules_sync_interval;
     let mut ticker = tokio::time::interval(sync_interval);
 
+    // Resume with the last-good response before the first request, so a restart while
+    // the control plane is down keeps the workspace's rules and policy instead of
+    // falling back to the built-in ruleset. Its ETag goes on the first request: if
+    // nothing changed meanwhile the API answers 304 and the cached copy stays.
+    let cache = RulesCache::from_config(&cfg);
+    if let Some(cached) = cache.as_ref().and_then(RulesCache::load) {
+        match serde_json::from_str::<SyncResponse>(&cached.body) {
+            Ok(body) => {
+                let applied = apply(body, &ruleset, &policy, &telemetry_mode);
+                if let Some(pc) = &applied.proxy_config {
+                    apply_proxy_config(pc, &mut sync_interval, &mut ticker);
+                }
+                etag = cached.etag;
+                tracing::info!(
+                    count = applied.count,
+                    monitor_mode = applied.monitor_mode,
+                    saved_at = %cached.saved_at,
+                    "Ruleset and policy loaded from the rules cache"
+                );
+            }
+            Err(e) => tracing::warn!(error = %e, "Rules cache body no longer parses; ignoring it"),
+        }
+    }
+
     loop {
         ticker.tick().await;
 
@@ -227,71 +336,31 @@ pub async fn run(
                     .get("etag")
                     .and_then(|v| v.to_str().ok())
                     .map(|s| s.to_string());
-                match res.json::<SyncResponse>().await {
-                    Ok(body) => {
-                        let new_mode = TelemetryQueryMode::from_api(
-                            body.policy
-                                .as_ref()
-                                .and_then(|p| p.telemetry_query_mode.as_deref()),
-                        );
-                        let new_policy = build_policy(body.policy);
-                        let rules: Vec<Rule> =
-                            body.rules.into_iter().map(ApiRule::into_rule).collect();
-                        let count = rules.len();
-                        ruleset.store(Arc::new(rules));
-                        policy.store(Arc::new(new_policy));
-                        telemetry_mode.store(Arc::new(new_mode));
-                        etag = new_etag;
-
-                        // Apply dashboard-configured proxy settings (hot-reload)
-                        if let Some(pc) = body.proxy_config {
-                            if let Some(interval_secs) = pc.rules_sync_interval_secs {
-                                let new_interval = Duration::from_secs(interval_secs.max(30));
-                                if new_interval != sync_interval {
-                                    sync_interval = new_interval;
-                                    ticker = tokio::time::interval(sync_interval);
-                                    tracing::info!(
-                                        secs = interval_secs,
-                                        "Rules sync interval updated from dashboard"
-                                    );
-                                }
-                            }
-                            // Note: telemetry_batch_size, flush_secs, memory_capacity
-                            // are applied by the Reporter which re-reads config each cycle.
-                            if pc.telemetry_batch_size.is_some()
-                                || pc.telemetry_flush_secs.is_some()
-                                || pc.telemetry_memory_capacity.is_some()
-                            {
-                                tracing::debug!(config = ?pc, "Proxy config received from dashboard");
-                            }
-                            // Warn if the dashboard's dialect for this database does not
-                            // match the wire protocol this proxy was started with. The
-                            // protocol is fixed at startup (a live listener can't change
-                            // protocol), so a mismatch means the proxy was deployed with
-                            // the wrong VERICTO_WIRE_PROTOCOL for this database.
-                            if let Some(dialect) = pc.dialect.as_deref() {
-                                let proto = std::env::var("VERICTO_WIRE_PROTOCOL")
-                                    .unwrap_or_else(|_| "postgres".into());
-                                let expected = matches!(
-                                    (proto.as_str(), dialect),
-                                    ("postgres", "postgres") | ("mysql", "mysql")
-                                );
-                                if !expected {
-                                    tracing::warn!(
-                                        wire_protocol = %proto,
-                                        dashboard_dialect = %dialect,
-                                        "Wire protocol does not match the database dialect configured \
-                                         in the dashboard — this proxy may be fronting the wrong database. \
-                                         Redeploy with the correct VERICTO_WIRE_PROTOCOL."
-                                    );
-                                }
-                            }
+                // Read the body as text so the exact bytes accepted can be cached.
+                match res
+                    .text()
+                    .await
+                    .map_err(|e| e.to_string())
+                    .and_then(|text| {
+                        serde_json::from_str::<SyncResponse>(&text)
+                            .map(|body| (text, body))
+                            .map_err(|e| e.to_string())
+                    }) {
+                    Ok((text, body)) => {
+                        let applied = apply(body, &ruleset, &policy, &telemetry_mode);
+                        if let Some(pc) = &applied.proxy_config {
+                            apply_proxy_config(pc, &mut sync_interval, &mut ticker);
                         }
-
+                        // Cached only after it parsed and was applied: the file always
+                        // holds a response this proxy has enforced, never a bad one.
+                        if let Some(cache) = &cache {
+                            cache.store(new_etag.as_deref(), &text);
+                        }
+                        etag = new_etag;
                         tracing::info!(
-                            count,
-                            monitor_mode = new_policy.monitor_mode,
-                            telemetry_query_mode = ?new_mode,
+                            count = applied.count,
+                            monitor_mode = applied.monitor_mode,
+                            telemetry_query_mode = ?applied.mode,
                             "Ruleset and policy updated from API"
                         );
                     }
@@ -397,5 +466,121 @@ mod tests {
         );
         assert_eq!(TelemetryQueryMode::from_api(None), TelemetryQueryMode::Raw);
         assert_eq!(TelemetryQueryMode::default(), TelemetryQueryMode::Raw);
+    }
+
+    /// A restart while the control plane is down resumes with the last-good response:
+    /// the custom rule and the workspace policy, not the built-in ruleset.
+    #[tokio::test]
+    async fn restart_during_an_outage_resumes_from_the_rules_cache() {
+        use crate::config::BufferMode;
+        use axum::{Router, http::header, routing::get};
+
+        const BODY: &str = r#"{
+            "version": "v7",
+            "rules": [{"rule_id": "custom-1", "code": "ACME-001", "severity": "high",
+                       "default_action": "block", "rule_type": "custom",
+                       "ast_condition_yaml": "node: DropStmt"}],
+            "policy": {"severity_actions": {"high": "flag"}, "monitor_mode": true,
+                       "telemetry_query_mode": "sanitized"}
+        }"#;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = Router::new().route(
+            "/api/v1/sync/rules",
+            get(|| async { ([(header::ETAG, "\"v7\"")], BODY) }),
+        );
+        let server = tokio::spawn(async move { axum::serve(listener, app).await });
+
+        let dir = tempfile::tempdir().unwrap();
+        let cache_path = dir.path().join("rules-cache.json");
+        let cfg = ControlPlaneConfig {
+            api_url: format!("http://{addr}"),
+            api_key: "vk_test".into(),
+            database_id: Some("db-1".into()),
+            rules_sync_interval: Duration::from_secs(3600),
+            rules_cache_path: Some(cache_path.clone()),
+            buffer_mode: BufferMode::Disk,
+            disk_spool_path: String::new(),
+            memory_capacity: 10,
+            batch_size: 10,
+            flush_interval: Duration::from_secs(5),
+        };
+        let fresh = || {
+            (
+                Arc::new(ArcSwap::from_pointee(
+                    crate::tcp::evaluator::default_ruleset(),
+                )),
+                Arc::new(ArcSwap::from_pointee(EnforcementPolicy::default())),
+                Arc::new(ArcSwap::from_pointee(TelemetryQueryMode::default())),
+                crate::tcp::healthz::Readiness::new(),
+            )
+        };
+
+        // 1. Control plane up: the first sync writes the cache.
+        let (rules, pol, mode, ready) = fresh();
+        let first = tokio::spawn(run(cfg.clone(), rules, pol, mode, ready.clone()));
+        ready.wait_ready().await;
+        first.abort();
+        assert!(
+            cache_path.exists(),
+            "a successful sync must write the cache"
+        );
+
+        // 2. Control plane down, proxy restarted.
+        server.abort();
+        let _ = server.await;
+        let (rules, pol, mode, ready) = fresh();
+        let second = tokio::spawn(run(
+            cfg,
+            rules.clone(),
+            pol.clone(),
+            mode.clone(),
+            ready.clone(),
+        ));
+        ready.wait_ready().await;
+        second.abort();
+
+        let rules = rules.load();
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].code, "ACME-001");
+        assert_eq!(rules[0].rule_type, RuleType::Custom);
+        let pol = pol.load();
+        assert!(pol.monitor_mode);
+        assert_eq!(pol.high, EnforcementAction::Flag);
+        assert_eq!(**mode.load(), TelemetryQueryMode::Sanitized);
+    }
+
+    /// Without a cache the same outage falls back to the built-in ruleset (unchanged).
+    #[tokio::test]
+    async fn without_a_cache_an_outage_keeps_the_built_in_ruleset() {
+        use crate::config::BufferMode;
+
+        let cfg = ControlPlaneConfig {
+            // Port 9 (discard) on loopback: refused immediately.
+            api_url: "http://127.0.0.1:9".into(),
+            api_key: "vk_test".into(),
+            database_id: None,
+            rules_sync_interval: Duration::from_secs(3600),
+            rules_cache_path: None,
+            buffer_mode: BufferMode::Memory,
+            disk_spool_path: String::new(),
+            memory_capacity: 10,
+            batch_size: 10,
+            flush_interval: Duration::from_secs(5),
+        };
+        let builtin = crate::tcp::evaluator::default_ruleset();
+        let rules: SharedRuleset = Arc::new(ArcSwap::from_pointee(builtin.clone()));
+        let ready = crate::tcp::healthz::Readiness::new();
+        let task = tokio::spawn(run(
+            cfg,
+            rules.clone(),
+            Arc::new(ArcSwap::from_pointee(EnforcementPolicy::default())),
+            Arc::new(ArcSwap::from_pointee(TelemetryQueryMode::default())),
+            ready.clone(),
+        ));
+        ready.wait_ready().await;
+        task.abort();
+        assert_eq!(rules.load().len(), builtin.len());
     }
 }
