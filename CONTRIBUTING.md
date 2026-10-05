@@ -57,7 +57,10 @@ CONTRIBUTING guide. Once a rule ships in an engine release, the proxy picks it u
 in two steps:
 
 1. Bump the `vericto-engine` tag in `Cargo.toml`, keeping `pg_query` on the same
-   major version as the engine (the comment there explains why).
+   major version as the engine (the comment there explains why). If `pg_query`
+   changes version, update `third-party/pg_query-bundled.txt` too: it holds the
+   licenses of the C code that crate compiles in, and the image build stops when
+   its version line does not match `Cargo.lock`.
 2. If the rule should be part of the built-in ruleset used without the
    control-plane link, add its code, severity and default action to
    `default_ruleset()` in `src/tcp/evaluator.rs`, and to the table its tests check.
