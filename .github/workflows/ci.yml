@@ -14,29 +14,16 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
-  # cargo resolves the private vericto-engine git dependency via the git CLI,
-  # which honors the credential rewrite configured in the auth step below.
-  CARGO_NET_GIT_FETCH_WITH_CLI: "true"
 
 jobs:
   test:
     name: fmt + clippy + test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4.2.2
-
-      - name: Authenticate to private vericto-engine repo
-        run: |
-          # Use the token as the PASSWORD with a fixed username. A bare
-          # `https://<token>@github.com/` rewrite makes git treat the token as
-          # the username and then demand a password, which aborts on a headless
-          # runner ("could not read Password ... No such device or address").
-          git config --global \
-            url."https://x-access-token:${{ secrets.GH_PAT_PRIVATE_REPOS }}@github.com/".insteadOf \
-            "https://github.com/"
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
         with:
           toolchain: "1.88.0"
           components: rustfmt, clippy
@@ -48,14 +35,12 @@ jobs:
             libclang-dev clang libssl-dev pkg-config protobuf-compiler
 
       - name: Cache cargo registry and target
-        uses: actions/cache@v4.2.3
+        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
         with:
-          # `~/.cargo/git` is intentionally NOT cached: restoring a stale git
-          # checkout of the private vericto-engine dep leaves cargo doing an
-          # incremental fetch over a repo whose embedded config lacks the token,
-          # so git prompts for a password and fails on the headless runner. The
-          # git dep is re-fetched fresh each run (one small repo) with the auth
-          # rewrite above. `-v2` retires the poisoned pre-existing caches.
+          # `~/.cargo/git` is not cached: the only git dependency is the public
+          # vericto-engine repo, re-fetched each run (one small repo), so a stale
+          # checkout is never restored into a build. `-v2` in the key retired
+          # earlier caches that held such a checkout.
           path: |
             ~/.cargo/registry
             target

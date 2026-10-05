@@ -1,8 +1,8 @@
 //! vericto-proxy — Deterministic SQL firewall (TCP wire-protocol mode).
 //!
-//! Customer-facing component: intercepts every query via the PostgreSQL wire
-//! protocol, evaluates it with the vericto-engine AST parser, and either forwards
-//! it to the real database or blocks it — all in <2ms.
+//! Customer-facing component: intercepts every query via the PostgreSQL or MySQL
+//! wire protocol, evaluates it with the vericto-engine AST parser, and either
+//! forwards it to the real database or blocks it.
 //!
 //! Telemetry is reported to the Vericto API (HTTPS) in batches; the ruleset is
 //! pulled from the API on a configurable polling interval (default: 5 min).

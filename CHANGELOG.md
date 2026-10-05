@@ -7,6 +7,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Builds no longer need a GitHub token.** vericto-engine is public, so CI and the
+  release image fetch it anonymously. Nothing reads the `GH_PAT_PRIVATE_REPOS` secret
+  any more: the credential-rewrite step in CI, the BuildKit `github_token` secret in
+  the release workflow and the three `RUN --mount=type=secret` wrappers in the
+  Dockerfile are gone, and so is `CARGO_NET_GIT_FETCH_WITH_CLI`, which only existed so
+  cargo would honor that rewrite. `docker build .` works on a fresh clone with no
+  secrets.
+- **GitHub Actions are pinned to commit SHAs**, with the release in a trailing comment,
+  and Dependabot proposes updates to them weekly.
+
+### Added
+
+- `NOTICE`, naming the licensor (Vericto S.A.S.).
+- GitHub private vulnerability reporting as a second channel in `SECURITY.md`.
+
+### Fixed
+
+- **Documentation that no longer matched the code.**
+  - `.env.example` still used the per-engine names removed in 3.0.0
+    (`UPSTREAM_PG_HOST`, `PROXY_PG_LISTEN_PORT`, `UPSTREAM_PG_SSLMODE`, …). The proxy
+    ignores them, so a deployment configured from that file had no `UPSTREAM_HOST`
+    and exited at startup. The file also described an HTTP evaluation endpoint the
+    proxy does not have.
+  - The README listed `SELECT *` without `WHERE`, `SELECT` without `LIMIT` and
+    `INSERT` without a column list as blocked. The built-in ruleset flags or monitors
+    them and forwards the query.
+  - The README and the crate docs said every query is decided in under 2 ms.
+    Evaluation time grows with query size: about 22 ms for a 64 KB `INSERT`, per the
+    measurements in `src/tcp/query_limit.rs`.
+  - `SECURITY.md` said the engine enforces a 64 KB query limit. The size limit the
+    proxy applies is `VERICTO_MAX_QUERY_BYTES` (10 MiB by default); the engine's own
+    guards are its 200-level nesting and 50-level AST depth limits.
+  - `CONTRIBUTING.md` described this repository as the AST engine and sent rule work
+    to files that live in vericto-engine.
+  - Links: the rule list points at `vericto.com/rules-reference` (`/rules` returned
+    404), the Oracle/SQL Server note at the public HTTP API guide instead of a private
+    repository, and the commercial-license contact is `enterprise@vericto.com`.
+
 ## [4.5.0] — 2026-10-04
 
 ### Added
@@ -580,7 +620,18 @@ the service now targets the rebranded engine.
 - Optional control-plane link: ruleset hot-sync and telemetry reporting.
 - `/health` and `/metrics` (p50/p99 latency) endpoints.
 
-[Unreleased]: https://github.com/vericto/vericto-proxy/compare/v4.0.0...HEAD
+[Unreleased]: https://github.com/vericto/vericto-proxy/compare/v4.5.0...HEAD
+[4.5.0]: https://github.com/vericto/vericto-proxy/compare/v4.4.2...v4.5.0
+[4.4.2]: https://github.com/vericto/vericto-proxy/compare/v4.4.1...v4.4.2
+[4.4.1]: https://github.com/vericto/vericto-proxy/compare/v4.4.0...v4.4.1
+[4.4.0]: https://github.com/vericto/vericto-proxy/compare/v4.3.3...v4.4.0
+[4.3.3]: https://github.com/vericto/vericto-proxy/compare/v4.3.0...v4.3.3
+[4.3.0]: https://github.com/vericto/vericto-proxy/compare/v4.2.2...v4.3.0
+[4.2.2]: https://github.com/vericto/vericto-proxy/compare/v4.2.1...v4.2.2
+[4.2.1]: https://github.com/vericto/vericto-proxy/compare/v4.2.0...v4.2.1
+[4.2.0]: https://github.com/vericto/vericto-proxy/compare/v4.1.0...v4.2.0
+[4.1.0]: https://github.com/vericto/vericto-proxy/compare/v4.0.1...v4.1.0
+[4.0.1]: https://github.com/vericto/vericto-proxy/compare/v4.0.0...v4.0.1
 [4.0.0]: https://github.com/vericto/vericto-proxy/compare/v3.0.0...v4.0.0
 [3.0.0]: https://github.com/vericto/vericto-proxy/compare/v2.3.0...v3.0.0
 [2.3.0]: https://github.com/vericto/vericto-proxy/compare/v2.2.0...v2.3.0

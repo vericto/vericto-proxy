@@ -1,21 +1,29 @@
 # Contributing to Vericto Proxy
 
-Thanks for your interest in improving Vericto Proxy. This guide covers the
-open-source AST engine in this repository. Contributions are accepted under the
-project's [Elastic License 2.0](LICENSE).
+Thanks for your interest in improving Vericto Proxy. This guide covers the TCP
+wire-protocol proxy in this repository, which is source-available under the
+[Elastic License 2.0](LICENSE). Contributions are accepted under the same license.
 
 ## Code of Conduct
 
 This project follows the [Contributor Covenant](CODE_OF_CONDUCT.md). Be
 respectful, constructive, and technically precise.
 
-## Ways to contribute
+## What belongs here
 
-- **New rules** — add detection for a destructive or risky SQL pattern.
-- **Dialect support** — improve PostgreSQL, MySQL, Oracle, or SQL Server parsing.
-- **Parser fixes** — handle AST edge cases (nested CTEs, subqueries, etc.).
-- **Performance** — the engine targets <2ms p99; benchmarks are welcome.
-- **Docs** — clarify rule semantics or the YAML condition schema.
+The proxy sits on the database wire protocol and calls
+[vericto-engine](https://github.com/vericto/vericto-engine) in-process to decide
+each query. Contributions that fit here:
+
+- **Wire protocol** — PostgreSQL and MySQL message handling (`src/tcp/`).
+- **TLS** — the client→proxy and proxy→database hops.
+- **Telemetry and rule sync** — the control-plane link (`src/telemetry/`,
+  `src/tcp/rules_sync.rs`).
+- **Configuration, Docker image and deployment docs.**
+- **Performance** — latency added on the query path; include measurements.
+
+Contributions that belong in vericto-engine: new rules, rule evaluation, and SQL
+parsing for any dialect.
 
 ## Getting started
 
@@ -43,12 +51,16 @@ the Dockerfile for the exact system dependencies).
 
 ## Adding a new rule
 
-1. Implement the evaluator in `src/rules/evaluator.rs`.
-2. Register it with a `VERICTO-XXX` code and a severity (`critical`/`high`/`medium`).
-3. Add unit tests in the same module covering:
-   - A query that **must** be blocked (positive case).
-   - A safe variant that **must** be allowed (regression guard against false positives).
-4. Document the rule in `README.md` and the rule table.
+Rules are implemented and tested in
+[vericto-engine](https://github.com/vericto/vericto-engine) — see its
+CONTRIBUTING guide. Once a rule ships in an engine release, the proxy picks it up
+in two steps:
+
+1. Bump the `vericto-engine` tag in `Cargo.toml`, keeping `pg_query` on the same
+   major version as the engine (the comment there explains why).
+2. If the rule should be part of the built-in ruleset used without the
+   control-plane link, add its code, severity and default action to
+   `default_ruleset()` in `src/tcp/evaluator.rs`, and to the table its tests check.
 
 > A rule that produces false positives is worse than no rule. Always include a
 > "must be allowed" test alongside the "must be blocked" test.
@@ -58,13 +70,14 @@ the Dockerfile for the exact system dependencies).
 We use [Conventional Commits](https://www.conventionalcommits.org/):
 
 ```
-feat(rules): add MERGE statement detection for SQL Server
-fix(parser): handle nested CTE in DELETE for postgres
-perf(engine): cache compiled YAML conditions per ruleset
-test(rules): add false-positive guards for VERICTO-051
+feat(tcp): add MySQL wire protocol with TLS on both hops
+fix(telemetry): stop one large query from stalling all delivery
+feat(rules-sync): keep the last-good ruleset on disk across restarts
+fix(tcp): disable Nagle on upstream socket to remove ~40ms latency
 ```
 
-Scopes for this repo: `engine`, `parser`, `rules`, `tcp`, `cli`, `docs`.
+Scopes for this repo: `tcp`, `telemetry`, `rules-sync`, `config`, `healthz`,
+`docker`, `deps`, `docs`.
 
 **Write in English** — commit subjects and bodies, code comments, test names, identifiers,
 `CHANGELOG.md` entries and pull request descriptions. The codebase is source-available
