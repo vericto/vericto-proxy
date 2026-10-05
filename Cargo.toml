@@ -30,15 +30,9 @@ tokio = { version = "1.38", features = ["full"] }
 # `dyn WireProtocol`. Required until native async-fn-in-trait is object-safe.
 async-trait = "0.1"
 
-# HTTP server (AST evaluation endpoint consumed by the Fastify API)
-axum = "0.7"
-tower = "0.4"
-tower-http = { version = "0.5", features = ["trace", "limit"] }
-
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-serde_yaml = "0.9"
 
 # Outbound HTTP client for telemetry reporting + rule sync to the Vericto API.
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
@@ -62,14 +56,12 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
 # Utilities
 uuid = { version = "1.10", features = ["v4"] }
-thiserror = "1.0"
-anyhow = "1.0"
-once_cell = "1.19"
 chrono = { version = "0.4", features = ["serde"] }
 
 [dev-dependencies]
 tempfile = "3"
-tokio-test = "0.4"
+# Stands in for the control-plane API in the rules-sync tests (src/tcp/rules_sync.rs).
+axum = "0.7"
 
 [profile.release]
 opt-level = 3
