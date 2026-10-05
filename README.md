@@ -9,7 +9,7 @@
 `vericto-proxy` is the **customer-facing TCP wire-protocol proxy**. It intercepts
 every query on the database wire protocol, evaluates it with the
 [vericto-engine](https://github.com/vericto/vericto-engine) AST parser, and either
-forwards it to the real database or blocks it — all in <2ms.
+forwards it to the real database or blocks it.
 
 One proxy instance fronts one database and speaks exactly one wire protocol,
 chosen at deploy time with `VERICTO_WIRE_PROTOCOL`:
@@ -24,8 +24,8 @@ engines**. Only the value above and (optionally) the default ports change.
 
 No AI, no stochastic heuristics — the same input always produces the same result.
 
-> **Other dialects** (Oracle, SQL Server): evaluate via the HTTP API
-> ([vericto-eval](https://github.com/vericto/vericto-eval)); there is no wire
+> **Other dialects** (Oracle, SQL Server): evaluate via the
+> [HTTP API](https://vericto.com/integration-guide#http-setup); there is no wire
 > proxy for them.
 
 ---
@@ -51,13 +51,18 @@ No code changes required — your ORM/driver is unaware of the proxy.
 
 ## What it blocks
 
+With the built-in ruleset, these never reach the database:
+
 - `DELETE` / `UPDATE` without `WHERE`
 - `DROP TABLE`, `DROP SCHEMA`, `TRUNCATE`
 - OR-tautology SQL injection (`WHERE id = $1 OR 1=1`)
 - `ALTER TABLE DROP COLUMN` / `RENAME`
-- `INSERT` without explicit column list
-- `SELECT *` without `WHERE`, `SELECT` without `LIMIT`
-- … [full rule list →](https://vericto.com/rules)
+- … [full rule list →](https://vericto.com/rules-reference)
+
+Lower-severity findings — `SELECT *` without `WHERE`, `SELECT` without `LIMIT`,
+`INSERT` without an explicit column list — are forwarded and recorded rather than
+blocked. With the control-plane link on, the workspace policy decides the action
+for each severity.
 
 A blocked query is returned as a **native error** for the active protocol (see
 the table above), so no special handling is needed in your application.
@@ -206,7 +211,7 @@ docker run --rm \
   vericto/proxy:local
 ```
 
-In `docker-compose.yml` (vericto-fmw monorepo):
+With Docker Compose:
 
 ```yaml
 proxy:
@@ -219,7 +224,7 @@ proxy:
     PROXY_LISTEN_PORT: "5433"
     # For MySQL: VERICTO_WIRE_PROTOCOL: "mysql" + the matching ports.
     # Optional — uncomment for telemetry + rule sync (all three together):
-    # VERICTO_API_URL: "http://api:4000"
+    # VERICTO_API_URL: "https://api.vericto.com"
     # VERICTO_API_KEY: "${VERICTO_API_KEY}"
     # VERICTO_DATABASE_ID: "${VERICTO_DATABASE_ID}"
 ```
@@ -239,10 +244,12 @@ Same credentials as a direct connection — only the host/port change.
 
 ## Contributing
 
-Rules, dialect improvements, and parser fixes are the highest-value community
-contributions. See [CONTRIBUTING.md](CONTRIBUTING.md) and [SECURITY.md](SECURITY.md).
+Wire-protocol, TLS, telemetry and deployment fixes belong here; rules and
+parser changes belong in [vericto-engine](https://github.com/vericto/vericto-engine).
+See [CONTRIBUTING.md](CONTRIBUTING.md) and [SECURITY.md](SECURITY.md).
 
 ## License
 
-Elastic License 2.0 — source-available, no managed-service resale.
-For a commercial license contact [hola@vericto.com](mailto:hola@vericto.com).
+Copyright 2026 Vericto S.A.S. Licensed under the Elastic License 2.0 — see
+[LICENSE](LICENSE). Source-available, no managed-service resale.
+For a commercial license contact [enterprise@vericto.com](mailto:enterprise@vericto.com).
