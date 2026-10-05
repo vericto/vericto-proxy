@@ -38,11 +38,18 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # The labels are set here because this is the step whose labels reach the image.
+      # Without the explicit licenses label, metadata-action fills it from GitHub's
+      # license detection, which does not recognise ELv2 and reports NOASSERTION.
       - name: Derive labels
         id: meta
         uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          labels: |
+            org.opencontainers.image.title=vericto-proxy
+            org.opencontainers.image.description=Vericto SQL security proxy — deterministic AST parsing
+            org.opencontainers.image.licenses=Elastic-2.0
 
       - name: Build and push digest
         id: build
@@ -107,7 +114,7 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Derive image tags and labels
+      - name: Derive image tags
         id: meta
         uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
         with:
@@ -116,10 +123,6 @@ jobs:
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
             type=semver,pattern={{major}}
-          labels: |
-            org.opencontainers.image.title=vericto-proxy
-            org.opencontainers.image.description=Vericto SQL security proxy — deterministic AST parsing
-            org.opencontainers.image.licenses=Elastic-2.0
 
       - name: Create and push multi-arch manifest
         working-directory: /tmp/digests
