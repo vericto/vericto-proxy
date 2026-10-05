@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [4.5.1] — 2026-10-05
+
+Build, packaging and documentation changes, made as the repository goes public.
+Nothing changes in what the proxy blocks or forwards. The only source change is a doc
+comment, and the engine update is documentation and CI only. Upgrading needs no
+configuration change.
+
 ### Changed
 
 - **Builds no longer need a GitHub token.** vericto-engine is public, so CI and the
@@ -653,7 +660,8 @@ the service now targets the rebranded engine.
 - Optional control-plane link: ruleset hot-sync and telemetry reporting.
 - `/health` and `/metrics` (p50/p99 latency) endpoints.
 
-[Unreleased]: https://github.com/vericto/vericto-proxy/compare/v4.5.0...HEAD
+[Unreleased]: https://github.com/vericto/vericto-proxy/compare/v4.5.1...HEAD
+[4.5.1]: https://github.com/vericto/vericto-proxy/compare/v4.5.0...v4.5.1
 [4.5.0]: https://github.com/vericto/vericto-proxy/compare/v4.4.2...v4.5.0
 [4.4.2]: https://github.com/vericto/vericto-proxy/compare/v4.4.1...v4.4.2
 [4.4.1]: https://github.com/vericto/vericto-proxy/compare/v4.4.0...v4.4.1
