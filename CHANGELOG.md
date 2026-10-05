@@ -26,11 +26,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **The image ships its license files.** `LICENSE`, `NOTICE` and a generated
+  `THIRD_PARTY_LICENSES` are in `/usr/share/doc/vericto-proxy/`; until now the image
+  held only the binary. The Elastic License 2.0 requires that anyone who receives
+  the software also receives its terms, and the licenses of the dependencies require
+  their notices to go with binary copies. `THIRD_PARTY_LICENSES` is written during
+  the image build by `cargo-about` 0.9.2 from `Cargo.lock`, so it always matches
+  what was compiled. It covers the crates that ship for the image's Linux targets,
+  excluding build and dev dependencies. `third-party/pg_query-bundled.txt` adds the
+  C code `pg_query` links in, which cargo-about cannot see: libpg_query, the
+  PostgreSQL parser sources, protobuf-c and xxHash. A dependency under a license
+  that is not in `third-party/about.toml`'s `accepted` list fails the build, and so
+  does a `pg_query` version that file does not describe.
 - `NOTICE`, naming the licensor (Vericto S.A.S.).
 - GitHub private vulnerability reporting as a second channel in `SECURITY.md`.
 
 ### Fixed
 
+- **The image's `org.opencontainers.image.licenses` label read `NOASSERTION`.** The
+  release workflow declared `Elastic-2.0` (with the title and description labels) in
+  the merge job. That job only stitches the per-architecture images into a manifest
+  list and never applies labels. So the label came from metadata-action's default,
+  GitHub's license detection, which does not recognise ELv2. The three labels now
+  sit on the build job's metadata step, the one whose labels reach the image.
 - **Documentation that no longer matched the code.**
   - `.env.example` still used the per-engine names removed in 3.0.0
     (`UPSTREAM_PG_HOST`, `PROXY_PG_LISTEN_PORT`, `UPSTREAM_PG_SSLMODE`, …). The proxy

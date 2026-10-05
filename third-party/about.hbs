@@ -1,0 +1,26 @@
+THIRD-PARTY SOFTWARE NOTICES FOR VERICTO-PROXY
+
+The vericto-proxy binary in this image is built from the Rust crates listed below.
+Each section names a license, the crates distributed under it and the license
+text. The C code that the pg_query crate compiles into the binary (libpg_query,
+PostgreSQL, protobuf-c and xxHash) is listed at the end of this file.
+
+vericto-proxy itself is licensed under the Elastic License 2.0; see LICENSE and
+NOTICE next to this file.
+
+Summary:
+{{#each overview}}
+  - {{{name}}} ({{{id}}}): {{count}} crate(s)
+{{/each}}
+{{#each licenses}}
+
+================================================================================
+{{{name}}} ({{{id}}})
+
+Used by:
+{{#each used_by}}
+  - {{{crate.name}}} {{{crate.version}}}
+{{/each}}
+
+{{{text}}}
+{{/each}}

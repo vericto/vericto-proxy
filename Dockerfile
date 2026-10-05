@@ -3,10 +3,12 @@
 # Uses cargo-chef to cache dependency compilation separately from source.
 #
 # Stages:
-#   chef     — installs cargo-chef tool
+#   chef     — installs cargo-chef and cargo-about
 #   planner  — generates recipe.json from Cargo.toml
-#   builder  — compiles deps (cached), then source (fast on rebuilds)
-#   runner   — minimal runtime image
+#   builder  — compiles deps (cached), then source (fast on rebuilds), then
+#              writes THIRD_PARTY_LICENSES
+#   runner   — minimal runtime image, with the license files under
+#              /usr/share/doc/vericto-proxy
 # =============================================================================
 
 # syntax=docker/dockerfile:1.7
@@ -28,6 +30,10 @@ ENV LIBCLANG_PATH=/usr/lib/llvm-14/lib
 
 RUN cargo install cargo-chef --locked
 
+# Generates THIRD_PARTY_LICENSES in the builder stage. Pinned, so the notices only
+# change format when this line does.
+RUN cargo install cargo-about --version 0.9.2 --locked --features cli
+
 # ── Stage 2: generate recipe (dependency fingerprint) ────────────────────────
 FROM chef AS planner
 COPY . .
@@ -48,6 +54,10 @@ COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 RUN cargo build --release
 
+# Notices for everything compiled into the binary; see third-party/build-notices.sh.
+COPY third-party ./third-party
+RUN sh third-party/build-notices.sh THIRD_PARTY_LICENSES
+
 # ── Stage 4: minimal runtime ──────────────────────────────────────────────────
 FROM debian:bookworm-slim AS runner
 
@@ -61,6 +71,12 @@ RUN groupadd --system --gid 1001 vericto && \
 
 COPY --from=builder /app/target/release/vericto-proxy /usr/local/bin/vericto-proxy
 RUN chown vericto:vericto /usr/local/bin/vericto-proxy
+
+# The Elastic License 2.0 requires that anyone who receives the software also
+# receives its terms, and the dependencies' licenses require their notices to go
+# with binary copies, so all three files ship next to the binary.
+COPY LICENSE NOTICE /usr/share/doc/vericto-proxy/
+COPY --from=builder /app/THIRD_PARTY_LICENSES /usr/share/doc/vericto-proxy/
 
 USER vericto
 

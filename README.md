@@ -253,3 +253,12 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) and [SECURITY.md](SECURITY.md).
 Copyright 2026 Vericto S.A.S. Licensed under the Elastic License 2.0 — see
 [LICENSE](LICENSE). Source-available, no managed-service resale.
 For a commercial license contact [enterprise@vericto.com](mailto:enterprise@vericto.com).
+
+The Docker image carries `LICENSE`, `NOTICE` and `THIRD_PARTY_LICENSES` (the
+licenses of every dependency compiled into the binary) in
+`/usr/share/doc/vericto-proxy/`:
+
+```bash
+docker run --rm --entrypoint cat ghcr.io/vericto/vericto-proxy:latest \
+  /usr/share/doc/vericto-proxy/THIRD_PARTY_LICENSES
+```
