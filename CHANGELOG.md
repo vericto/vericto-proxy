@@ -18,6 +18,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   secrets.
 - **GitHub Actions are pinned to commit SHAs**, with the release in a trailing comment,
   and Dependabot proposes updates to them weekly.
+- **Adopts `vericto-engine` v3.5.3** (from v3.5.2), the engine's latest release.
+  Upstream it is documentation and CI only: a `NOTICE`, a corrected security policy
+  and test names. The library code the proxy compiles is unchanged, with no API,
+  behaviour or rule change, so the proxy blocks exactly what it did. `pg_query` stays
+  on 6.2, the version the engine uses.
 
 ### Added
 
