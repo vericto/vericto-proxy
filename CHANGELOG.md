@@ -29,6 +29,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `NOTICE`, naming the licensor (Vericto S.A.S.).
 - GitHub private vulnerability reporting as a second channel in `SECURITY.md`.
 
+### Removed
+
+- **Seven dependencies nothing used.** `tower`, `tower-http`, `serde_yaml`,
+  `thiserror`, `anyhow` and `once_cell` had no references left in `src/`, and neither
+  did the dev-dependency `tokio-test`. `axum`, `tower` and `tower-http` were listed
+  under a comment describing an HTTP evaluation endpoint that the proxy no longer
+  serves. `axum` moves to `[dev-dependencies]`: its only remaining use is the test
+  double for the control-plane API in the rules-sync tests, so it is no longer
+  compiled into the release binary.
+
 ### Fixed
 
 - **Documentation that no longer matched the code.**
