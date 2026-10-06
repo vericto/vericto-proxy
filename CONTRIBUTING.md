@@ -2,7 +2,8 @@
 
 Thanks for your interest in improving Vericto Proxy. This guide covers the TCP
 wire-protocol proxy in this repository, which is source-available under the
-[Elastic License 2.0](LICENSE). Contributions are accepted under the same license.
+[Elastic License 2.0](LICENSE). Contributions are accepted under the Vericto
+[Contributor License Agreement](#contributor-license-agreement).
 
 ## Code of Conduct
 
@@ -92,6 +93,7 @@ here forward is English.
 ## Pull request acceptance criteria
 
 - ✅ CI passes (`fmt`, `clippy -D warnings`, `cargo test`).
+- ✅ The Contributor License Agreement is signed.
 - ✅ New rules include both a blocked-case and an allowed-case test.
 - ✅ At least one maintainer review.
 - ✅ No new `unwrap()`/`expect()` on runtime paths — handle errors explicitly.
@@ -101,7 +103,14 @@ here forward is English.
 
 Do **not** open a public issue for vulnerabilities. See [SECURITY.md](SECURITY.md).
 
-## Developer Certificate of Origin
+## Contributor License Agreement
 
-By contributing, you certify that your contribution complies with the
-[DCO](https://developercertificate.org/). Sign your commits with `git commit -s`.
+Before your first pull request can be merged, you need to sign the Vericto
+Contributor License Agreement (CLA). It gives Vericto S.A.S. the rights it needs to
+distribute your contribution as part of the project, under the Elastic License 2.0 and
+under the commercial licenses it offers.
+
+A bot comments on your first pull request with a link to read and sign the agreement
+with your GitHub account. The signature is recorded once and applies to your later
+pull requests. If you contribute on behalf of an employer, write to
+[legal@vericto.com](mailto:legal@vericto.com) before opening the pull request.
