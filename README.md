@@ -30,6 +30,54 @@ No AI, no stochastic heuristics — the same input always produces the same resu
 
 ---
 
+## Try it with Docker
+
+All you need is Docker: no account, no API key, no build. This starts a throwaway
+Postgres, puts the proxy in front of it with the built-in ruleset, and sends a few
+queries through it with the `psql` that ships in the Postgres image. The password
+`demo` is only for this disposable database.
+
+```bash
+docker network create vericto-demo
+docker run -d --name vericto-demo-db --network vericto-demo \
+  -e POSTGRES_PASSWORD=demo postgres:17
+docker run -d --name vericto-demo-proxy --network vericto-demo \
+  -e UPSTREAM_HOST=vericto-demo-db ghcr.io/vericto/vericto-proxy:4.5.1
+until docker exec vericto-demo-db pg_isready -q -h localhost -U postgres; do sleep 1; done
+
+docker run --rm --network vericto-demo postgres:17 \
+  psql postgresql://postgres:demo@vericto-demo-proxy:5433/postgres \
+  -c "CREATE TABLE users (id int PRIMARY KEY, email text)" \
+  -c "INSERT INTO users VALUES (1, 'ana@example.com'), (42, 'bo@example.com')" \
+  -c "DELETE FROM users" \
+  -c "DELETE FROM users WHERE id = 42" \
+  -c "SELECT id, email FROM users"
+```
+
+The `DELETE` without a `WHERE` never reaches the database; the one with a `WHERE`
+does:
+
+```text
+CREATE TABLE
+INSERT 0 2
+ERROR:  Vericto blocked this query [VERICTO-001] — AST node: DeleteStmt > WhereClause = NULL. Suggestion: DELETE FROM users WHERE id = $1
+DELETE 1
+ id |      email
+----+-----------------
+  1 | ana@example.com
+(1 row)
+```
+
+`docker logs vericto-demo-proxy` shows the decision. To put the proxy in front of
+your own database, see [Docker](#docker) and
+[Connection strings](#connection-strings). Clean up with:
+
+```bash
+docker rm -f vericto-demo-db vericto-demo-proxy && docker network rm vericto-demo
+```
+
+---
+
 ## Architecture position
 
 ```
@@ -202,7 +250,7 @@ Only two things differ per engine; everything above is shared.
 
 ---
 
-## Quick start
+## Run from source
 
 ```bash
 # Postgres (default). Requires a local Postgres on 5432.
@@ -228,25 +276,33 @@ cargo fmt
 
 ## Docker
 
-```bash
-docker build -t vericto/proxy:local .
+Release images are published at `ghcr.io/vericto/vericto-proxy` for `linux/amd64`
+and `linux/arm64`, and pull without credentials.
 
-# Postgres
-docker run --rm -e UPSTREAM_HOST=host.docker.internal -p 5433:5433 vericto/proxy:local
+```bash
+# Postgres. On Linux, add --add-host=host.docker.internal:host-gateway
+docker run --rm -e UPSTREAM_HOST=host.docker.internal -p 5433:5433 \
+  ghcr.io/vericto/vericto-proxy:4.5.1
 
 # MySQL
 docker run --rm \
   -e VERICTO_WIRE_PROTOCOL=mysql \
   -e UPSTREAM_HOST=host.docker.internal \
   -p 3307:3307 \
-  vericto/proxy:local
+  ghcr.io/vericto/vericto-proxy:4.5.1
+```
+
+To build the image from this checkout instead:
+
+```bash
+docker build -t vericto/proxy:local .
 ```
 
 With Docker Compose:
 
 ```yaml
 proxy:
-  image: ${VERICTO_PROXY_IMAGE:-vericto/proxy:local}
+  image: ${VERICTO_PROXY_IMAGE:-ghcr.io/vericto/vericto-proxy:4.5.1}
   ports:
     - "5433:5433"
   environment:
