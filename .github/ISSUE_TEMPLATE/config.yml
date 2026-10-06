@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Propose a rule or report a SQL parsing problem
+    url: https://github.com/vericto/vericto-engine/issues/new/choose
+    about: Rules and SQL parsing live in vericto-engine, which the proxy runs in-process.
+  - name: Report a security vulnerability
+    url: https://github.com/vericto/vericto-proxy/security/advisories/new
+    about: Report it privately instead of in a public issue. See SECURITY.md.

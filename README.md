@@ -141,6 +141,37 @@ hop; `PROXY_TLS_MODE` covers the client→proxy hop.
 > `UPSTREAM_SSLMODE=require` together (or leave both off). See
 > [engine-specific notes](#engine-specific-notes).
 
+### Query size limit
+
+| Variable                  | Default              | Description                                   |
+|---------------------------|----------------------|-----------------------------------------------|
+| `VERICTO_MAX_QUERY_BYTES` | `10485760` (10 MiB)  | Largest statement the proxy evaluates         |
+
+Evaluation runs before the query reaches the database, and its cost grows with the
+statement's size. On the measurements in `src/tcp/query_limit.rs` it takes about
+22 ms for 64 KB and 3.8 s for 10 MB. A statement over the limit is refused before it
+is parsed, with the same native error as a blocked query and the code
+`VERICTO-QUERY-TOO-LARGE`. In `monitor_mode` it is forwarded unevaluated instead.
+
+A value larger than the wire protocol can carry is clamped, with a warning: 64 MiB for
+PostgreSQL, 16 MiB − 1 byte for MySQL. A value that is not a positive integer falls
+back to the default, also with a warning.
+
+### Health check (optional)
+
+| Variable               | Default | Description                                   |
+|------------------------|---------|-----------------------------------------------|
+| `VERICTO_HEALTHZ_PORT` | — (off) | TCP port for load-balancer health checks      |
+
+The listener accepts each connection and closes it without exchanging any bytes, so
+a probe is a plain TCP connect. It is separate from the traffic port and never
+contacts the database: a database outage does not take the proxy out of rotation.
+
+It opens only once warm-up is done: at startup without the control-plane link, or
+after the first rule-sync attempt (successful or not) with it. Until then probes get
+connection refused. The image's `HEALTHCHECK` probes this port when it is set. A
+value that is not a valid port number is ignored, and the listener stays off.
+
 ### Observability
 
 | Variable        | Default | Description                                   |

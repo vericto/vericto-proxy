@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Contributions need the Vericto Contributor License Agreement** instead of a DCO
+  sign-off. `CONTRIBUTING.md` and the pull request template ask contributors to sign
+  it before their first pull request is merged, and no longer ask for `git commit -s`.
+- **The issue and pull request templates describe the proxy.** They had been copied
+  from vericto-engine and asked about dialects the proxy does not serve and about new
+  rules. The bug report now asks for the wire protocol, the driver, the proxy version
+  and its configuration. Rule proposals and parser problems link to vericto-engine,
+  and vulnerabilities to private reporting; the rule-proposal template is gone.
+
+### Removed
+
+- **`Dockerfile.build`.** It was a stale copy of `Dockerfile.local`. It copied the
+  engine from a `vericto-engine-local` directory, documented the production tag as
+  `v1.0.0`, and pointed to a helper script outside this repository. `Dockerfile.local`
+  covers the same case: building against a local vericto-engine checkout.
+
+### Fixed
+
+- **`VERICTO_MAX_QUERY_BYTES` and `VERICTO_HEALTHZ_PORT` are documented.** The proxy
+  reads both, but neither `README.md` nor `.env.example` mentioned them. The README now
+  gives the size limit's default, clamping and monitor-mode behaviour, and explains when
+  the health-check port opens and what a probe checks.
+- `Dockerfile.local` no longer points to a helper script that is not in this
+  repository.
+
 ## [4.5.1] — 2026-10-05
 
 Build, packaging and documentation changes, made as the repository goes public.
@@ -527,8 +554,8 @@ Maintenance release: no API, config, or behaviour changes.
   `ast_condition_yaml` straight through, so no code changes were needed.
 - **Migrated to Rust edition 2024** (`edition = "2021"` → `"2024"`). Toolchain is
   already pinned to 1.88, which supports it; no source changes were required.
-- Updated repository URL and README links from `donkan168/…` to `vericto/…` to
-  reflect the repository transfer.
+- Updated repository URL and README links to `vericto/…` to reflect the
+  repository transfer.
 
 ## [4.0.0] — 2026-07-16
 

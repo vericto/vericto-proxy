@@ -16,8 +16,6 @@
 #     -t vericto/proxy:local \
 #     --build-context engine=../vericto-engine \
 #     .
-#
-# Or use the helper script: ../scripts/build-local.sh
 # =============================================================================
 
 FROM rust:1.88-slim-bookworm AS builder
