@@ -41,7 +41,9 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 # rustls handshake) when UPSTREAM_SSLMODE is require/verify-full.
 tokio-rustls = "0.26"
 webpki-roots = "0.26"
-rustls-pemfile = "2"
+# PEM parsing comes from rustls-pki-types (re-exported by tokio-rustls as
+# `rustls::pki_types::pem`), not from rustls-pemfile, which is unmaintained
+# (RUSTSEC-2025-0134) and now only wraps that same parser.
 
 # SHA-256 for the rules-cache link fingerprint (src/tcp/rules_cache.rs). Already
 # compiled in as rustls's crypto provider, so this adds no new code.

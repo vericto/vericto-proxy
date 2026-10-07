@@ -20,6 +20,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 use tokio_rustls::TlsAcceptor;
 use tokio_rustls::rustls::ServerConfig;
+use tokio_rustls::rustls::pki_types::pem::{self, PemObject};
 use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
 /// Boxed client read half (plaintext TCP or TLS).
@@ -98,8 +99,7 @@ fn pem_or_path(value: &str, what: &str) -> io::Result<Vec<u8>> {
 /// Reads a PEM certificate chain from inline PEM or from disk.
 fn load_certs(source: &str) -> io::Result<Vec<CertificateDer<'static>>> {
     let pem = pem_or_path(source, "cert")?;
-    let mut rd: &[u8] = &pem;
-    let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut rd)
+    let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_slice_iter(&pem)
         .collect::<Result<_, _>>()
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     if certs.is_empty() {
@@ -114,14 +114,14 @@ fn load_certs(source: &str) -> io::Result<Vec<CertificateDer<'static>>> {
 /// Reads a PEM private key from disk (PKCS#8, PKCS#1, or SEC1).
 fn load_private_key(source: &str) -> io::Result<PrivateKeyDer<'static>> {
     let pem = pem_or_path(source, "key")?;
-    let mut rd: &[u8] = &pem;
-    rustls_pemfile::private_key(&mut rd)?.ok_or_else(|| {
+    PrivateKeyDer::from_pem_slice(&pem).map_err(|e| match e {
         // Deliberately does NOT echo `source`: when the key arrives inline, that
         // value IS the key. `describe_source` reports the shape instead.
-        io::Error::new(
+        pem::Error::NoItemsFound => io::Error::new(
             io::ErrorKind::InvalidData,
             format!("no private key found in {}", describe_source(source)),
-        )
+        ),
+        other => io::Error::new(io::ErrorKind::InvalidData, other),
     })
 }
 
@@ -174,6 +174,36 @@ mod tests {
     /// A syntactically valid but meaningless PEM block, enough to exercise the
     /// inline-vs-path branch without shipping a real key in the test suite.
     const PEM_FALSO: &str = "-----BEGIN CERTIFICATE-----\nZm9v\n-----END CERTIFICATE-----\n";
+
+    /// The three private-key encodings the docs promise (PKCS#8, PKCS#1, SEC1) are
+    /// still told apart after moving from rustls-pemfile to the pki-types parser,
+    /// which picks the variant from the PEM label the same way.
+    #[test]
+    fn every_documented_private_key_encoding_is_recognised() {
+        let pem = |label: &str| format!("-----BEGIN {label}-----\nZm9v\n-----END {label}-----\n");
+        assert!(matches!(
+            load_private_key(&pem("PRIVATE KEY")),
+            Ok(PrivateKeyDer::Pkcs8(_))
+        ));
+        assert!(matches!(
+            load_private_key(&pem("RSA PRIVATE KEY")),
+            Ok(PrivateKeyDer::Pkcs1(_))
+        ));
+        assert!(matches!(
+            load_private_key(&pem("EC PRIVATE KEY")),
+            Ok(PrivateKeyDer::Sec1(_))
+        ));
+    }
+
+    #[test]
+    fn a_key_file_without_a_key_says_so_without_echoing_it() {
+        // A certificate where the key should be: the old `Ok(None)` branch, now
+        // `NoItemsFound`. Same message, and the inline value is never repeated.
+        let err = load_private_key(PEM_FALSO).expect_err("a certificate is not a key");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("no private key found"));
+        assert!(!err.to_string().contains("Zm9v"));
+    }
 
     #[test]
     fn inline_pem_is_read_without_touching_the_filesystem() {

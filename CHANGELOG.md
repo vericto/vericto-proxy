@@ -29,6 +29,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and its configuration. Rule proposals and parser problems link to vericto-engine,
   and vulnerabilities to private reporting; the rule-proposal template is gone.
 
+### Security
+
+- **PEM parsing no longer depends on `rustls-pemfile`.** That crate is unmaintained
+  (RUSTSEC-2025-0134) and had become a thin wrapper over the parser in
+  `rustls-pki-types`, which the proxy already compiled in through `tokio-rustls`. The
+  certificate and key loaders for both TLS hops now call it directly, so a dependency
+  is gone instead of replaced. Behaviour is unchanged: the three private-key encodings
+  (PKCS#8, PKCS#1, SEC1) are still told apart by their PEM label, and a key file with
+  no key still fails with the same message, without echoing inline material. New tests
+  pin both.
+- **`anyhow` 1.0.104**, past the `downcast_mut` unsoundness (RUSTSEC-2026-0190). It
+  only reaches the build through `prost-derive`, a proc-macro, so it never ran in the
+  proxy; updated so `cargo audit` reports nothing.
+
+With both, `cargo audit` reports no vulnerabilities and no warnings. This closes R4
+of the 2026-10-04 vulnerability review.
+
 ### Removed
 
 - **`Dockerfile.build`.** It was a stale copy of `Dockerfile.local`. It copied the
