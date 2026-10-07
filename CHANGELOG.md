@@ -7,8 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **A way to try the proxy with Docker alone.** The README's new "Try it with
+  Docker" section starts a throwaway Postgres and the published image, and shows a
+  `DELETE` without `WHERE` being blocked and one with `WHERE` going through. It needs
+  no account, API key or build.
+
 ### Changed
 
+- **The Docker and Compose examples use the published image**
+  `ghcr.io/vericto/vericto-proxy:4.5.1` instead of a locally built
+  `vericto/proxy:local`. Building the image yourself is still documented, and the
+  `cargo` instructions are now under "Run from source".
 - **Contributions need the Vericto Contributor License Agreement** instead of a DCO
   sign-off. `CONTRIBUTING.md` and the pull request template ask contributors to sign
   it before their first pull request is merged, and no longer ask for `git commit -s`.
