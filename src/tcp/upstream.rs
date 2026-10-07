@@ -17,6 +17,7 @@ use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
+use tokio_rustls::rustls::pki_types::pem::{self, PemObject};
 use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
 use tokio_rustls::rustls::{ClientConfig, RootCertStore};
 
@@ -143,8 +144,7 @@ fn load_client_auth(
             let pem = std::fs::read(cert).map_err(|e| {
                 io::Error::new(e.kind(), format!("reading upstream cert {cert}: {e}"))
             })?;
-            let mut rd: &[u8] = &pem;
-            let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut rd)
+            let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_slice_iter(&pem)
                 .collect::<Result<_, _>>()
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
             if certs.is_empty() {
@@ -156,12 +156,12 @@ fn load_client_auth(
             let key_pem = std::fs::read(key).map_err(|e| {
                 io::Error::new(e.kind(), format!("reading upstream key {key}: {e}"))
             })?;
-            let mut krd: &[u8] = &key_pem;
-            let key_der = rustls_pemfile::private_key(&mut krd)?.ok_or_else(|| {
-                io::Error::new(
+            let key_der = PrivateKeyDer::from_pem_slice(&key_pem).map_err(|e| match e {
+                pem::Error::NoItemsFound => io::Error::new(
                     io::ErrorKind::InvalidData,
                     format!("no private key found in upstream key {key}"),
-                )
+                ),
+                other => io::Error::new(io::ErrorKind::InvalidData, other),
             })?;
             Ok(Some((certs, key_der)))
         }
@@ -186,8 +186,7 @@ fn build_client_config(
             let mut roots = RootCertStore::empty();
             if let Some(path) = ca_path {
                 let pem = std::fs::read(path)?;
-                let mut rd: &[u8] = &pem;
-                for cert in rustls_pemfile::certs(&mut rd) {
+                for cert in CertificateDer::pem_slice_iter(&pem) {
                     let cert = cert.map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
                     roots
                         .add(cert)
