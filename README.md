@@ -179,7 +179,7 @@ hop; `PROXY_TLS_MODE` covers the client→proxy hop.
 | `UPSTREAM_SSLMODE`   | `disable` (def) \| `require` \| `verify-full` | TLS to the database |
 | `UPSTREAM_SSLROOTCERT`| —               | CA bundle (PEM) for `verify-full`        |
 | `UPSTREAM_SSLCERT` / `UPSTREAM_SSLKEY` | —  | Client cert for upstream mutual TLS (Postgres) |
-| `PROXY_TLS_MODE`     | `disable` (def) \| `require` | Terminate client-side TLS     |
+| `PROXY_TLS_MODE`     | `disable` (def) \| `require` | Terminate client-side TLS. With `require`, a client that does not request TLS is refused (Postgres: SQLSTATE 28000) |
 | `PROXY_TLS_CERT` / `PROXY_TLS_KEY` | —  | Server cert/key presented to clients. Either a **path** to a PEM file or the **PEM contents inline** — inline lets a secrets manager deliver the key, so it never has to be baked into the image |
 
 > **MySQL TLS caveat:** TLS must be on **both** hops or neither — never one. The

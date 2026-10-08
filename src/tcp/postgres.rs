@@ -184,6 +184,11 @@ async fn run_session(client: TcpStream, config: Arc<PgProxyConfig>) -> std::io::
 /// answers `'S'`, performs the server-side TLS handshake, and reads the
 /// StartupMessage over the encrypted channel. Otherwise it declines encryption
 /// (`'N'`) and continues in plaintext — the trusted-network deployment model.
+///
+/// `acceptor` is `Some` only for `PROXY_TLS_MODE=require`, so a StartupMessage
+/// sent in plaintext (the client skipped `SSLRequest`, e.g. `sslmode=disable`)
+/// is refused with a native `ErrorResponse` (28000) and never reaches the
+/// upstream — the MySQL path refuses the same case (`session.rs`).
 async fn negotiate_startup(
     mut client: TcpStream,
     acceptor: Option<&tokio_rustls::TlsAcceptor>,
@@ -211,6 +216,24 @@ async fn negotiate_startup(
                 client.flush().await?;
             }
             StartupPacket::Startup { raw, params } => {
+                if acceptor.is_some() {
+                    tracing::warn!(
+                        user = ?params.user,
+                        database = ?params.database,
+                        "PROXY_TLS_MODE=require but the client started without TLS; rejected"
+                    );
+                    client
+                        .write_all(&crate::tcp::codec::build_error_response(
+                            crate::tcp::codec::SQLSTATE_INVALID_AUTHORIZATION,
+                            "Vericto: this proxy requires SSL (PROXY_TLS_MODE=require); connect with sslmode=require",
+                        ))
+                        .await?;
+                    client.flush().await?;
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "PROXY_TLS_MODE=require but the client did not request TLS",
+                    ));
+                }
                 tracing::debug!(
                     user = ?params.user,
                     database = ?params.database,
@@ -1058,5 +1081,105 @@ mod tests {
             .expect("session must terminate after upstream dies mid-session")
             .unwrap();
         let _ = upstream_task.await;
+    }
+
+    /// A `TlsAcceptor` for tests that never complete a handshake: it has no
+    /// certificate at all, which is enough to put `negotiate_startup` in
+    /// `PROXY_TLS_MODE=require` mode.
+    fn require_tls_acceptor() -> tokio_rustls::TlsAcceptor {
+        use tokio_rustls::rustls::ServerConfig;
+        use tokio_rustls::rustls::server::{ClientHello, ResolvesServerCert};
+        use tokio_rustls::rustls::sign::CertifiedKey;
+
+        #[derive(Debug)]
+        struct NoCert;
+        impl ResolvesServerCert for NoCert {
+            fn resolve(&self, _: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
+                None
+            }
+        }
+        // The same provider main() installs; idempotent across tests.
+        let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
+        let config = ServerConfig::builder()
+            .with_no_client_auth()
+            .with_cert_resolver(Arc::new(NoCert));
+        tokio_rustls::TlsAcceptor::from(Arc::new(config))
+    }
+
+    /// An upstream that records whether anything ever connected to it.
+    async fn watched_upstream() -> (std::net::SocketAddr, tokio::task::JoinHandle<bool>) {
+        let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = upstream.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            tokio::time::timeout(std::time::Duration::from_millis(500), upstream.accept())
+                .await
+                .is_ok()
+        });
+        (addr, task)
+    }
+
+    #[tokio::test]
+    async fn require_tls_rejects_a_plaintext_startup_before_the_upstream() {
+        let (upstream_addr, upstream_contacted) = watched_upstream().await;
+        let mut config = test_config(&upstream_addr.ip().to_string(), upstream_addr.port());
+        Arc::get_mut(&mut config).unwrap().client_tls_acceptor = Some(require_tls_acceptor());
+
+        let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (client, _) = proxy.accept().await.unwrap();
+            handle_connection(client, config).await;
+        });
+
+        // The client skips SSLRequest and sends its StartupMessage in plaintext.
+        let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+        client.write_all(&startup_message()).await.unwrap();
+        client.flush().await.unwrap();
+
+        read_error_response(
+            &mut client,
+            crate::tcp::codec::SQLSTATE_INVALID_AUTHORIZATION,
+        )
+        .await;
+        tokio::time::timeout(std::time::Duration::from_secs(5), server)
+            .await
+            .expect("session must terminate after the rejection")
+            .unwrap();
+        assert!(
+            !upstream_contacted.await.unwrap(),
+            "a plaintext client must never reach the database under PROXY_TLS_MODE=require"
+        );
+    }
+
+    #[tokio::test]
+    async fn require_tls_still_accepts_an_ssl_request() {
+        let (upstream_addr, _upstream) = watched_upstream().await;
+        let mut config = test_config(&upstream_addr.ip().to_string(), upstream_addr.port());
+        Arc::get_mut(&mut config).unwrap().client_tls_acceptor = Some(require_tls_acceptor());
+
+        let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (client, _) = proxy.accept().await.unwrap();
+            handle_connection(client, config).await;
+        });
+
+        let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+        // SSLRequest: Int32 length 8, Int32 code 80877103.
+        client
+            .write_all(&[0, 0, 0, 8, 0x04, 0xD2, 0x16, 0x2F])
+            .await
+            .unwrap();
+        client.flush().await.unwrap();
+
+        let mut reply = [0u8; 1];
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            client.read_exact(&mut reply),
+        )
+        .await
+        .expect("must not hang")
+        .unwrap();
+        assert_eq!(reply[0], b'S', "an SSLRequest must still be accepted");
     }
 }

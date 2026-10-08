@@ -22,6 +22,11 @@ pub const SQLSTATE_INSUFFICIENT_PRIVILEGE: &str = "42501";
 /// error instead of a bare closed socket.
 pub const SQLSTATE_CONNECTION_FAILURE: &str = "08006";
 
+/// SQLSTATE returned when `PROXY_TLS_MODE=require` and the client starts in
+/// plaintext (invalid_authorization_specification). The same code PostgreSQL
+/// itself answers when `pg_hba.conf` only has `hostssl` entries.
+pub const SQLSTATE_INVALID_AUTHORIZATION: &str = "28000";
+
 /// Maximum accepted message size (anti-DoS defense). 64MB.
 const MAX_MESSAGE_LEN: usize = 64 * 1024 * 1024;
 
