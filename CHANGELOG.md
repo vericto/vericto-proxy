@@ -16,6 +16,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **vericto-engine v3.6.0** (from v3.5.3). Additive: `EnforcementPolicy` gains
+  `sensitive_columns` and `EvaluationOutcome` gains `rewritten_query` and
+  `sensitive_columns`. With no tags the engine skips the analysis and every decision
+  is unchanged.
+
 - **The Docker and Compose examples use the published image**
   `ghcr.io/vericto/vericto-proxy:4.5.1` instead of a locally built
   `vericto/proxy:local`. Building the image yourself is still documented, and the
