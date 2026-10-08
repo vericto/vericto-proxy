@@ -68,6 +68,19 @@ impl WireProtocol for MysqlProtocol {
         matches!(msg, RawClientMessage::Mysql(p) if p.seq == 0)
     }
 
+    /// A mask rewrite goes in the same command (COM_QUERY or COM_STMT_PREPARE),
+    /// same sequence id. A COM_STMT_PREPARE needs nothing else: the proxy keeps
+    /// no statement map, the server assigns the id of the rewritten statement in
+    /// its COM_STMT_PREPARE_OK (relayed unchanged), and the client's
+    /// COM_STMT_EXECUTE / COM_STMT_SEND_LONG_DATA name that id and bind the same
+    /// `?` parameters (checked by `evaluator::evaluate_message`).
+    fn with_query(&self, msg: &RawClientMessage, sql: &str) -> Option<RawClientMessage> {
+        let RawClientMessage::Mysql(p) = msg else {
+            return None;
+        };
+        p.with_sql(sql).map(RawClientMessage::Mysql)
+    }
+
     fn build_block_response(&self, ctx: &BlockContext) -> BlockResponse {
         let message = block_message(ctx.rule_code, ctx.ast_node_path, ctx.suggested_safe_query);
         // The reply to a command packet uses sequence id command_seq + 1.
@@ -153,6 +166,27 @@ mod tests {
             payload: vec![0x0e],
         });
         assert!(matches!(p.classify(&ping), Classified::PassThrough));
+    }
+
+    /// A mask rewrite travels in the same command: COM_QUERY stays COM_QUERY,
+    /// COM_STMT_PREPARE stays COM_STMT_PREPARE, same sequence id.
+    #[test]
+    fn with_query_carries_the_rewrite_in_the_same_command() {
+        let p = MysqlProtocol;
+        for tag in [COM_QUERY, COM_STMT_PREPARE] {
+            let Some(RawClientMessage::Mysql(m)) = p.with_query(
+                &pkt(tag, "SELECT email FROM t"),
+                "SELECT 'x' AS email FROM t",
+            ) else {
+                panic!("MySQL carries a rewrite");
+            };
+            assert_eq!(m.seq, 0);
+            assert_eq!(m.payload[0], tag);
+            assert_eq!(
+                m.extract_sql().as_deref(),
+                Some("SELECT 'x' AS email FROM t")
+            );
+        }
     }
 
     #[test]

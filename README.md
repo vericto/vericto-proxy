@@ -134,23 +134,38 @@ what the proxy decides is what the database receives:
 |---------|----------|-------|
 | `block` | The query never reaches the database: `ErrorResponse`, SQLSTATE 42501 | Never reaches the database: `ERR_Packet`, ERROR 1142 |
 | `flag`  | Forwarded as sent, recorded as FLAGGED | Same |
-| `mask`  | The proxy forwards a **rewritten** query in which the column is masked (`full`, `last4`, `email` or `hash`) under its own name, and never the original. The client receives masked values. | **Blocked** (ERROR 1142): there is no MySQL rewrite yet, and forwarding the value in clear would turn a mask into a flag. Tag the column `block` or `flag`, or leave it out of the projection. |
+| `mask`  | The proxy forwards a **rewritten** query in which the column is masked (`full`, `last4`, `email` or `hash`) under its own name, and never the original. The client receives masked values. | Same: the proxy forwards the rewritten query in the same `COM_QUERY` or `COM_STMT_PREPARE`, and never the original. |
 
-What holds under `mask` (Postgres):
+What holds under `mask`:
 
-- Both protocols are rewritten: a simple `Query` and the extended protocol's `Parse`.
-  On a `Parse` the statement name and the parameter types are kept, and `$n`
-  placeholders survive, so the client's `Bind`/`Execute` run unchanged.
-- A masked column becomes `text`. A computed expression over it (`lower(email)`,
-  `substring(card, 1, 4)`) is masked `full`, whatever the style.
+- Both protocols of each database are rewritten. Postgres: a simple `Query` and the
+  extended protocol's `Parse`; on a `Parse` the statement name and the parameter types
+  are kept, and `$n` placeholders survive, so the client's `Bind`/`Execute` run
+  unchanged. MySQL: `COM_QUERY` (keeping the `CLIENT_QUERY_ATTRIBUTES` prefix) and
+  `COM_STMT_PREPARE`. The `?` placeholders survive in the same order, so the
+  parameter count the server returns in `COM_STMT_PREPARE_OK` is the one the client
+  expects, and `COM_STMT_EXECUTE` / `COM_STMT_SEND_LONG_DATA` pass through untouched.
+  The proxy keeps no statement map: the client executes the id the server gave the
+  rewritten statement.
+- The MySQL masks use only functions present in MySQL 5.7 and 8.0, Aurora MySQL and
+  MariaDB, and give the same values as on Postgres (`a***@example.io`, `****4242`).
+  The rewrite is printed from the parsed statement, so comments and formatting are
+  not kept (string literals are). A query the engine cannot reproduce faithfully
+  (optimizer hints `/*+ … */`, `SQL_CALC_FOUND_ROWS` and the other SELECT modifiers,
+  bit literals) is blocked rather than rewritten. Rule evaluation on MySQL follows
+  MySQL's own reading of comments and string escapes; text the engine cannot read
+  with certainty is blocked by `VERICTO-086`, tags or not.
+- A masked column becomes `text` (a string on MySQL). A computed expression over it
+  (`lower(email)`, `substring(card, 1, 4)`) is masked `full`, whatever the style.
 - `SELECT *`, `t.*`, whole-row references (`row_to_json(t)`) and `COPY t TO` over a
   table with a masked or blocked column are blocked; list the columns. So are copies
   of a masked column into another table (`INSERT … SELECT`, `CREATE TABLE AS`), since
   masking them would change stored data.
 - **Fail-safe:** if anything about the rewrite does not hold together (no rewritten
-  query for a masked read, a rewrite for a dialect without one, a rewrite that drops a
-  `$n` the client will bind), the proxy blocks with `VERICTO-085`. It never forwards
-  the original instead.
+  query for a masked read, an empty rewrite or one with a NUL, a rewrite for a dialect
+  without one, a rewrite that drops a `$n` or changes the number of `?` the client
+  will bind), the proxy blocks with `VERICTO-085` and a message saying why (MySQL:
+  ERROR 1142). It never forwards the original instead.
 - `monitor_mode` never changes what runs: a would-be block or mask is forwarded as sent
   and recorded, as for every other rule.
 
@@ -161,7 +176,8 @@ parse errors behave as before.
 
 Every read of a tagged column is reported with rule code `VERICTO-085`, the tagged
 columns it touched and, for a mask, the rewritten query next to the original (both
-sanitized in sanitized telemetry mode). The two share the per-event query budget, so a
+sanitized in sanitized telemetry mode: Postgres text with libpg_query, MySQL text with
+the MySQL lexer, every literal and comment replaced). The two share the per-event query budget, so a
 masked event is no larger than any other.
 
 Known limits come from the engine, which works from the SQL alone: a view, function or
@@ -327,6 +343,12 @@ cargo fmt
 # Also run the sensitive-column tests against a real Postgres (each creates and
 # drops its own database; without the variable they are skipped)
 VERICTO_TEST_PG_URL=postgres://postgres:postgres@127.0.0.1:5432/postgres cargo test sensitive_tests
+
+# ... and a real MySQL (5.7 or 8.0), over COM_QUERY and prepared statements
+VERICTO_TEST_MYSQL_URL=mysql://root:secret@127.0.0.1:3306 cargo test sensitive_tests
+# for a MySQL that requires TLS, both hops use it: add
+#   VERICTO_TEST_MYSQL_SSLMODE=require \
+#   VERICTO_TEST_MYSQL_TLS_CERT=proxy-cert.pem VERICTO_TEST_MYSQL_TLS_KEY=proxy-key.pem
 ```
 
 ---

@@ -210,10 +210,12 @@ pub async fn intercept_client_to_server(
                         forward(server_write, &masked.encode()).await?;
                         continue;
                     }
-                    // Unreachable with the shipped protocols (`evaluate` already
-                    // refuses a rewrite for a dialect without one, and a Postgres
-                    // query message always carries it), so the telemetry event
-                    // above says FLAGGED; the block still wins.
+                    // Rare: `evaluate` already refuses a rewrite for a dialect
+                    // without one, and a Postgres query message always carries it.
+                    // A MySQL packet cannot when the rewrite would not fit one
+                    // packet, or a COM_QUERY's attributes prefix binds values the
+                    // proxy cannot frame. The telemetry event above then says
+                    // FLAGGED; the block still wins.
                     let ast_node_path = "SensitiveColumn > mask not enforceable by the proxy: \
                                          this wire protocol cannot carry the rewritten query";
                     tracing::error!(ast_node_path, "blocking a masked query");
