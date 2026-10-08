@@ -445,7 +445,9 @@ fn build_telemetry_event(
         severity,
         enforcement_action,
         violations,
-        parse_error,
+        parse_error: parse_error
+            .as_deref()
+            .map(crate::telemetry::truncate_reported_parse_error),
         latency_ms: Some(latency_us as f64 / 1000.0),
         client_ip: None,
         occurred_at: chrono::Utc::now().to_rfc3339(),
@@ -769,6 +771,24 @@ mod tests {
         assert_eq!(ev.status, "PARSE_ERROR");
         assert_eq!(ev.parse_error.as_deref(), Some("boom"));
         assert_eq!(ev.enforcement_action.as_deref(), Some("flag"));
+    }
+
+    #[test]
+    fn telemetry_parse_error_message_is_bounded() {
+        let decision = TcpDecision::Forward {
+            violations: Vec::new(),
+            observation: Some(Observation {
+                rule_code: "VERICTO-PARSE-ERROR".to_string(),
+                ast_node_path: "PARSE_ERROR: long".to_string(),
+                severity: Severity::Medium,
+                action: EnforcementAction::Flag,
+                parse_error: Some("x".repeat(10_000)),
+            }),
+        };
+        let ev = build_telemetry_event("db1", "@@@", Dialect::Postgres, &decision, 10);
+        let msg = ev.parse_error.expect("message kept");
+        assert!(msg.len() <= crate::telemetry::MAX_REPORTED_PARSE_ERROR_BYTES);
+        assert!(msg.starts_with("xxx"));
     }
 
     #[test]

@@ -67,6 +67,12 @@ of the 2026-10-04 vulnerability review.
   `ErrorResponse` with SQLSTATE 28000 and the connection closes before any upstream
   connection is opened, as the MySQL path already did. With `PROXY_TLS_MODE=disable`
   nothing changes.
+- **Parser messages reach the control plane.** Telemetry sent the parser's message
+  as `parse_error`, but `/ingest/events` reads `parse_error_message` and dropped the
+  unknown key, so a PARSE_ERROR event never carried its message. The field now goes
+  out as `parse_error_message`, cut to the API's 2048-byte cap so a long message
+  cannot get the whole batch rejected. Disk-spooled events written by an older build
+  still read back.
 
 ## [4.5.1] — 2026-10-05
 
