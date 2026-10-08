@@ -31,7 +31,17 @@ pub struct TelemetryEvent {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub enforcement_action: Option<String>,
     /// Parser error message for PARSE_ERROR events.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    ///
+    /// On the wire this is `parse_error_message`, the name `/ingest/events` reads.
+    /// It used to go out as `parse_error`, which the API's schema does not know and
+    /// silently dropped, so no parser message ever reached the dashboard. `alias`
+    /// keeps spool files written before the rename readable (`BufferMode::Disk`
+    /// reads its own output back). Bounded by [`truncate_reported_parse_error`].
+    #[serde(
+        rename = "parse_error_message",
+        alias = "parse_error",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub parse_error: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub latency_ms: Option<f64>,
@@ -187,6 +197,23 @@ pub fn truncate_reported_query(sql: &str) -> String {
     out
 }
 
+/// Maximum `parse_error_message` shipped per event, in bytes: the ingest schema's
+/// own cap (2048). A longer value fails validation and the API rejects the whole
+/// batch, so it is cut here. Bytes bound the schema's UTF-16 length from above.
+pub const MAX_REPORTED_PARSE_ERROR_BYTES: usize = 2048;
+
+/// Bound a parser message to [`MAX_REPORTED_PARSE_ERROR_BYTES`], marking the cut.
+pub fn truncate_reported_parse_error(msg: &str) -> String {
+    if msg.len() <= MAX_REPORTED_PARSE_ERROR_BYTES {
+        return msg.to_string();
+    }
+    let cut = floor_char_boundary(
+        msg,
+        MAX_REPORTED_PARSE_ERROR_BYTES - TRUNCATION_MARKER.len(),
+    );
+    format!("{}{TRUNCATION_MARKER}", &msg[..cut])
+}
+
 pub use queue::{EventQueue, new_queue};
 pub use reporter::Reporter;
 
@@ -251,5 +278,53 @@ mod tests {
         assert!(out.len() <= MAX_REPORTED_QUERY_BYTES);
         let body = out.strip_suffix(TRUNCATION_MARKER).unwrap();
         assert!(body.chars().all(|c| c == '🙂'));
+    }
+
+    fn parse_error_event(msg: &str) -> TelemetryEvent {
+        TelemetryEvent {
+            event_id: "e-1".to_string(),
+            database_id: "db-1".to_string(),
+            query_text: "SELEC 1".to_string(),
+            dialect: "postgres".to_string(),
+            status: "PARSE_ERROR".to_string(),
+            rule_code: Some("VERICTO-PARSE-ERROR".to_string()),
+            ast_node_path: None,
+            severity: Some("medium".to_string()),
+            enforcement_action: Some("flag".to_string()),
+            parse_error: Some(msg.to_string()),
+            latency_ms: Some(0.1),
+            client_ip: None,
+            occurred_at: "2026-10-07T00:00:00Z".to_string(),
+            violations: Vec::new(),
+        }
+    }
+
+    /// `/ingest/events` reads `parse_error_message`; any other key is dropped by
+    /// its schema, which is how every parser message used to be lost.
+    #[test]
+    fn parser_message_goes_out_as_parse_error_message() {
+        let json = serde_json::to_value(parse_error_event("syntax error")).unwrap();
+        assert_eq!(json["parse_error_message"], "syntax error");
+        assert!(json.get("parse_error").is_none());
+    }
+
+    /// A disk spool written by the previous build still carries `parse_error`.
+    #[test]
+    fn a_spooled_event_with_the_old_key_still_reads_back() {
+        let mut json = serde_json::to_value(parse_error_event("old")).unwrap();
+        let obj = json.as_object_mut().unwrap();
+        let msg = obj.remove("parse_error_message").unwrap();
+        obj.insert("parse_error".to_string(), msg);
+        let ev: TelemetryEvent = serde_json::from_value(json).unwrap();
+        assert_eq!(ev.parse_error.as_deref(), Some("old"));
+    }
+
+    #[test]
+    fn parser_message_is_bounded_by_the_ingest_schema() {
+        let short = "syntax error at or near \"SELEC\"";
+        assert_eq!(truncate_reported_parse_error(short), short);
+        let out = truncate_reported_parse_error(&"数".repeat(MAX_REPORTED_PARSE_ERROR_BYTES));
+        assert!(out.len() <= MAX_REPORTED_PARSE_ERROR_BYTES);
+        assert!(out.ends_with(TRUNCATION_MARKER));
     }
 }
