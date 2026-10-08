@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [4.6.0] — 2026-10-08
+
+Sensitive Column Protection: the proxy enforces the database's column tags on the
+wire. It blocks the column, flags it, or on Postgres forwards a rewritten query that
+masks it. It needs vericto-engine v3.6.0. A database without tags is evaluated
+exactly as before. The release also ships the changes made since 4.5.1 and listed
+below: `PROXY_TLS_MODE=require` refuses plaintext Postgres clients, parser messages
+reach the control plane, and `rustls-pemfile` is gone.
+
 ### Added
 
 - **Sensitive columns are enforced on the wire (VERICTO-085, engine v3.6.0).** A
@@ -786,7 +795,8 @@ the service now targets the rebranded engine.
 - Optional control-plane link: ruleset hot-sync and telemetry reporting.
 - `/health` and `/metrics` (p50/p99 latency) endpoints.
 
-[Unreleased]: https://github.com/vericto/vericto-proxy/compare/v4.5.1...HEAD
+[Unreleased]: https://github.com/vericto/vericto-proxy/compare/v4.6.0...HEAD
+[4.6.0]: https://github.com/vericto/vericto-proxy/compare/v4.5.1...v4.6.0
 [4.5.1]: https://github.com/vericto/vericto-proxy/compare/v4.5.0...v4.5.1
 [4.5.0]: https://github.com/vericto/vericto-proxy/compare/v4.4.2...v4.5.0
 [4.4.2]: https://github.com/vericto/vericto-proxy/compare/v4.4.1...v4.4.2
