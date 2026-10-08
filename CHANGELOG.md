@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [4.7.0] — 2026-10-08
+
+MySQL masks. A `mask` tag on MySQL used to block every read of the column with
+ERROR 1142; with vericto-engine v3.7.0 the proxy forwards the engine's rewritten
+query instead, so a MySQL client receives masked values, as a Postgres one already
+did. A database without tags is evaluated exactly as before.
+
 ### Added
 
 - **`mask` on MySQL (VERICTO-085, engine v3.7.0).** When the engine returns a
@@ -860,7 +867,8 @@ the service now targets the rebranded engine.
 - Optional control-plane link: ruleset hot-sync and telemetry reporting.
 - `/health` and `/metrics` (p50/p99 latency) endpoints.
 
-[Unreleased]: https://github.com/vericto/vericto-proxy/compare/v4.6.0...HEAD
+[Unreleased]: https://github.com/vericto/vericto-proxy/compare/v4.7.0...HEAD
+[4.7.0]: https://github.com/vericto/vericto-proxy/compare/v4.6.0...v4.7.0
 [4.6.0]: https://github.com/vericto/vericto-proxy/compare/v4.5.1...v4.6.0
 [4.5.1]: https://github.com/vericto/vericto-proxy/compare/v4.5.0...v4.5.1
 [4.5.0]: https://github.com/vericto/vericto-proxy/compare/v4.4.2...v4.5.0
