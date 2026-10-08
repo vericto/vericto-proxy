@@ -79,7 +79,45 @@ pub struct TelemetryEvent {
     /// outlives the task.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub violations: Vec<ReportedViolationPayload>,
+    /// The SQL the proxy sent to the database INSTEAD of `query_text`, when a
+    /// `mask` tag applied (Sensitive Column Protection). The audit keeps both:
+    /// the original says what the agent asked for, this says what ran. Sanitized
+    /// like `query_text` in sanitized mode, and bounded together with it (see
+    /// [`truncate_reported_pair`]). Omitted when nothing was rewritten.
+    ///
+    /// `default` for the same reason as `violations`: the disk spool reads its
+    /// own output back, and an event written without the key must still parse.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rewritten_query: Option<String>,
+    /// The tagged columns the query read, as the engine identifies them (the
+    /// tag's names, not the query's spelling). Omitted when none was read, so an
+    /// event from a database without tags is exactly what it was before.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sensitive_columns: Vec<SensitiveColumnPayload>,
 }
+
+/// One tagged column a query read, shaped for the ingest schema:
+/// `{schema, table, column, policy}`, `schema` null when the tag has none.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SensitiveColumnPayload {
+    pub schema: Option<String>,
+    pub table: String,
+    pub column: String,
+    /// "block" | "flag" | "mask": the tag's policy.
+    pub policy: String,
+}
+
+/// Largest number of touched columns reported per event: the ingest schema's
+/// own bound (`.max(64)`). One over it fails validation and the API rejects the
+/// whole batch, so the list is cut here. The engine sorts it by name; a query
+/// reading 64 tagged columns at once is not expected, and the decision never
+/// depends on this list.
+pub const MAX_REPORTED_SENSITIVE_COLUMNS: usize = 64;
+
+/// Maximum `suggested_safe_query` shipped per violation, in bytes: the ingest
+/// schema's cap (2048). A VERICTO-085 suggestion can be a whole rewritten
+/// statement, so it is cut here rather than letting it reject the batch.
+pub const MAX_REPORTED_SUGGESTION_BYTES: usize = 2048;
 
 /// One violated rule, shaped for the API's ingest schema.
 ///
@@ -197,6 +235,46 @@ pub fn truncate_reported_query(sql: &str) -> String {
     out
 }
 
+/// Bound the original and the rewritten SQL of a masked query together, to
+/// [`MAX_REPORTED_QUERY_BYTES`] for the pair.
+///
+/// Not each to its own limit: that would double what a masked event costs, and
+/// the per-event budget is what keeps a default batch under the API's 1 MiB body
+/// limit (see [`MAX_REPORTED_QUERY_BYTES`] and the compile-time check under it).
+/// When both do not fit, a text shorter than half the budget is kept whole and
+/// the other gets the rest; otherwise each gets half.
+pub fn truncate_reported_pair(original: &str, rewritten: &str) -> (String, String) {
+    if original.len() + rewritten.len() <= MAX_REPORTED_QUERY_BYTES {
+        return (original.to_string(), rewritten.to_string());
+    }
+    let half = MAX_REPORTED_QUERY_BYTES / 2;
+    let (o_budget, r_budget) = if original.len() <= half {
+        (original.len(), MAX_REPORTED_QUERY_BYTES - original.len())
+    } else if rewritten.len() <= half {
+        (MAX_REPORTED_QUERY_BYTES - rewritten.len(), rewritten.len())
+    } else {
+        (half, MAX_REPORTED_QUERY_BYTES - half)
+    };
+    (
+        truncate_to(original, o_budget),
+        truncate_to(rewritten, r_budget),
+    )
+}
+
+/// `s` cut to at most `max` bytes on a character boundary, marked when cut.
+fn truncate_to(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        return s.to_string();
+    }
+    let cut = floor_char_boundary(s, max.saturating_sub(TRUNCATION_MARKER.len()));
+    format!("{}{TRUNCATION_MARKER}", &s[..cut])
+}
+
+/// Bound a violation's suggestion to [`MAX_REPORTED_SUGGESTION_BYTES`].
+pub fn truncate_reported_suggestion(s: &str) -> String {
+    truncate_to(s, MAX_REPORTED_SUGGESTION_BYTES)
+}
+
 /// Maximum `parse_error_message` shipped per event, in bytes: the ingest schema's
 /// own cap (2048). A longer value fails validation and the API rejects the whole
 /// batch, so it is cut here. Bytes bound the schema's UTF-16 length from above.
@@ -296,6 +374,8 @@ mod tests {
             client_ip: None,
             occurred_at: "2026-10-07T00:00:00Z".to_string(),
             violations: Vec::new(),
+            rewritten_query: None,
+            sensitive_columns: Vec::new(),
         }
     }
 
@@ -317,6 +397,65 @@ mod tests {
         obj.insert("parse_error".to_string(), msg);
         let ev: TelemetryEvent = serde_json::from_value(json).unwrap();
         assert_eq!(ev.parse_error.as_deref(), Some("old"));
+    }
+
+    #[test]
+    fn a_short_pair_is_reported_verbatim() {
+        let (o, r) = truncate_reported_pair("SELECT email FROM t", "SELECT 'x' AS email FROM t");
+        assert_eq!(o, "SELECT email FROM t");
+        assert_eq!(r, "SELECT 'x' AS email FROM t");
+    }
+
+    /// The pair shares one budget, so a masked event costs no more than any other.
+    #[test]
+    fn a_long_pair_fits_one_query_budget() {
+        let long = "a".repeat(MAX_REPORTED_QUERY_BYTES);
+        let (o, r) = truncate_reported_pair(&long, &long);
+        assert!(o.len() + r.len() <= MAX_REPORTED_QUERY_BYTES);
+        assert!(o.ends_with(TRUNCATION_MARKER) && r.ends_with(TRUNCATION_MARKER));
+
+        // A short side is kept whole; the long one gets the rest.
+        let (o, r) = truncate_reported_pair("SELECT 1", &long);
+        assert_eq!(o, "SELECT 1");
+        assert!(o.len() + r.len() <= MAX_REPORTED_QUERY_BYTES);
+        let (o, r) = truncate_reported_pair(&"数".repeat(MAX_REPORTED_QUERY_BYTES), "SELECT 2");
+        assert_eq!(r, "SELECT 2");
+        assert!(o.len() + r.len() <= MAX_REPORTED_QUERY_BYTES);
+    }
+
+    #[test]
+    fn a_suggestion_is_bounded_by_the_ingest_schema() {
+        assert_eq!(truncate_reported_suggestion("LIMIT 100"), "LIMIT 100");
+        let out = truncate_reported_suggestion(&"x".repeat(10_000));
+        assert!(out.len() <= MAX_REPORTED_SUGGESTION_BYTES);
+        assert!(out.ends_with(TRUNCATION_MARKER));
+    }
+
+    /// The masked-query fields are omitted when unused, and an event spooled
+    /// before they existed still reads back.
+    #[test]
+    fn sensitive_fields_are_optional_both_ways() {
+        let json = serde_json::to_value(parse_error_event("x")).unwrap();
+        assert!(json.get("rewritten_query").is_none());
+        assert!(json.get("sensitive_columns").is_none());
+        let ev: TelemetryEvent = serde_json::from_value(json).unwrap();
+        assert!(ev.rewritten_query.is_none() && ev.sensitive_columns.is_empty());
+    }
+
+    #[test]
+    fn a_touched_column_has_the_ingest_shape() {
+        let mut ev = parse_error_event("x");
+        ev.sensitive_columns.push(SensitiveColumnPayload {
+            schema: None,
+            table: "customers".into(),
+            column: "email".into(),
+            policy: "mask".into(),
+        });
+        let json = serde_json::to_value(&ev).unwrap();
+        assert_eq!(
+            json["sensitive_columns"],
+            serde_json::json!([{"schema": null, "table": "customers", "column": "email", "policy": "mask"}])
+        );
     }
 
     #[test]

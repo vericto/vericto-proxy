@@ -141,6 +141,9 @@ pub fn oversized_decision(
             // and there is nothing to enumerate. The oversize code itself travels
             // in `rule_code`, which the API persists on its own.
             violations: Vec::new(),
+            // Never parsed, so never rewritten and no column analysed.
+            rewritten_query: None,
+            sensitive_columns: Vec::new(),
         }
     } else {
         TcpDecision::Block {
@@ -153,6 +156,7 @@ pub fn oversized_decision(
             severity: Severity::High,
             // Same as above: rejected before parsing, so no evaluated rules.
             violations: Vec::new(),
+            sensitive_columns: Vec::new(),
         }
     }
 }

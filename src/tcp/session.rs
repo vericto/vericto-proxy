@@ -4,7 +4,9 @@
 //! framing/classification/block-bytes are abstracted behind `WireProtocol`:
 //!   read message → classify → (if SQL) evaluate with the protocol's dialect →
 //!   on Block, send the native rejection and (protocol-permitting) swallow the
-//!   rest of the sequence → otherwise forward upstream unchanged.
+//!   rest of the sequence → on a mask, forward the engine's rewritten SQL in
+//!   place of the original (never the original) → otherwise forward upstream
+//!   unchanged.
 //!
 //! Evaluation, telemetry and enforcement are shared here (no per-protocol
 //! duplication). Startup negotiation and upstream connect differ per protocol
@@ -19,7 +21,7 @@ use tokio::sync::Mutex;
 
 use crate::tcp::client_tls::{ClientRead, ClientWrite};
 use crate::tcp::codec::build_ready_for_query;
-use crate::tcp::evaluator::{TcpDecision, evaluate};
+use crate::tcp::evaluator::{SENSITIVE_RULE_CODE, TcpDecision, evaluate_message};
 use crate::tcp::postgres::PgProxyConfig;
 use crate::tcp::protocol::{BlockContext, Classified, RawClientMessage, WireProtocol};
 
@@ -157,7 +159,7 @@ pub async fn intercept_client_to_server(
                     let dialect = proto.dialect();
                     let config = Arc::clone(config);
                     tokio::task::spawn_blocking(move || {
-                        let decision = evaluate(&sql, dialect, &rules, &policy);
+                        let decision = evaluate_message(&sql, dialect, kind, &rules, &policy);
                         let eval_us = eval_start.elapsed().as_micros();
                         // Telemetry before any forwarding (R5.7).
                         crate::tcp::postgres::report_telemetry(
@@ -190,6 +192,44 @@ pub async fn intercept_client_to_server(
                         skip_until_sync = true;
                     }
                     continue; // query NOT forwarded upstream
+                }
+
+                // Masked → forward the rewritten SQL in the same message (same
+                // statement name and parameter types on a Parse). Never the
+                // original: if this protocol cannot carry the rewrite, block.
+                if let TcpDecision::Forward {
+                    rewritten_query: Some(rewritten),
+                    ..
+                } = &decision
+                {
+                    if let Some(masked) = proto.with_query(&msg, rewritten) {
+                        tracing::info!(
+                            query_preview = %sql.chars().take(80).collect::<String>(),
+                            "Query MASKED at TCP proxy; forwarding the rewritten SQL"
+                        );
+                        forward(server_write, &masked.encode()).await?;
+                        continue;
+                    }
+                    // Unreachable with the shipped protocols (`evaluate` already
+                    // refuses a rewrite for a dialect without one, and a Postgres
+                    // query message always carries it), so the telemetry event
+                    // above says FLAGGED; the block still wins.
+                    let ast_node_path = "SensitiveColumn > mask not enforceable by the proxy: \
+                                         this wire protocol cannot carry the rewritten query";
+                    tracing::error!(ast_node_path, "blocking a masked query");
+                    crate::tcp::postgres::log_block(&sql, SENSITIVE_RULE_CODE, ast_node_path);
+                    let block = proto.build_block_response(&BlockContext {
+                        rule_code: SENSITIVE_RULE_CODE,
+                        ast_node_path,
+                        suggested_safe_query: None,
+                        kind,
+                        client_seq: message_seq(&msg),
+                    });
+                    send_to_client(client_write, &block.bytes).await?;
+                    if block.skip_until_sync {
+                        skip_until_sync = true;
+                    }
+                    continue;
                 }
 
                 // Allowed / flagged / monitored → forward unchanged.

@@ -264,6 +264,8 @@ mod tests {
             client_ip: None,
             occurred_at: format!("2026-10-01T03:52:5{}.000000000+00:00", id.len() % 10),
             violations: Vec::new(),
+            rewritten_query: None,
+            sensitive_columns: Vec::new(),
         }
     }
 

@@ -9,6 +9,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Sensitive columns are enforced on the wire (VERICTO-085, engine v3.6.0).** A
+  database's column tags now arrive in `/sync/rules` as `sensitive_columns`, next to
+  `rules` and `policy`, and go into the `EnforcementPolicy` every query is evaluated
+  with. They are kept in the live `ArcSwap` snapshot and in the last-good rules cache
+  like the rest of the response, so a restart during a control-plane outage keeps
+  enforcing them. An API that does not send the field gives exactly the policy the
+  proxy built before.
+
+  What a tag does on each protocol:
+  - `block`: the query never reaches the database (Postgres `ErrorResponse` 42501,
+    MySQL `ERR_Packet` 1142), on the simple and the extended protocol alike.
+  - `flag`: forwarded as sent and reported as FLAGGED.
+  - `mask` on Postgres: the proxy forwards the engine's **rewritten** query instead of
+    the original, so the client receives masked values. A simple `Query` and an
+    extended-protocol `Parse` are both rewritten in place. On a `Parse` the statement
+    name and the parameter type OIDs are kept byte for byte and the `$n` placeholders
+    survive, so the client's `Bind` and `Execute` work unchanged.
+  - `mask` on MySQL: **blocked**. The engine has no MySQL rewrite yet, and forwarding
+    the value in clear would quietly turn "never in clear" into "tell me afterwards".
+
+  The proxy does not take the rewrite on trust. A masked read with no rewritten query,
+  a rewrite for a dialect that has none, an empty one or one with a NUL, or a rewrite
+  that drops a `$n` the client is going to bind (a computed expression over a
+  parameter is masked whole, so `substring(card, $1, 4)` loses its `$1`), is blocked
+  with `VERICTO-085` and a message saying why. In each of those cases the only thing
+  left to forward is the unmasked original. `monitor_mode` still never changes what
+  runs: there, a would-be mask is forwarded as sent and only reported.
+
+  Telemetry carries what the audit needs, in the shape `/ingest/events` validates:
+  `rule_code` `VERICTO-085`, `sensitive_columns`
+  (`[{schema, table, column, policy}]`, at most 64, the schema's bound), and, for a
+  mask, `rewritten_query` next to the original `query_text`. In sanitized mode the
+  rewritten query is normalized like the original, and so is a VERICTO-085 suggestion,
+  which under `monitor_mode` is the would-be rewrite with the query's literals in it.
+  The original and the rewrite share the 8 KiB query budget instead of taking 8 KiB
+  each. That budget is what keeps a default batch of 100 events under the API's 1 MiB
+  body limit, and two full texts per event would break it at 1.6 MiB. Events and spool
+  files without the new fields read and serialize exactly as before.
+
 - **A way to try the proxy with Docker alone.** The README's new "Try it with
   Docker" section starts a throwaway Postgres and the published image, and shows a
   `DELETE` without `WHERE` being blocked and one with `WHERE` going through. It needs
@@ -16,6 +55,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **With a `block` or `mask` tag configured, a query that does not parse is blocked**,
+  whatever the workspace's parse-error policy says. The proxy now branches on the
+  engine's `EnforcementPolicy::effective_parse_error()` instead of the raw
+  `parse_error` field. Without that, syntax the parser rejects and the database
+  accepts would be a way around a tag: MySQL `HANDLER customers READ` and
+  `PREPARE s FROM '…'` are two such cases. With no tags, or with only `flag` tags,
+  parse errors behave as before.
 - **vericto-engine v3.6.0** (from v3.5.3). Additive: `EnforcementPolicy` gains
   `sensitive_columns` and `EvaluationOutcome` gains `rewritten_query` and
   `sensitive_columns`. With no tags the engine skips the analysis and every decision
@@ -59,6 +105,14 @@ of the 2026-10-04 vulnerability review.
   covers the same case: building against a local vericto-engine checkout.
 
 ### Fixed
+
+- **A rule suggestion longer than 2048 bytes no longer loses a whole telemetry
+  batch.** The ingest schema caps `violations[].suggested_safe_query` at 2048, and the
+  proxy sent the suggestion uncut. One long suggestion failed validation, the API
+  rejected the batch with a 400, and the reporter dropped every event in it as a
+  permanent failure. Suggestions are now cut to 2048 bytes and marked. A VERICTO-085
+  suggestion that repeats the rewritten query is not sent at all, since the event
+  already carries that query.
 
 - **`VERICTO_MAX_QUERY_BYTES` and `VERICTO_HEALTHZ_PORT` are documented.** The proxy
   reads both, but neither `README.md` nor `.env.example` mentioned them. The README now
