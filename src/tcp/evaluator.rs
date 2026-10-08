@@ -732,16 +732,21 @@ mod tests {
         assert!(parameter_mismatch("SELECT 1", "SELECT $1").is_some());
     }
 
-    /// Simple queries have no Bind, so the parameter check is Parse-only.
+    /// A masked expression over a bind parameter keeps the parameter (engine
+    /// 3.6.1), so a Parse is forwarded rewritten, like a simple query. The
+    /// parameter check stays as a safety net (`parameter_mismatch` above).
     #[test]
-    fn the_parameter_check_applies_to_parse_only() {
+    fn a_masked_parameter_is_kept_on_parse_and_simple_query() {
         let sql = "SELECT substring(email, $1, 4) FROM customers LIMIT 1";
         let rules = default_ruleset();
         let policy = mask_email();
-        assert!(matches!(
-            evaluate_message(sql, Dialect::Postgres, QueryKind::Prepared, &rules, &policy),
-            TcpDecision::Block { .. }
-        ));
+        match evaluate_message(sql, Dialect::Postgres, QueryKind::Prepared, &rules, &policy) {
+            TcpDecision::Forward {
+                rewritten_query: Some(q),
+                ..
+            } => assert!(q.contains("$1"), "{q}"),
+            _ => panic!("expected a rewritten Forward"),
+        }
         assert!(matches!(
             evaluate_message(sql, Dialect::Postgres, QueryKind::Simple, &rules, &policy),
             TcpDecision::Forward {
