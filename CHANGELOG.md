@@ -61,6 +61,12 @@ of the 2026-10-04 vulnerability review.
   the health-check port opens and what a probe checks.
 - `Dockerfile.local` no longer points to a helper script that is not in this
   repository.
+- **`PROXY_TLS_MODE=require` refuses plaintext PostgreSQL clients.** A client that
+  skipped `SSLRequest` and sent its StartupMessage in plaintext (`sslmode=disable`)
+  was accepted and relayed to the database unencrypted. It now gets a native
+  `ErrorResponse` with SQLSTATE 28000 and the connection closes before any upstream
+  connection is opened, as the MySQL path already did. With `PROXY_TLS_MODE=disable`
+  nothing changes.
 
 ## [4.5.1] — 2026-10-05
 
