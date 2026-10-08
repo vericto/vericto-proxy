@@ -126,6 +126,14 @@ pub trait WireProtocol: Send + Sync {
 
     /// Builds the native rejection response for a blocked query.
     fn build_block_response(&self, ctx: &BlockContext) -> BlockResponse;
+
+    /// The same query message carrying `sql` instead (a mask rewrite), with
+    /// everything else about it unchanged. `None` when this protocol cannot
+    /// carry a rewrite: the session then blocks, because the only other thing it
+    /// could forward is the unmasked original. Default: `None`.
+    fn with_query(&self, _msg: &RawClientMessage, _sql: &str) -> Option<RawClientMessage> {
+        None
+    }
 }
 
 // Protocol selection lives in `main.rs` (it picks the listener — run_pg_proxy vs

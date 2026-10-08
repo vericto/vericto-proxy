@@ -163,6 +163,37 @@ pub fn extract_parse_query(msg: &PgMessage) -> Option<String> {
     cstring_at(&msg.body, after_name).map(|(s, _)| s)
 }
 
+/// The same Simple Query ('Q') or Parse ('P') message carrying `sql` instead of
+/// its original SQL. For a Parse the statement name and everything after the
+/// query (the parameter type OIDs) are kept byte for byte, so the client's
+/// later Bind/Describe/Execute still address the statement it prepared.
+///
+/// `None` when `msg` is neither, is malformed, or `sql` cannot travel as a
+/// cstring (an embedded NUL would end it early and send a truncated query).
+pub fn with_replaced_query(msg: &PgMessage, sql: &str) -> Option<PgMessage> {
+    if sql.as_bytes().contains(&0) {
+        return None;
+    }
+    let mut body = Vec::with_capacity(msg.body.len() + sql.len());
+    let rest = match msg.tag {
+        b'Q' => {
+            cstring_at(&msg.body, 0)?;
+            &[][..]
+        }
+        b'P' => {
+            let (_, after_name) = cstring_at(&msg.body, 0)?;
+            let (_, after_query) = cstring_at(&msg.body, after_name)?;
+            body.extend_from_slice(&msg.body[..after_name]);
+            &msg.body[after_query..]
+        }
+        _ => return None,
+    };
+    body.extend_from_slice(sql.as_bytes());
+    body.push(0);
+    body.extend_from_slice(rest);
+    Some(PgMessage { tag: msg.tag, body })
+}
+
 /// Reads a cstring (NUL-terminated) from `offset`. Returns (string, next_offset).
 fn cstring_at(buf: &[u8], offset: usize) -> Option<(String, usize)> {
     if offset > buf.len() {
@@ -246,6 +277,45 @@ mod tests {
     fn extract_parse_query_unnamed_statement() {
         let msg = parse_msg("", "SELECT 1");
         assert_eq!(extract_parse_query(&msg).as_deref(), Some("SELECT 1"));
+    }
+
+    #[test]
+    fn replaced_simple_query_carries_only_the_new_sql() {
+        let msg =
+            with_replaced_query(&simple_query_msg("SELECT email FROM t"), "SELECT 'x'").unwrap();
+        assert_eq!(msg.tag, b'Q');
+        assert_eq!(msg.body, b"SELECT 'x'\0");
+    }
+
+    #[test]
+    fn replaced_parse_keeps_the_name_and_the_parameter_types() {
+        let mut original = parse_msg("stmt_9", "SELECT card FROM t WHERE id = $1");
+        // Replace the "0 types" tail with two explicit OIDs.
+        original.body.truncate(original.body.len() - 2);
+        original.body.extend_from_slice(&2i16.to_be_bytes());
+        original.body.extend_from_slice(&23i32.to_be_bytes());
+        original.body.extend_from_slice(&25i32.to_be_bytes());
+        let tail = original.body[original.body.len() - 10..].to_vec();
+
+        let msg =
+            with_replaced_query(&original, "SELECT 'x' AS card FROM t WHERE id = $1").unwrap();
+        assert_eq!(msg.tag, b'P');
+        assert_eq!(
+            extract_parse_query(&msg).as_deref(),
+            Some("SELECT 'x' AS card FROM t WHERE id = $1")
+        );
+        assert!(msg.body.starts_with(b"stmt_9\0"));
+        assert_eq!(&msg.body[msg.body.len() - 10..], &tail[..]);
+    }
+
+    #[test]
+    fn replaced_query_refuses_a_nul_and_other_messages() {
+        assert!(with_replaced_query(&simple_query_msg("SELECT 1"), "SELECT 1\0; DROP").is_none());
+        let sync = PgMessage {
+            tag: b'S',
+            body: Vec::new(),
+        };
+        assert!(with_replaced_query(&sync, "SELECT 1").is_none());
     }
 
     #[test]

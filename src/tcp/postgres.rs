@@ -334,9 +334,6 @@ fn action_str(action: EnforcementAction) -> &'static str {
     }
 }
 
-/// Builds a telemetry event from an evaluation decision. Pure (no I/O) so it can
-/// be unit-tested. Returns `None` only when there is nothing to report (never,
-/// currently — every decision maps to a status).
 /// Canonical lowercase name for a dialect, as expected by the control plane
 /// (and accepted back by `Dialect::parse_dialect`). Reported verbatim in
 /// telemetry so the dashboard reflects the wire protocol the proxy is fronting.
@@ -349,6 +346,8 @@ fn dialect_name(dialect: Dialect) -> &'static str {
     }
 }
 
+/// [`build_event`] in raw mode, for the tests that only exercise the mapping.
+#[cfg(test)]
 fn build_telemetry_event(
     database_id: &str,
     sql: &str,
@@ -356,6 +355,47 @@ fn build_telemetry_event(
     decision: &TcpDecision,
     latency_us: u128,
 ) -> crate::telemetry::TelemetryEvent {
+    build_event(
+        database_id,
+        sql,
+        dialect,
+        decision,
+        latency_us,
+        crate::tcp::rules_sync::TelemetryQueryMode::Raw,
+    )
+}
+
+/// Builds a telemetry event from an evaluation decision. Pure (no I/O) so it can
+/// be unit-tested.
+///
+/// In sanitized `mode` every SQL text that leaves is normalized first: the
+/// query, the rewritten query of a mask, and a VERICTO-085 suggestion (which
+/// under `monitor_mode` is the would-be rewrite). Sanitizing happens before the
+/// size cut, because a cut statement no longer parses and would only ever be
+/// reported as redacted.
+fn build_event(
+    database_id: &str,
+    sql: &str,
+    dialect: Dialect,
+    decision: &TcpDecision,
+    latency_us: u128,
+    mode: crate::tcp::rules_sync::TelemetryQueryMode,
+) -> crate::telemetry::TelemetryEvent {
+    use crate::tcp::evaluator::SENSITIVE_RULE_CODE;
+    use crate::tcp::rules_sync::TelemetryQueryMode;
+
+    // Privacy: when the workspace policy selects "sanitized", normalize literals
+    // to placeholders before any query text leaves the customer network. Rule
+    // evaluation already happened on the full query — this only affects reporting.
+    let sanitized = mode == TelemetryQueryMode::Sanitized;
+    let reported = |text: &str| -> String {
+        if sanitized {
+            sanitize_query(text)
+        } else {
+            text.to_string()
+        }
+    };
+
     let mut severity: Option<String> = None;
     let mut enforcement_action: Option<String> = None;
     let mut parse_error: Option<String> = None;
@@ -413,31 +453,80 @@ fn build_telemetry_event(
         }
     };
 
+    let (violations, touched, rewritten) = match decision {
+        TcpDecision::Forward {
+            violations,
+            sensitive_columns,
+            rewritten_query,
+            ..
+        } => (violations, sensitive_columns, rewritten_query.as_deref()),
+        TcpDecision::Block {
+            violations,
+            sensitive_columns,
+            ..
+        } => (violations, sensitive_columns, None),
+    };
+
     // The full violation set, capped and mapped to the wire shape. Taken from the
     // decision rather than rebuilt from `rule_code`: the engine's ordering is the
     // contract that makes entry 0 the winner, and re-deriving it here could
     // disagree with the decision the proxy already acted on.
-    let violations: Vec<crate::telemetry::ReportedViolationPayload> = match decision {
-        TcpDecision::Forward { violations, .. } | TcpDecision::Block { violations, .. } => {
-            violations
-                .iter()
-                .take(crate::telemetry::MAX_REPORTED_VIOLATIONS)
-                .map(|v| crate::telemetry::ReportedViolationPayload {
-                    rule_code: v.rule_code.clone(),
-                    severity: v.severity.as_str().to_string(),
-                    enforcement_action: action_str(v.action).to_string(),
-                    ast_node_path: Some(v.ast_node_path.clone()),
-                    suggested_safe_query: v.suggested_safe_query.clone(),
-                    estimated_rows_affected: v.estimated_rows_affected,
-                })
-                .collect()
+    let violations: Vec<crate::telemetry::ReportedViolationPayload> = violations
+        .iter()
+        .take(crate::telemetry::MAX_REPORTED_VIOLATIONS)
+        .map(|v| {
+            let sensitive = v.rule_code == SENSITIVE_RULE_CODE;
+            let suggestion = v.suggested_safe_query.as_deref().and_then(|s| {
+                if sensitive && Some(s) == rewritten {
+                    // A successful mask repeats the rewritten SQL here; the event
+                    // already carries it in `rewritten_query`.
+                    None
+                } else if sensitive && sanitized {
+                    Some(sanitize_suggestion(s))
+                } else {
+                    Some(s.to_string())
+                }
+            });
+            crate::telemetry::ReportedViolationPayload {
+                rule_code: v.rule_code.clone(),
+                severity: v.severity.as_str().to_string(),
+                enforcement_action: action_str(v.action).to_string(),
+                ast_node_path: Some(v.ast_node_path.clone()),
+                suggested_safe_query: suggestion
+                    .as_deref()
+                    .map(crate::telemetry::truncate_reported_suggestion),
+                estimated_rows_affected: v.estimated_rows_affected,
+            }
+        })
+        .collect();
+
+    let sensitive_columns = touched
+        .iter()
+        .take(crate::telemetry::MAX_REPORTED_SENSITIVE_COLUMNS)
+        .map(|c| crate::telemetry::SensitiveColumnPayload {
+            schema: c.schema.clone(),
+            table: c.table.clone(),
+            column: c.column.clone(),
+            policy: c.policy.as_str().to_string(),
+        })
+        .collect();
+
+    let reported_sql = reported(sql);
+    let (query_text, rewritten_query) = match rewritten {
+        Some(r) => {
+            let (o, r) = crate::telemetry::truncate_reported_pair(&reported_sql, &reported(r));
+            (o, Some(r))
         }
+        None => (
+            crate::telemetry::truncate_reported_query(&reported_sql),
+            None,
+        ),
     };
 
     crate::telemetry::TelemetryEvent {
         event_id: uuid::Uuid::new_v4().to_string(),
         database_id: database_id.to_string(),
-        query_text: crate::telemetry::truncate_reported_query(sql),
+        query_text,
         dialect: dialect_name(dialect).to_string(),
         status,
         rule_code,
@@ -451,6 +540,8 @@ fn build_telemetry_event(
         latency_ms: Some(latency_us as f64 / 1000.0),
         client_ip: None,
         occurred_at: chrono::Utc::now().to_rfc3339(),
+        rewritten_query,
+        sensitive_columns,
     }
 }
 
@@ -463,28 +554,31 @@ pub(crate) fn report_telemetry(
     decision: &TcpDecision,
     latency_us: u128,
 ) {
-    use crate::tcp::rules_sync::TelemetryQueryMode;
-
     let Some(sink) = &config.telemetry else {
         return;
     };
-
-    // Privacy: when the workspace policy selects "sanitized", normalize literals
-    // to placeholders before the query text leaves the customer network. Rule
-    // evaluation already happened on the full query — this only affects reporting.
-    let reported_sql: std::borrow::Cow<'_, str> = match **config.telemetry_mode.load() {
-        TelemetryQueryMode::Raw => std::borrow::Cow::Borrowed(sql),
-        TelemetryQueryMode::Sanitized => std::borrow::Cow::Owned(sanitize_query(sql)),
-    };
-
-    let event = build_telemetry_event(
+    let event = build_event(
         &sink.database_id,
-        &reported_sql,
+        sql,
         dialect,
         decision,
         latency_us,
+        **config.telemetry_mode.load(),
     );
     sink.queue.push(event);
+}
+
+/// A VERICTO-085 suggestion in sanitized mode. It is either SQL (the would-be
+/// rewrite under `monitor_mode`, which carries the query's literals) or the
+/// engine's fixed advice to list the columns, which carries none. SQL is
+/// normalized; the advice is kept; anything else is redacted, because it can
+/// only be text the proxy has not seen and cannot vouch for.
+fn sanitize_suggestion(s: &str) -> String {
+    match pg_query::normalize(s) {
+        Ok(normalized) => normalized,
+        Err(_) if s.starts_with("List the columns explicitly") => s.to_string(),
+        Err(_) => "<suggestion redacted>".to_string(),
+    }
 }
 
 /// Normalizes a SQL statement so no user data (literals) is reported: constants
@@ -536,6 +630,8 @@ mod tests {
                 violation("VERICTO-050", Severity::Medium, EnforcementAction::Flag),
                 violation("VERICTO-051", Severity::Medium, EnforcementAction::Flag),
             ],
+            rewritten_query: None,
+            sensitive_columns: Vec::new(),
         };
         let ev = build_telemetry_event("db1", "SELECT * FROM t", Dialect::Postgres, &decision, 10);
 
@@ -565,6 +661,7 @@ mod tests {
                     EnforcementAction::Monitor,
                 ),
             ],
+            sensitive_columns: Vec::new(),
         };
         let ev = build_telemetry_event("db1", "DELETE FROM t", Dialect::Postgres, &decision, 10);
 
@@ -595,6 +692,8 @@ mod tests {
         let decision = TcpDecision::Forward {
             observation: None,
             violations: muchas,
+            rewritten_query: None,
+            sensitive_columns: Vec::new(),
         };
         let ev = build_telemetry_event("db1", "SELECT 1", Dialect::Postgres, &decision, 10);
 
@@ -612,6 +711,8 @@ mod tests {
         let decision = TcpDecision::Forward {
             observation: None,
             violations: Vec::new(),
+            rewritten_query: None,
+            sensitive_columns: Vec::new(),
         };
         let ev = build_telemetry_event("db1", "SELECT 1", Dialect::Postgres, &decision, 10);
         assert!(ev.violations.is_empty());
@@ -633,6 +734,8 @@ mod tests {
                 Severity::Medium,
                 EnforcementAction::Flag,
             )],
+            rewritten_query: None,
+            sensitive_columns: Vec::new(),
         };
         let ev = build_telemetry_event("db1", "SELECT 1", Dialect::Postgres, &decision, 10);
         let json = serde_json::to_string(&ev).expect("event serializes");
@@ -649,6 +752,8 @@ mod tests {
                 action,
                 parse_error: None,
             }),
+            rewritten_query: None,
+            sensitive_columns: Vec::new(),
         }
     }
 
@@ -661,6 +766,8 @@ mod tests {
             &TcpDecision::Forward {
                 observation: None,
                 violations: Vec::new(),
+                rewritten_query: None,
+                sensitive_columns: Vec::new(),
             },
             42,
         );
@@ -710,6 +817,8 @@ mod tests {
         let decision = TcpDecision::Forward {
             observation: None,
             violations: Vec::new(),
+            rewritten_query: None,
+            sensitive_columns: Vec::new(),
         };
         let sql = format!(
             "SELECT * FROM t WHERE x IN ({})",
@@ -732,6 +841,8 @@ mod tests {
         let decision = TcpDecision::Forward {
             observation: None,
             violations: Vec::new(),
+            rewritten_query: None,
+            sensitive_columns: Vec::new(),
         };
         let ev = build_telemetry_event("db1", "SELECT 1", Dialect::Postgres, &decision, 10);
         assert_eq!(ev.query_text, "SELECT 1");
@@ -745,6 +856,7 @@ mod tests {
             ast_node_path: "DeleteStmt".to_string(),
             suggested_safe_query: None,
             severity: Severity::Critical,
+            sensitive_columns: Vec::new(),
         };
         let ev = build_telemetry_event("db1", "DELETE FROM t", Dialect::Mysql, &decision, 80);
         assert_eq!(ev.status, "BLOCKED");
@@ -766,6 +878,8 @@ mod tests {
                 action: EnforcementAction::Flag,
                 parse_error: Some("boom".to_string()),
             }),
+            rewritten_query: None,
+            sensitive_columns: Vec::new(),
         };
         let ev = build_telemetry_event("db1", "@@@", Dialect::Postgres, &decision, 10);
         assert_eq!(ev.status, "PARSE_ERROR");
@@ -784,6 +898,8 @@ mod tests {
                 action: EnforcementAction::Flag,
                 parse_error: Some("x".repeat(10_000)),
             }),
+            rewritten_query: None,
+            sensitive_columns: Vec::new(),
         };
         let ev = build_telemetry_event("db1", "@@@", Dialect::Postgres, &decision, 10);
         let msg = ev.parse_error.expect("message kept");
@@ -799,11 +915,114 @@ mod tests {
             ast_node_path: "PARSE_ERROR: boom".to_string(),
             suggested_safe_query: None,
             severity: Severity::Medium,
+            sensitive_columns: Vec::new(),
         };
         let ev = build_telemetry_event("db1", "@@@", Dialect::Postgres, &decision, 10);
         assert_eq!(ev.status, "PARSE_ERROR");
         assert_eq!(ev.enforcement_action.as_deref(), Some("block"));
         assert_eq!(ev.parse_error.as_deref(), Some("PARSE_ERROR: boom"));
+    }
+
+    fn touched(i: usize, policy: vericto_engine::SensitivePolicy) -> vericto_engine::TouchedColumn {
+        vericto_engine::TouchedColumn {
+            schema: Some("public".into()),
+            table: "customers".into(),
+            column: format!("c{i}"),
+            policy,
+        }
+    }
+
+    fn sensitive_violation(suggestion: &str) -> ReportedViolation {
+        ReportedViolation {
+            suggested_safe_query: Some(suggestion.to_string()),
+            ..violation("VERICTO-085", Severity::High, EnforcementAction::Flag)
+        }
+    }
+
+    /// A mask reports the original, the rewrite and the columns; the rewrite is
+    /// not repeated in the VERICTO-085 violation.
+    #[test]
+    fn telemetry_reports_a_masked_query() {
+        let rewritten = "SELECT '[redacted]'::text AS c0 FROM customers";
+        let decision = TcpDecision::Forward {
+            observation: None,
+            violations: vec![sensitive_violation(rewritten)],
+            rewritten_query: Some(rewritten.to_string()),
+            sensitive_columns: vec![touched(0, vericto_engine::SensitivePolicy::Mask)],
+        };
+        let ev = build_telemetry_event(
+            "db1",
+            "SELECT c0 FROM customers",
+            Dialect::Postgres,
+            &decision,
+            1,
+        );
+        assert_eq!(ev.query_text, "SELECT c0 FROM customers");
+        assert_eq!(ev.rewritten_query.as_deref(), Some(rewritten));
+        assert_eq!(ev.violations[0].suggested_safe_query, None);
+        assert_eq!(
+            ev.sensitive_columns,
+            vec![crate::telemetry::SensitiveColumnPayload {
+                schema: Some("public".into()),
+                table: "customers".into(),
+                column: "c0".into(),
+                policy: "mask".into(),
+            }]
+        );
+    }
+
+    /// Under monitor_mode the would-be rewrite is only in the suggestion, so in
+    /// sanitized mode that is where its literals must be removed.
+    #[test]
+    fn sanitized_mode_sanitizes_a_sensitive_suggestion() {
+        let decision = TcpDecision::Forward {
+            observation: None,
+            violations: vec![
+                sensitive_violation(
+                    "SELECT '[redacted]'::text AS email FROM customers WHERE name = 'Alice'",
+                ),
+                sensitive_violation(
+                    "List the columns explicitly: `*`, `t.*`, whole-row references and `COPY table TO` read every tagged column",
+                ),
+            ],
+            rewritten_query: None,
+            sensitive_columns: vec![touched(0, vericto_engine::SensitivePolicy::Mask)],
+        };
+        let ev = build_event(
+            "db1",
+            "SELECT email FROM customers WHERE name = 'Alice'",
+            Dialect::Postgres,
+            &decision,
+            1,
+            crate::tcp::rules_sync::TelemetryQueryMode::Sanitized,
+        );
+        let s0 = ev.violations[0].suggested_safe_query.as_deref().unwrap();
+        assert!(!s0.contains("Alice"), "{s0}");
+        assert!(s0.contains("customers"), "{s0}");
+        let s1 = ev.violations[1].suggested_safe_query.as_deref().unwrap();
+        assert!(s1.starts_with("List the columns explicitly"));
+        assert!(!ev.query_text.contains("Alice"));
+    }
+
+    /// The ingest schema rejects the whole batch over 64 columns.
+    #[test]
+    fn telemetry_caps_the_touched_columns() {
+        let decision = TcpDecision::Block {
+            rule_code: "VERICTO-085".into(),
+            ast_node_path: "SensitiveColumn > … (block)".into(),
+            suggested_safe_query: None,
+            severity: Severity::High,
+            violations: Vec::new(),
+            sensitive_columns: (0..100)
+                .map(|i| touched(i, vericto_engine::SensitivePolicy::Block))
+                .collect(),
+        };
+        let ev = build_telemetry_event("db1", "SELECT 1", Dialect::Postgres, &decision, 1);
+        assert_eq!(
+            ev.sensitive_columns.len(),
+            crate::telemetry::MAX_REPORTED_SENSITIVE_COLUMNS
+        );
+        assert_eq!(ev.rewritten_query, None);
     }
 
     #[test]

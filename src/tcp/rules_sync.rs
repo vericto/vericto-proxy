@@ -15,7 +15,8 @@ use serde::Deserialize;
 use crate::config::ControlPlaneConfig;
 use crate::tcp::rules_cache::RulesCache;
 use vericto_engine::{
-    EnforcementAction, EnforcementPolicy, ParseErrorAction, Rule, RuleType, Severity,
+    EnforcementAction, EnforcementPolicy, ParseErrorAction, Rule, RuleType, SensitiveColumn,
+    Severity,
 };
 
 /// Shared, hot-swappable ruleset.
@@ -59,6 +60,15 @@ struct SyncResponse {
     /// Dashboard-configured proxy settings (hot-reloaded).
     #[serde(default)]
     proxy_config: Option<ProxyConfig>,
+    /// The database's sensitive-column tags (VERICTO-085), per database and so
+    /// only sent for `?database_id=`. Element shape and its fail-safe parsing
+    /// (an unknown policy reads as `block`, an unknown mask style as `full`) are
+    /// the engine's own `Deserialize` (engine contract §2), not re-implemented
+    /// here. Absent, `null` or `[]` = no tags = the policy is exactly what it was
+    /// before the field existed. A malformed element fails the whole response,
+    /// which keeps the last-good ruleset, tags included.
+    #[serde(default)]
+    sensitive_columns: Option<Vec<SensitiveColumn>>,
 }
 
 /// Settings configurable from the Vericto dashboard, applied without restart.
@@ -155,11 +165,16 @@ fn parse_action(raw: &str) -> EnforcementAction {
     }
 }
 
-/// Builds an `EnforcementPolicy` from the API policy object. When `api` is
-/// `None` (older API during the compatibility window) the default policy is
-/// used. Present severity actions override the corresponding default level.
-fn build_policy(api: Option<ApiPolicy>) -> EnforcementPolicy {
-    let mut policy = EnforcementPolicy::default();
+/// Builds an `EnforcementPolicy` from the API policy object and the database's
+/// sensitive-column tags. When `api` is `None` (older API during the
+/// compatibility window) the default policy is used. Present severity actions
+/// override the corresponding default level. The tags are set either way: they
+/// are per database, the policy object is per workspace.
+fn build_policy(api: Option<ApiPolicy>, tags: Option<Vec<SensitiveColumn>>) -> EnforcementPolicy {
+    let mut policy = EnforcementPolicy {
+        sensitive_columns: tags.unwrap_or_default(),
+        ..EnforcementPolicy::default()
+    };
     let Some(api) = api else {
         return policy;
     };
@@ -190,6 +205,8 @@ fn build_policy(api: Option<ApiPolicy>) -> EnforcementPolicy {
 struct Applied {
     count: usize,
     monitor_mode: bool,
+    /// Number of sensitive-column tags in force.
+    sensitive_columns: usize,
     mode: TelemetryQueryMode,
     proxy_config: Option<ProxyConfig>,
 }
@@ -207,8 +224,9 @@ fn apply(
             .as_ref()
             .and_then(|p| p.telemetry_query_mode.as_deref()),
     );
-    let new_policy = build_policy(body.policy);
+    let new_policy = build_policy(body.policy, body.sensitive_columns);
     let monitor_mode = new_policy.monitor_mode;
+    let sensitive_columns = new_policy.sensitive_columns.len();
     let rules: Vec<Rule> = body.rules.into_iter().map(ApiRule::into_rule).collect();
     let count = rules.len();
     ruleset.store(Arc::new(rules));
@@ -217,6 +235,7 @@ fn apply(
     Applied {
         count,
         monitor_mode,
+        sensitive_columns,
         mode,
         proxy_config: body.proxy_config,
     }
@@ -310,6 +329,7 @@ pub async fn run(
                 tracing::info!(
                     count = applied.count,
                     monitor_mode = applied.monitor_mode,
+                    sensitive_columns = applied.sensitive_columns,
                     saved_at = %cached.saved_at,
                     "Ruleset and policy loaded from the rules cache"
                 );
@@ -360,6 +380,7 @@ pub async fn run(
                         tracing::info!(
                             count = applied.count,
                             monitor_mode = applied.monitor_mode,
+                            sensitive_columns = applied.sensitive_columns,
                             telemetry_query_mode = ?applied.mode,
                             "Ruleset and policy updated from API"
                         );
@@ -391,7 +412,7 @@ mod tests {
 
     #[test]
     fn build_policy_none_yields_default() {
-        let policy = build_policy(None);
+        let policy = build_policy(None, None);
         assert_eq!(policy, EnforcementPolicy::default());
     }
 
@@ -405,7 +426,7 @@ mod tests {
             monitor_mode: true,
             telemetry_query_mode: None,
         };
-        let policy = build_policy(Some(api));
+        let policy = build_policy(Some(api), None);
         // Overridden level.
         assert_eq!(policy.medium, EnforcementAction::Monitor);
         // Untouched levels keep their defaults.
@@ -549,6 +570,164 @@ mod tests {
         assert!(pol.monitor_mode);
         assert_eq!(pol.high, EnforcementAction::Flag);
         assert_eq!(**mode.load(), TelemetryQueryMode::Sanitized);
+    }
+
+    fn applied_policy(body: &str) -> EnforcementPolicy {
+        let body: SyncResponse = serde_json::from_str(body).expect("sync body parses");
+        let ruleset: SharedRuleset = Arc::new(ArcSwap::from_pointee(Vec::new()));
+        let policy: SharedPolicy = Arc::new(ArcSwap::from_pointee(EnforcementPolicy::default()));
+        let mode: SharedTelemetryMode = Arc::new(ArcSwap::from_pointee(TelemetryQueryMode::Raw));
+        apply(body, &ruleset, &policy, &mode);
+        (**policy.load()).clone()
+    }
+
+    /// The database's tags travel in `/sync/rules` (engine contract §2) and end
+    /// up in the policy every query is evaluated with.
+    #[test]
+    fn sync_payload_with_sensitive_columns_carries_them_into_the_policy() {
+        use vericto_engine::{MaskStyle, SensitivePolicy};
+        let policy = applied_policy(
+            r#"{
+                "version": "v8", "rules": [],
+                "policy": {"severity_actions": {}, "parse_error_action": "allow_report"},
+                "sensitive_columns": [
+                    {"schema": "public", "table": "customers", "column": "email", "policy": "mask", "mask_style": "email"},
+                    {"schema": null, "table": "customers", "column": "ssn", "policy": "block"},
+                    {"schema_name": "billing", "table_name": "cards", "column_name": "pan", "policy": "FLAG"},
+                    {"table": "customers", "column": "dob", "policy": "something-newer"}
+                ]
+            }"#,
+        );
+        let tags = &policy.sensitive_columns;
+        assert_eq!(tags.len(), 4);
+        assert_eq!(tags[0].schema.as_deref(), Some("public"));
+        assert_eq!(tags[0].policy, SensitivePolicy::Mask);
+        assert_eq!(tags[0].mask_style, MaskStyle::Email);
+        assert_eq!(tags[1].schema, None);
+        assert_eq!(tags[1].policy, SensitivePolicy::Block);
+        // The DB column names are accepted as aliases; the policy is case-insensitive.
+        assert_eq!(
+            (tags[2].table.as_str(), tags[2].column.as_str()),
+            ("cards", "pan")
+        );
+        assert_eq!(tags[2].policy, SensitivePolicy::Flag);
+        // An unknown policy is a block: a newer dashboard never disables protection.
+        assert_eq!(tags[3].policy, SensitivePolicy::Block);
+        // The rest of the policy is built as before.
+        assert_eq!(policy.parse_error, ParseErrorAction::AllowReport);
+        // ... and a block or mask tag makes a parse error block.
+        assert_eq!(policy.effective_parse_error(), ParseErrorAction::Block);
+    }
+
+    /// An API that does not send the field (or sends null / []) gives exactly
+    /// the policy the proxy built before the field existed.
+    #[test]
+    fn sync_payload_without_sensitive_columns_is_unchanged() {
+        let policy_json = r#""policy": {"severity_actions": {"medium": "monitor"}, "parse_error_action": "allow_report"}"#;
+        let expected = EnforcementPolicy {
+            medium: EnforcementAction::Monitor,
+            ..EnforcementPolicy::default()
+        };
+        for extra in [
+            "",
+            r#", "sensitive_columns": null"#,
+            r#", "sensitive_columns": []"#,
+        ] {
+            let policy = applied_policy(&format!(
+                r#"{{"version": "v1", "rules": [], {policy_json}{extra}}}"#
+            ));
+            assert_eq!(policy, expected, "with {extra:?}");
+            assert_eq!(
+                policy.effective_parse_error(),
+                ParseErrorAction::AllowReport
+            );
+        }
+        // Tags without a policy object: default policy plus the tags.
+        let policy = applied_policy(
+            r#"{"version": "v1", "rules": [],
+                "sensitive_columns": [{"table": "t", "column": "c", "policy": "flag"}]}"#,
+        );
+        assert_eq!(policy.sensitive_columns.len(), 1);
+        assert_eq!(
+            EnforcementPolicy {
+                sensitive_columns: Vec::new(),
+                ..policy
+            },
+            EnforcementPolicy::default()
+        );
+    }
+
+    /// The last-good cache holds the tags too: a restart during an outage keeps
+    /// enforcing them instead of reading the tagged columns in clear.
+    #[tokio::test]
+    async fn restart_during_an_outage_keeps_the_sensitive_columns() {
+        use crate::config::BufferMode;
+        use axum::{Router, http::header, routing::get};
+        use vericto_engine::{MaskStyle, SensitivePolicy};
+
+        const BODY: &str = r#"{
+            "version": "v9", "rules": [],
+            "policy": {"severity_actions": {}},
+            "sensitive_columns": [
+                {"schema": "public", "table": "customers", "column": "email", "policy": "mask", "mask_style": "last4"}
+            ]
+        }"#;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = Router::new().route(
+            "/api/v1/sync/rules",
+            get(|| async { ([(header::ETAG, "\"v9\"")], BODY) }),
+        );
+        let server = tokio::spawn(async move { axum::serve(listener, app).await });
+
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = ControlPlaneConfig {
+            api_url: format!("http://{addr}"),
+            api_key: "vk_test".into(),
+            database_id: Some("db-1".into()),
+            rules_sync_interval: Duration::from_secs(3600),
+            rules_cache_path: Some(dir.path().join("rules-cache.json")),
+            buffer_mode: BufferMode::Memory,
+            disk_spool_path: String::new(),
+            memory_capacity: 10,
+            batch_size: 10,
+            flush_interval: Duration::from_secs(5),
+        };
+        let start = |cfg: ControlPlaneConfig| {
+            let pol: SharedPolicy = Arc::new(ArcSwap::from_pointee(EnforcementPolicy::default()));
+            let ready = crate::tcp::healthz::Readiness::new();
+            let task = tokio::spawn(run(
+                cfg,
+                Arc::new(ArcSwap::from_pointee(Vec::new())),
+                pol.clone(),
+                Arc::new(ArcSwap::from_pointee(TelemetryQueryMode::default())),
+                ready.clone(),
+            ));
+            (pol, ready, task)
+        };
+
+        // Live sync: the tags are in effect and the cache is written.
+        let (pol, ready, task) = start(cfg.clone());
+        ready.wait_ready().await;
+        task.abort();
+        assert_eq!(pol.load().sensitive_columns.len(), 1);
+
+        // Control plane down, proxy restarted: the cache restores them.
+        server.abort();
+        let _ = server.await;
+        let (pol, ready, task) = start(cfg);
+        ready.wait_ready().await;
+        task.abort();
+        let pol = pol.load();
+        assert_eq!(pol.sensitive_columns.len(), 1);
+        let tag = &pol.sensitive_columns[0];
+        assert_eq!(tag.schema.as_deref(), Some("public"));
+        assert_eq!(
+            (tag.table.as_str(), tag.column.as_str()),
+            ("customers", "email")
+        );
+        assert_eq!(tag.policy, SensitivePolicy::Mask);
+        assert_eq!(tag.mask_style, MaskStyle::Last4);
     }
 
     /// Without a cache the same outage falls back to the built-in ruleset (unchanged).

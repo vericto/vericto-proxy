@@ -10,7 +10,7 @@ use vericto_engine::parser::Dialect;
 
 use crate::tcp::codec::{
     SQLSTATE_INSUFFICIENT_PRIVILEGE, build_error_response, build_ready_for_query,
-    extract_parse_query, extract_simple_query, read_message,
+    extract_parse_query, extract_simple_query, read_message, with_replaced_query,
 };
 use crate::tcp::protocol::{
     BlockContext, BlockResponse, Classified, QueryKind, RawClientMessage, WireProtocol,
@@ -59,6 +59,13 @@ impl WireProtocol for PostgresProtocol {
             b'X' => Classified::Terminate,
             _ => Classified::PassThrough,
         }
+    }
+
+    fn with_query(&self, msg: &RawClientMessage, sql: &str) -> Option<RawClientMessage> {
+        let RawClientMessage::Postgres(m) = msg else {
+            return None;
+        };
+        with_replaced_query(m, sql).map(RawClientMessage::Postgres)
     }
 
     fn build_block_response(&self, ctx: &BlockContext) -> BlockResponse {

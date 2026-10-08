@@ -5,9 +5,15 @@
 
 use vericto_engine::parser::{Dialect, parser_for};
 use vericto_engine::{
-    Decision, EnforcementAction, EnforcementPolicy, ParseErrorAction, ReportedViolation, Rule,
-    RuleEngine, RuleType, Severity,
+    Decision, EnforcementAction, EnforcementPolicy, EvaluationOutcome, ParseErrorAction,
+    ReportedViolation, Rule, RuleEngine, RuleType, SensitivePolicy, Severity, TouchedColumn,
 };
+
+use crate::tcp::protocol::QueryKind;
+
+/// Rule code of every sensitive-column outcome (engine contract §3.1), including
+/// the proxy's own fail-safe blocks below.
+pub const SENSITIVE_RULE_CODE: &str = "VERICTO-085";
 
 /// Result of evaluating a query on the TCP path.
 pub enum TcpDecision {
@@ -20,6 +26,12 @@ pub enum TcpDecision {
         /// observation rather than inside it because a parse-error observation has
         /// no engine violations to report.
         violations: Vec<ReportedViolation>,
+        /// The SQL to send INSTEAD of the original: a `mask` tag was applied
+        /// (Postgres only). When `Some`, the session forwards this text and never
+        /// the original; `evaluate` has already checked it is consistent.
+        rewritten_query: Option<String>,
+        /// Every tagged column the query reads (VERICTO-085), for the audit trail.
+        sensitive_columns: Vec<TouchedColumn>,
     },
     /// Reject the query with SQLSTATE 42501.
     Block {
@@ -31,7 +43,30 @@ pub enum TcpDecision {
         /// decided by the winner alone; this is the audit trail, and reporting it
         /// cannot change the decision.
         violations: Vec<ReportedViolation>,
+        /// Every tagged column the query would have read (VERICTO-085).
+        sensitive_columns: Vec<TouchedColumn>,
     },
+}
+
+impl TcpDecision {
+    /// A block raised by the proxy itself because a mask could not be enforced
+    /// as the engine described it. Never forwards anything: the alternative to a
+    /// rewrite the proxy cannot trust is the unmasked original.
+    fn sensitive_block(
+        reason: &str,
+        violations: Vec<ReportedViolation>,
+        sensitive_columns: Vec<TouchedColumn>,
+    ) -> Self {
+        TcpDecision::Block {
+            rule_code: SENSITIVE_RULE_CODE.to_string(),
+            ast_node_path: format!("SensitiveColumn > mask not enforceable by the proxy: {reason}"),
+            suggested_safe_query: None,
+            // The engine's severity for a block or mask outcome (contract §3.1).
+            severity: Severity::High,
+            violations,
+            sensitive_columns,
+        }
+    }
 }
 
 /// A non-blocking violation (or parse-error allow-report) recorded for telemetry.
@@ -51,9 +86,13 @@ pub struct Observation {
 /// - Parse OK → `RuleEngine::evaluate`; `Decision::Block` maps to `Block`,
 ///   `Decision::Flag`/`Decision::Allow` map to `Forward` carrying an
 ///   `Observation` built from the resolved action (None when no rule matched).
-/// - Parse error → resolved from `policy.parse_error`: `AllowReport` (fail-open
-///   default) forwards with a parse-error `Observation`; `Block` (fail-closed
-///   opt-in) rejects with `VERICTO-PARSE-ERROR`.
+///   A `Forward` carries the engine's `rewritten_query` when a mask applied;
+///   if the outcome does not hold together (see [`rewrite_inconsistency`]) the
+///   query is blocked instead.
+/// - Parse error → resolved from `policy.effective_parse_error()`:
+///   `AllowReport` (fail-open default) forwards with a parse-error
+///   `Observation`; `Block` (fail-closed opt-in, and forced by any `block` or
+///   `mask` sensitive column) rejects with `VERICTO-PARSE-ERROR`.
 pub fn evaluate(
     sql: &str,
     dialect: Dialect,
@@ -64,6 +103,19 @@ pub fn evaluate(
     match parser.parse(sql) {
         Ok(parsed) => {
             let outcome = RuleEngine::evaluate(&parsed, rules, policy);
+            if outcome.decision != Decision::Block
+                && let Some(reason) = rewrite_inconsistency(&outcome, dialect, policy)
+            {
+                tracing::error!(
+                    reason,
+                    "sensitive-column outcome is inconsistent; blocking rather than forwarding"
+                );
+                return TcpDecision::sensitive_block(
+                    reason,
+                    outcome.violations,
+                    outcome.sensitive_columns,
+                );
+            }
             match outcome.decision {
                 Decision::Block => TcpDecision::Block {
                     rule_code: outcome.rule_code.unwrap_or_else(|| "VERICTO".to_string()),
@@ -71,6 +123,7 @@ pub fn evaluate(
                     suggested_safe_query: outcome.suggested_safe_query,
                     severity: outcome.severity.unwrap_or(Severity::Critical),
                     violations: outcome.violations,
+                    sensitive_columns: outcome.sensitive_columns,
                 },
                 Decision::Flag | Decision::Allow => TcpDecision::Forward {
                     observation: outcome.action.map(|action| Observation {
@@ -84,10 +137,16 @@ pub fn evaluate(
                         parse_error: None,
                     }),
                     violations: outcome.violations,
+                    rewritten_query: outcome.rewritten_query,
+                    sensitive_columns: outcome.sensitive_columns,
                 },
             }
         }
-        Err(e) => match policy.parse_error {
+        // `effective_parse_error`, not the raw `parse_error`: with a `block` or
+        // `mask` tag configured a query the engine cannot read cannot be shown not
+        // to read the column, so it blocks whatever the workspace chose (engine
+        // contract §3.2). Without such tags the two are identical.
+        Err(e) => match policy.effective_parse_error() {
             // Fail-open default (R5.5): forward + report.
             ParseErrorAction::AllowReport => TcpDecision::Forward {
                 // A query that did not parse violated no rule: there is nothing to
@@ -101,17 +160,138 @@ pub fn evaluate(
                     action: EnforcementAction::Flag,
                     parse_error: Some(e.to_string()),
                 }),
+                rewritten_query: None,
+                sensitive_columns: Vec::new(),
             },
-            // Fail-closed opt-in (R5.6): reject with 42501.
+            // Fail-closed (R5.6): reject with 42501.
             ParseErrorAction::Block => TcpDecision::Block {
                 rule_code: "VERICTO-PARSE-ERROR".to_string(),
                 ast_node_path: format!("PARSE_ERROR: {e}"),
                 suggested_safe_query: None,
                 severity: Severity::Medium,
                 violations: Vec::new(),
+                sensitive_columns: Vec::new(),
             },
         },
     }
+}
+
+/// [`evaluate`], plus the checks that depend on how the query arrived.
+///
+/// A `Parse` message is followed by a `Bind` the client built for the
+/// parameters of the statement it sent. The engine keeps `$n` placeholders, but
+/// a computed expression over a masked column is masked whole, so
+/// `substring(card, $1, 4)` becomes a constant and `$1` disappears: the
+/// client's `Bind` no longer fits the statement. That is refused here, with a
+/// message that says why, instead of forwarding a statement that fails later
+/// with a confusing protocol error. Checked before telemetry so the event
+/// records what actually happened.
+pub fn evaluate_message(
+    sql: &str,
+    dialect: Dialect,
+    kind: QueryKind,
+    rules: &[Rule],
+    policy: &EnforcementPolicy,
+) -> TcpDecision {
+    let decision = evaluate(sql, dialect, rules, policy);
+    match decision {
+        TcpDecision::Forward {
+            rewritten_query: Some(ref rewritten),
+            ..
+        } if kind == QueryKind::Prepared => match parameter_mismatch(sql, rewritten) {
+            None => decision,
+            Some(reason) => {
+                let TcpDecision::Forward {
+                    violations,
+                    sensitive_columns,
+                    ..
+                } = decision
+                else {
+                    unreachable!()
+                };
+                TcpDecision::sensitive_block(&reason, violations, sensitive_columns)
+            }
+        },
+        other => other,
+    }
+}
+
+/// Why an engine outcome that is not a block cannot be enforced as it stands,
+/// or `None` when it can. Any `Some` blocks the query: every way of being
+/// inconsistent leaves the proxy with only the original SQL to forward, which is
+/// exactly what a mask tag forbids.
+///
+/// The engine guarantees none of these happen (contract §3.2/§3.3); this is the
+/// proxy not taking that on trust for the one decision where trusting it wrongly
+/// leaks the column.
+fn rewrite_inconsistency(
+    outcome: &EvaluationOutcome,
+    dialect: Dialect,
+    policy: &EnforcementPolicy,
+) -> Option<&'static str> {
+    let masked = outcome
+        .sensitive_columns
+        .iter()
+        .any(|c| c.policy == SensitivePolicy::Mask);
+    match &outcome.rewritten_query {
+        Some(_) if dialect != Dialect::Postgres => {
+            Some("a rewritten query was returned for a dialect the rewrite does not support")
+        }
+        Some(_) if !masked => Some("a rewritten query was returned but no masked column was read"),
+        Some(sql) if sql.trim().is_empty() || sql.contains('\0') => {
+            Some("the rewritten query is empty or not valid wire text")
+        }
+        Some(_) => None,
+        // monitor_mode is the one case where a masked read legitimately forwards
+        // the original: dry-run never changes what runs (contract §3.2).
+        None if masked && !policy.monitor_mode => {
+            Some("a masked column was read but no rewritten query was returned")
+        }
+        None => None,
+    }
+}
+
+/// `$n` placeholders of a Postgres statement, sorted and deduplicated. `None`
+/// when it does not parse.
+fn placeholders(sql: &str) -> Option<Vec<i32>> {
+    let parsed = pg_query::parse(sql).ok()?;
+    let mut n: Vec<i32> = parsed
+        .protobuf
+        .nodes()
+        .into_iter()
+        .filter_map(|(node, ..)| match node {
+            pg_query::NodeRef::ParamRef(p) => Some(p.number),
+            _ => None,
+        })
+        .collect();
+    n.sort_unstable();
+    n.dedup();
+    Some(n)
+}
+
+/// Why `rewritten` cannot be bound with the parameters the client prepared
+/// `original` for, or `None` when it can.
+fn parameter_mismatch(original: &str, rewritten: &str) -> Option<String> {
+    let (Some(before), Some(after)) = (placeholders(original), placeholders(rewritten)) else {
+        return Some("the rewritten statement could not be checked for parameters".to_string());
+    };
+    if before == after {
+        return None;
+    }
+    let lost: Vec<String> = before
+        .iter()
+        .filter(|n| !after.contains(n))
+        .map(|n| format!("${n}"))
+        .collect();
+    Some(if lost.is_empty() {
+        "the rewritten statement has different parameters".to_string()
+    } else {
+        format!(
+            "masking removes parameter {} (it is used inside a masked expression); \
+             select the column itself, or compute on it without a parameter",
+            lost.join(", ")
+        )
+    })
 }
 
 /// Default ruleset: the built-in rules with their canonical severity and
@@ -377,6 +557,198 @@ mod tests {
             }
             _ => panic!("parse-error fail-open must Forward with a parse-error observation"),
         }
+    }
+
+    fn tags(json: serde_json::Value) -> EnforcementPolicy {
+        EnforcementPolicy {
+            sensitive_columns: serde_json::from_value(json).unwrap(),
+            ..EnforcementPolicy::default()
+        }
+    }
+
+    fn mask_email() -> EnforcementPolicy {
+        tags(serde_json::json!([
+            {"table": "customers", "column": "email", "policy": "mask", "mask_style": "email"}
+        ]))
+    }
+
+    /// With a block or mask tag, a parse error blocks even under the fail-open
+    /// default: the proxy must use `effective_parse_error`, not `parse_error`.
+    #[test]
+    fn parse_error_with_a_block_or_mask_tag_blocks() {
+        for policy in [
+            mask_email(),
+            tags(serde_json::json!([{"table": "t", "column": "c", "policy": "block"}])),
+        ] {
+            assert_eq!(policy.parse_error, ParseErrorAction::AllowReport);
+            match evaluate(
+                "NOT A VALID SQL @@@",
+                Dialect::Postgres,
+                &default_ruleset(),
+                &policy,
+            ) {
+                TcpDecision::Block { rule_code, .. } => {
+                    assert_eq!(rule_code, "VERICTO-PARSE-ERROR")
+                }
+                TcpDecision::Forward { .. } => {
+                    panic!("a parse error must block with a protective tag")
+                }
+            }
+        }
+    }
+
+    /// Flag-only tags keep the workspace's fail-open choice.
+    #[test]
+    fn parse_error_with_only_flag_tags_still_forwards() {
+        let policy = tags(serde_json::json!([{"table": "t", "column": "c", "policy": "flag"}]));
+        match evaluate(
+            "NOT A VALID SQL @@@",
+            Dialect::Postgres,
+            &default_ruleset(),
+            &policy,
+        ) {
+            TcpDecision::Forward {
+                observation: Some(obs),
+                ..
+            } => {
+                assert_eq!(obs.rule_code, "VERICTO-PARSE-ERROR")
+            }
+            _ => panic!("flag-only tags must not change parse-error handling"),
+        }
+    }
+
+    #[test]
+    fn postgres_mask_forwards_the_rewrite_and_the_touched_columns() {
+        let d = evaluate(
+            "SELECT email FROM customers LIMIT 1",
+            Dialect::Postgres,
+            &default_ruleset(),
+            &mask_email(),
+        );
+        let TcpDecision::Forward {
+            rewritten_query: Some(sql),
+            sensitive_columns,
+            observation,
+            ..
+        } = d
+        else {
+            panic!("a successful mask forwards the rewritten query");
+        };
+        assert!(sql.contains("regexp_replace"), "{sql}");
+        assert_eq!(sensitive_columns.len(), 1);
+        assert_eq!(sensitive_columns[0].policy, SensitivePolicy::Mask);
+        assert_eq!(observation.unwrap().rule_code, SENSITIVE_RULE_CODE);
+    }
+
+    #[test]
+    fn mysql_mask_blocks() {
+        match evaluate(
+            "SELECT email FROM customers LIMIT 1",
+            Dialect::Mysql,
+            &default_ruleset(),
+            &mask_email(),
+        ) {
+            TcpDecision::Block {
+                rule_code,
+                ast_node_path,
+                sensitive_columns,
+                ..
+            } => {
+                assert_eq!(rule_code, SENSITIVE_RULE_CODE);
+                assert!(
+                    ast_node_path.contains("mask unsupported"),
+                    "{ast_node_path}"
+                );
+                assert_eq!(sensitive_columns.len(), 1);
+            }
+            TcpDecision::Forward { .. } => panic!("mask on MySQL must block"),
+        }
+    }
+
+    fn touched(policy: SensitivePolicy) -> TouchedColumn {
+        TouchedColumn {
+            schema: None,
+            table: "customers".into(),
+            column: "email".into(),
+            policy,
+        }
+    }
+
+    /// Every outcome that leaves the proxy with only the original to forward
+    /// is refused; the consistent ones are not.
+    #[test]
+    fn inconsistent_mask_outcomes_are_refused() {
+        let plain = EnforcementPolicy::default();
+        let monitor = EnforcementPolicy {
+            monitor_mode: true,
+            ..EnforcementPolicy::default()
+        };
+        let outcome = |rewritten: Option<&str>, cols: Vec<TouchedColumn>| {
+            let mut o = EvaluationOutcome::allowed();
+            o.decision = Decision::Flag;
+            o.rewritten_query = rewritten.map(str::to_string);
+            o.sensitive_columns = cols;
+            o
+        };
+        let pg = Dialect::Postgres;
+        let ok = outcome(
+            Some("SELECT 'x' AS email"),
+            vec![touched(SensitivePolicy::Mask)],
+        );
+        assert_eq!(rewrite_inconsistency(&ok, pg, &plain), None);
+        // Mask read, no rewrite: the case the fail-safe exists for.
+        let none = outcome(None, vec![touched(SensitivePolicy::Mask)]);
+        assert!(rewrite_inconsistency(&none, pg, &plain).is_some());
+        // ... except under monitor_mode, which never changes what runs.
+        assert_eq!(rewrite_inconsistency(&none, pg, &monitor), None);
+        // A rewrite for MySQL, without a masked column, empty, or with a NUL.
+        assert!(rewrite_inconsistency(&ok, Dialect::Mysql, &plain).is_some());
+        let unmasked = outcome(Some("SELECT 1"), vec![touched(SensitivePolicy::Flag)]);
+        assert!(rewrite_inconsistency(&unmasked, pg, &plain).is_some());
+        for bad in ["  ", "SELECT 1\0"] {
+            let o = outcome(Some(bad), vec![touched(SensitivePolicy::Mask)]);
+            assert!(rewrite_inconsistency(&o, pg, &plain).is_some(), "{bad:?}");
+        }
+        // Nothing masked, nothing rewritten: not this check's business.
+        let flag = outcome(None, vec![touched(SensitivePolicy::Flag)]);
+        assert_eq!(rewrite_inconsistency(&flag, pg, &plain), None);
+    }
+
+    #[test]
+    fn a_rewrite_must_keep_every_parameter() {
+        assert_eq!(
+            parameter_mismatch(
+                "SELECT email FROM t WHERE id = $1",
+                "SELECT 'x' AS email FROM t WHERE id = $1"
+            ),
+            None
+        );
+        let lost = parameter_mismatch(
+            "SELECT substring(card, $1, 4) FROM t WHERE id = $2",
+            "SELECT '[redacted]'::text AS substring FROM t WHERE id = $2",
+        )
+        .unwrap();
+        assert!(lost.contains("$1") && !lost.contains("$2"), "{lost}");
+        assert!(parameter_mismatch("SELECT 1", "SELECT $1").is_some());
+    }
+
+    /// Simple queries have no Bind, so the parameter check is Parse-only.
+    #[test]
+    fn the_parameter_check_applies_to_parse_only() {
+        let sql = "SELECT substring(email, $1, 4) FROM customers LIMIT 1";
+        let rules = default_ruleset();
+        let policy = mask_email();
+        assert!(matches!(
+            evaluate_message(sql, Dialect::Postgres, QueryKind::Prepared, &rules, &policy),
+            TcpDecision::Block { .. }
+        ));
+        assert!(matches!(
+            evaluate_message(sql, Dialect::Postgres, QueryKind::Simple, &rules, &policy),
+            TcpDecision::Forward {
+                rewritten_query: Some(_),
+                ..
+            }
+        ));
     }
 
     // Parse error, fail-closed (Block) → Block with VERICTO-PARSE-ERROR.

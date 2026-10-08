@@ -117,6 +117,59 @@ the table above), so no special handling is needed in your application.
 
 ---
 
+## Sensitive columns
+
+Columns can be tagged as sensitive per database in the Vericto dashboard (Team and
+Enterprise plans). The tags reach the proxy with the ruleset (`/sync/rules`, so the
+control-plane link and `VERICTO_DATABASE_ID` are required) and are enforced on the
+wire, before the database sees the query. Each tag has a policy; when a query reads
+several tagged columns the strictest wins (`block` > `mask` > `flag`). A column read
+is a projection: what the query returns, or copies into another table. A column used
+only in `WHERE`, `JOIN`, `GROUP BY` or `ORDER BY` is not a read.
+
+**The proxy enforces.** Unlike the Validation API or the CLI, which only advise,
+what the proxy decides is what the database receives:
+
+| Policy  | Postgres | MySQL |
+|---------|----------|-------|
+| `block` | The query never reaches the database: `ErrorResponse`, SQLSTATE 42501 | Never reaches the database: `ERR_Packet`, ERROR 1142 |
+| `flag`  | Forwarded as sent, recorded as FLAGGED | Same |
+| `mask`  | The proxy forwards a **rewritten** query in which the column is masked (`full`, `last4`, `email` or `hash`) under its own name, and never the original. The client receives masked values. | **Blocked** (ERROR 1142): there is no MySQL rewrite yet, and forwarding the value in clear would turn a mask into a flag. Tag the column `block` or `flag`, or leave it out of the projection. |
+
+What holds under `mask` (Postgres):
+
+- Both protocols are rewritten: a simple `Query` and the extended protocol's `Parse`.
+  On a `Parse` the statement name and the parameter types are kept, and `$n`
+  placeholders survive, so the client's `Bind`/`Execute` run unchanged.
+- A masked column becomes `text`. A computed expression over it (`lower(email)`,
+  `substring(card, 1, 4)`) is masked `full`, whatever the style.
+- `SELECT *`, `t.*`, whole-row references (`row_to_json(t)`) and `COPY t TO` over a
+  table with a masked or blocked column are blocked; list the columns. So are copies
+  of a masked column into another table (`INSERT … SELECT`, `CREATE TABLE AS`), since
+  masking them would change stored data.
+- **Fail-safe:** if anything about the rewrite does not hold together (no rewritten
+  query for a masked read, a rewrite for a dialect without one, a rewrite that drops a
+  `$n` the client will bind), the proxy blocks with `VERICTO-085`. It never forwards
+  the original instead.
+- `monitor_mode` never changes what runs: a would-be block or mask is forwarded as sent
+  and recorded, as for every other rule.
+
+With any `block` or `mask` tag configured, a query the engine cannot parse is
+**blocked**, whatever the workspace's parse-error policy says: a query that cannot be
+read cannot be shown not to read the column. With no tags, or only `flag` tags,
+parse errors behave as before.
+
+Every read of a tagged column is reported with rule code `VERICTO-085`, the tagged
+columns it touched and, for a mask, the rewritten query next to the original (both
+sanitized in sanitized telemetry mode). The two share the per-event query budget, so a
+masked event is no larger than any other.
+
+Known limits come from the engine, which works from the SQL alone: a view, function or
+partition over a tagged table is not covered unless it is tagged too. See the
+[engine documentation](https://github.com/vericto/vericto-engine#sensitive-columns-vericto-085).
+
+---
+
 ## Configuration
 
 All variables are **dialect-agnostic** — the same names apply to every engine.
@@ -270,6 +323,10 @@ cargo run
 cargo test
 cargo clippy -- -D warnings
 cargo fmt
+
+# Also run the sensitive-column tests against a real Postgres (each creates and
+# drops its own database; without the variable they are skipped)
+VERICTO_TEST_PG_URL=postgres://postgres:postgres@127.0.0.1:5432/postgres cargo test sensitive_tests
 ```
 
 ---

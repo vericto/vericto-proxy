@@ -267,3 +267,6 @@ pub async fn run_mysql_proxy(
 
 pub mod rules_cache;
 pub mod rules_sync;
+
+#[cfg(test)]
+mod sensitive_tests;

@@ -64,6 +64,10 @@ chrono = { version = "0.4", features = ["serde"] }
 tempfile = "3"
 # Stands in for the control-plane API in the rules-sync tests (src/tcp/rules_sync.rs).
 axum = "0.7"
+# A real Postgres driver for the wire-level sensitive-column tests
+# (src/tcp/sensitive_tests.rs), run against a live database when
+# VERICTO_TEST_PG_URL is set. Dev-only: nothing of it ships in the binary.
+tokio-postgres = "0.7"
 
 [profile.release]
 opt-level = 3
