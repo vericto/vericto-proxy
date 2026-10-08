@@ -350,7 +350,10 @@ async fn pg_flag_tag_forwards_the_original_and_reports_it() {
 /// whole) cannot be bound: blocked with a clear message rather than forwarded
 /// as a statement the client's Bind no longer fits.
 #[tokio::test]
-async fn pg_parse_whose_rewrite_drops_a_parameter_is_blocked() {
+async fn pg_parse_with_a_masked_parameter_keeps_it() {
+    // Engine 3.6.1 keeps every `$n` of a masked expression (3.6.0 dropped them,
+    // and this Parse was blocked by the parameter check). The Parse now reaches
+    // the database rewritten, with the same parameters for the client to bind.
     let mut w = wire(
         Box::new(PostgresProtocol),
         policy_with_tags(),
@@ -364,13 +367,18 @@ async fn pg_parse_whose_rewrite_drops_a_parameter_is_blocked() {
         ))
         .await
         .unwrap();
-    w.client.write_all(&pg_sync()).await.unwrap();
-    let e = read_pg(&mut w.client).await;
-    assert_eq!(e.tag, b'E');
-    let (_, msg) = pg_error(&e.body);
-    assert!(msg.contains("VERICTO-085") && msg.contains("$1"), "{msg}");
-    assert_eq!(read_pg(&mut w.client).await.tag, b'Z');
-    assert_eq!(first_query_reaching_db(&mut w).await, "SELECT 1");
+    let p = timeout(read_pg(&mut w.db)).await;
+    assert_eq!(p.tag, b'P');
+    // Parse body: statement name (here empty), then the query, both NUL-terminated.
+    let forwarded = cstr(&p.body[1..]);
+    assert!(
+        forwarded.contains("[redacted]") && forwarded.contains("$1"),
+        "{forwarded}"
+    );
+    assert!(
+        !forwarded.contains("substring(card, $1, 4) AS"),
+        "{forwarded}"
+    );
 }
 
 #[tokio::test]

@@ -11,14 +11,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 Sensitive Column Protection: the proxy enforces the database's column tags on the
 wire. It blocks the column, flags it, or on Postgres forwards a rewritten query that
-masks it. It needs vericto-engine v3.6.0. A database without tags is evaluated
+masks it. It needs vericto-engine v3.6.1. A database without tags is evaluated
 exactly as before. The release also ships the changes made since 4.5.1 and listed
 below: `PROXY_TLS_MODE=require` refuses plaintext Postgres clients, parser messages
 reach the control plane, and `rustls-pemfile` is gone.
 
 ### Added
 
-- **Sensitive columns are enforced on the wire (VERICTO-085, engine v3.6.0).** A
+- **Sensitive columns are enforced on the wire (VERICTO-085, engine v3.6.1).** A
   database's column tags now arrive in `/sync/rules` as `sensitive_columns`, next to
   `rules` and `policy`, and go into the `EnforcementPolicy` every query is evaluated
   with. They are kept in the live `ArcSwap` snapshot and in the last-good rules cache
@@ -40,8 +40,7 @@ reach the control plane, and `rustls-pemfile` is gone.
 
   The proxy does not take the rewrite on trust. A masked read with no rewritten query,
   a rewrite for a dialect that has none, an empty one or one with a NUL, or a rewrite
-  that drops a `$n` the client is going to bind (a computed expression over a
-  parameter is masked whole, so `substring(card, $1, 4)` loses its `$1`), is blocked
+  that drops a `$n` the client is going to bind, is blocked
   with `VERICTO-085` and a message saying why. In each of those cases the only thing
   left to forward is the unmasked original. `monitor_mode` still never changes what
   runs: there, a would-be mask is forwarded as sent and only reported.
@@ -71,7 +70,11 @@ reach the control plane, and `rustls-pemfile` is gone.
   accepts would be a way around a tag: MySQL `HANDLER customers READ` and
   `PREPARE s FROM '…'` are two such cases. With no tags, or with only `flag` tags,
   parse errors behave as before.
-- **vericto-engine v3.6.0** (from v3.5.3). Additive: `EnforcementPolicy` gains
+- **vericto-engine v3.6.1** (from v3.5.3). Version 3.6.1 rather than 3.6.0: in
+  3.6.0 a computed mask over a bind parameter (`substring(card, $1, 4)`) dropped the
+  `$1`, and the proxy blocked such a Parse. With 3.6.1 the parameter is kept and the
+  Parse is forwarded rewritten; the parameter check stays as a safety net.
+  Additive: `EnforcementPolicy` gains
   `sensitive_columns` and `EvaluationOutcome` gains `rewritten_query` and
   `sensitive_columns`. With no tags the engine skips the analysis and every decision
   is unchanged.
