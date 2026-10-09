@@ -7,6 +7,75 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [4.7.0] — 2026-10-08
+
+MySQL masks. A `mask` tag on MySQL used to block every read of the column with
+ERROR 1142; with vericto-engine v3.7.0 the proxy forwards the engine's rewritten
+query instead, so a MySQL client receives masked values, as a Postgres one already
+did. A database without tags is evaluated exactly as before.
+
+### Added
+
+- **`mask` on MySQL (VERICTO-085, engine v3.7.0).** When the engine returns a
+  `rewritten_query`, the proxy sends it in place of the original:
+  - `COM_QUERY`: the rewrite replaces the SQL text. The `CLIENT_QUERY_ATTRIBUTES`
+    prefix that MySQL 8.0.23+ clients put in front of it is kept, since the server
+    parses it first.
+  - `COM_STMT_PREPARE`: the rewrite replaces the statement. Its `?` placeholders are
+    counted with the MySQL lexer (not inside strings, quoted identifiers or comments)
+    before forwarding, so the parameter count the server returns in
+    `COM_STMT_PREPARE_OK` is the one the client prepared for. A different count is
+    blocked, like a lost `$n` on Postgres.
+  - `COM_STMT_EXECUTE` and `COM_STMT_SEND_LONG_DATA` are not touched. The proxy keeps
+    no statement map: the server gives the rewritten statement its id, the
+    `COM_STMT_PREPARE_OK` reaches the client unchanged, and the client executes that
+    id with the values it bound.
+
+  A MySQL mask the engine cannot rewrite (`SELECT *` over a masked column, a copy into
+  another table, a query whose text cannot be reproduced faithfully) still blocks with
+  ERROR 1142 and the engine's reason. The fail-safe checks are the Postgres ones: an
+  empty rewrite, a NUL, a changed `?` count, a rewrite with no masked column, or a
+  masked read with no rewrite all block with `VERICTO-085` and a message. A rewrite
+  that would not fit one MySQL packet, or a `COM_QUERY` whose attributes bind values,
+  cannot be framed and blocks too. `monitor_mode` forwards the original and only
+  reports. Telemetry is the Postgres one: `rule_code` `VERICTO-085`, the touched
+  columns, and the rewritten query next to the original.
+
+### Fixed
+
+- **Sanitized telemetry normalizes MySQL text with the MySQL lexer.** Every query was
+  normalized with libpg_query, whatever its dialect. On MySQL text that leaked and
+  lost data:
+  - a double-quoted value (`WHERE name = "Alice"`) is a string in MySQL and an
+    identifier in Postgres, so it was reported in clear;
+  - backtick-quoted identifiers, which every MySQL mask rewrite uses, do not parse in
+    Postgres, so the rewritten query would only ever have been reported as
+    `<unparseable query redacted>`.
+
+  MySQL queries, rewrites and suggestions now go through the sqlparser MySQL
+  tokenizer (the one the engine parses with). Every literal (string, number, hex,
+  bit) becomes `?` and every comment a space; keywords, identifiers, operators and
+  the client's own `?` are kept. Text that does not tokenize is still redacted.
+  Postgres is unchanged.
+
+### Changed
+
+- **vericto-engine v3.7.0** (from v3.6.1): MySQL `mask` rewrites. No type or field
+  changes. Engine changes that reach the wire beyond the mask itself:
+  - Rule evaluation on MySQL now follows MySQL's own reading of comments and string
+    escapes, for every rule and policy, with or without tags. Text the engine cannot
+    read with certainty is blocked by the new Security rule `VERICTO-086` ("SQL text
+    that MySQL and the engine would read differently"), which the proxy answers like
+    any block (ERROR 1142 on MySQL), and only flags under `monitor_mode`. Its message
+    carries no query text.
+  - More ways of copying a tagged MySQL column into a session variable or another
+    row now count as reads of it.
+  - On Postgres a computed expression masked `full` (`string_agg(email, ',')`) keeps
+    its expression, so an aggregate still returns one row. Values are unchanged.
+- **`sqlparser` 0.52** is now a direct dependency. It was already compiled in through
+  the engine, so no new code ships: it gives the `?` count and the MySQL sanitizer.
+  It stays pinned to the engine's version.
+
 ## [4.6.0] — 2026-10-08
 
 Sensitive Column Protection: the proxy enforces the database's column tags on the
@@ -798,7 +867,8 @@ the service now targets the rebranded engine.
 - Optional control-plane link: ruleset hot-sync and telemetry reporting.
 - `/health` and `/metrics` (p50/p99 latency) endpoints.
 
-[Unreleased]: https://github.com/vericto/vericto-proxy/compare/v4.6.0...HEAD
+[Unreleased]: https://github.com/vericto/vericto-proxy/compare/v4.7.0...HEAD
+[4.7.0]: https://github.com/vericto/vericto-proxy/compare/v4.6.0...v4.7.0
 [4.6.0]: https://github.com/vericto/vericto-proxy/compare/v4.5.1...v4.6.0
 [4.5.1]: https://github.com/vericto/vericto-proxy/compare/v4.5.0...v4.5.1
 [4.5.0]: https://github.com/vericto/vericto-proxy/compare/v4.4.2...v4.5.0

@@ -192,6 +192,50 @@ impl MySqlPacket {
             _ => None,
         }
     }
+
+    /// The same command carrying `sql` instead of its SQL text (a mask rewrite),
+    /// with the same sequence id and, on COM_QUERY, the same query-attributes
+    /// prefix (it belongs to the command: the server parses it before the SQL).
+    ///
+    /// `None` when the packet cannot carry it, so the caller blocks rather than
+    /// forward the original:
+    /// - not a COM_QUERY / COM_STMT_PREPARE;
+    /// - a COM_QUERY whose body is neither plain SQL nor a parameterless
+    ///   attributes prefix (`extract_sql` could not find where the SQL starts);
+    /// - a payload of 0xFFFFFF bytes or more, which needs continuation packets.
+    pub fn with_sql(&self, sql: &str) -> Option<MySqlPacket> {
+        let tag = self.command_tag()?;
+        let prefix: &[u8] = match tag {
+            COM_QUERY => {
+                let body = &self.payload[1..];
+                let sql_start = body.len() - strip_query_attributes(body).len();
+                if sql_start == 0 && !body.first().is_some_and(|&b| looks_like_sql_start(b)) {
+                    return None;
+                }
+                &body[..sql_start]
+            }
+            COM_STMT_PREPARE => &[],
+            _ => return None,
+        };
+        let len = 1 + prefix.len() + sql.len();
+        if len >= MYSQL_MAX_PACKET_LEN {
+            return None;
+        }
+        let mut payload = Vec::with_capacity(len);
+        payload.push(tag);
+        payload.extend_from_slice(prefix);
+        payload.extend_from_slice(sql.as_bytes());
+        Some(MySqlPacket {
+            seq: self.seq,
+            payload,
+        })
+    }
+}
+
+/// Whether a COM_QUERY body that starts with `b` is plain SQL (no
+/// query-attributes prefix): a keyword, a parenthesis, a space or a comment.
+fn looks_like_sql_start(b: u8) -> bool {
+    b.is_ascii_alphabetic() || b == b'(' || b == b' ' || b == b'/'
 }
 
 /// Reads a MySQL length-encoded integer. Returns (value, bytes_consumed).
@@ -236,7 +280,7 @@ fn strip_query_attributes(body: &[u8]) -> &[u8] {
     let Some(&first) = body.first() else {
         return body;
     };
-    if first.is_ascii_alphabetic() || first == b'(' || first == b' ' || first == b'/' {
+    if looks_like_sql_start(first) {
         // Looks like SQL already (SELECT, DELETE, (, comment, …) — no prefix.
         return body;
     }
@@ -387,6 +431,79 @@ mod tests {
         };
         assert_eq!(pkt.command_tag(), None);
         assert_eq!(pkt.extract_sql(), None);
+    }
+
+    fn prepare(sql: &str) -> MySqlPacket {
+        let mut payload = vec![COM_STMT_PREPARE];
+        payload.extend_from_slice(sql.as_bytes());
+        MySqlPacket { seq: 0, payload }
+    }
+
+    #[test]
+    fn with_sql_replaces_the_sql_of_a_query_and_a_prepare() {
+        let mut payload = vec![COM_QUERY];
+        payload.extend_from_slice(b"SELECT email FROM t");
+        let q = MySqlPacket { seq: 0, payload };
+        let r = q.with_sql("SELECT 'x' AS email FROM t").unwrap();
+        assert_eq!(r.seq, 0);
+        assert_eq!(r.payload[0], COM_QUERY);
+        assert_eq!(&r.payload[1..], b"SELECT 'x' AS email FROM t");
+
+        let p = MySqlPacket {
+            seq: 3,
+            ..prepare("SELECT email FROM t WHERE id = ?")
+        };
+        let r = p
+            .with_sql("SELECT 'x' AS email FROM t WHERE id = ?")
+            .unwrap();
+        assert_eq!(r.seq, 3, "the sequence id is kept");
+        assert_eq!(r.payload[0], COM_STMT_PREPARE);
+        assert_eq!(&r.payload[1..], b"SELECT 'x' AS email FROM t WHERE id = ?");
+        assert_eq!(
+            r.extract_sql().as_deref(),
+            Some("SELECT 'x' AS email FROM t WHERE id = ?")
+        );
+    }
+
+    /// A CLIENT_QUERY_ATTRIBUTES prefix belongs to the command, not the SQL: the
+    /// server still expects it in front of the rewritten text.
+    #[test]
+    fn with_sql_keeps_the_query_attributes_prefix() {
+        let mut payload = vec![COM_QUERY, 0x00, 0x01];
+        payload.extend_from_slice(b"SELECT email FROM t");
+        let q = MySqlPacket { seq: 0, payload };
+        let r = q.with_sql("SELECT 'x' AS email FROM t").unwrap();
+        assert_eq!(&r.payload[..3], &[COM_QUERY, 0x00, 0x01]);
+        assert_eq!(&r.payload[3..], b"SELECT 'x' AS email FROM t");
+        assert_eq!(
+            r.extract_sql().as_deref(),
+            Some("SELECT 'x' AS email FROM t")
+        );
+    }
+
+    /// When the proxy cannot tell where the SQL starts (a body that is neither SQL
+    /// nor a parameterless attributes prefix), or the result does not fit one
+    /// packet, there is no rewrite: the caller then blocks.
+    #[test]
+    fn with_sql_refuses_what_it_cannot_frame() {
+        // Query attributes with one bound parameter: the prefix is not skipped.
+        let mut payload = vec![
+            COM_QUERY, 0x01, 0x01, 0x00, 0x01, 0xfe, 0x00, 0x01, b'a', 0x01, b'1',
+        ];
+        payload.extend_from_slice(b"SELECT email FROM t");
+        let q = MySqlPacket { seq: 0, payload };
+        assert_eq!(q.with_sql("SELECT 1"), None);
+        // Not a SQL command.
+        let ping = MySqlPacket {
+            seq: 0,
+            payload: vec![0x0e],
+        };
+        assert_eq!(ping.with_sql("SELECT 1"), None);
+        // A payload of 0xFFFFFF bytes or more would need a continuation packet.
+        let big = "x".repeat(MYSQL_MAX_PACKET_LEN);
+        assert_eq!(prepare("SELECT 1").with_sql(&big), None);
+        let fits = "x".repeat(MYSQL_MAX_PACKET_LEN - 2);
+        assert!(prepare("SELECT 1").with_sql(&fits).is_some());
     }
 
     #[test]

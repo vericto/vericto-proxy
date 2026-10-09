@@ -390,7 +390,7 @@ fn build_event(
     let sanitized = mode == TelemetryQueryMode::Sanitized;
     let reported = |text: &str| -> String {
         if sanitized {
-            sanitize_query(text)
+            sanitize_for(text, dialect)
         } else {
             text.to_string()
         }
@@ -482,7 +482,7 @@ fn build_event(
                     // already carries it in `rewritten_query`.
                     None
                 } else if sensitive && sanitized {
-                    Some(sanitize_suggestion(s))
+                    Some(sanitize_suggestion(s, dialect))
                 } else {
                     Some(s.to_string())
                 }
@@ -573,12 +573,74 @@ pub(crate) fn report_telemetry(
 /// engine's fixed advice to list the columns, which carries none. SQL is
 /// normalized; the advice is kept; anything else is redacted, because it can
 /// only be text the proxy has not seen and cannot vouch for.
-fn sanitize_suggestion(s: &str) -> String {
-    match pg_query::normalize(s) {
-        Ok(normalized) => normalized,
-        Err(_) if s.starts_with("List the columns explicitly") => s.to_string(),
-        Err(_) => "<suggestion redacted>".to_string(),
+fn sanitize_suggestion(s: &str, dialect: Dialect) -> String {
+    if s.starts_with("List the columns explicitly") {
+        return s.to_string();
     }
+    match normalize_for(s, dialect) {
+        Some(normalized) => normalized,
+        None => "<suggestion redacted>".to_string(),
+    }
+}
+
+/// [`sanitize_query`] with the lexer of the query's own dialect. MySQL text is
+/// not Postgres text: there `"…"` is a string (libpg_query would keep it as an
+/// identifier, in clear), `\'` escapes a quote, `#` starts a comment, and every
+/// mask rewrite quotes its aliases with backticks, which libpg_query rejects.
+fn sanitize_for(sql: &str, dialect: Dialect) -> String {
+    match dialect {
+        Dialect::Mysql => {
+            normalize_mysql(sql).unwrap_or_else(|| "<unparseable query redacted>".to_string())
+        }
+        _ => sanitize_query(sql),
+    }
+}
+
+fn normalize_for(sql: &str, dialect: Dialect) -> Option<String> {
+    match dialect {
+        Dialect::Mysql => normalize_mysql(sql),
+        _ => pg_query::normalize(sql).ok(),
+    }
+}
+
+/// MySQL text with every literal (string, number, hex/bit, national) replaced
+/// by `?` and every comment by a space; keywords, identifiers, operators and
+/// the client's own `?` placeholders are kept. `None` when it does not lex, so
+/// the caller redacts it rather than report it raw. The token kinds are those
+/// of the sqlparser version pinned with the engine.
+fn normalize_mysql(sql: &str) -> Option<String> {
+    use sqlparser::tokenizer::{Token, Tokenizer, Whitespace};
+    let tokens = Tokenizer::new(&sqlparser::dialect::MySqlDialect {}, sql)
+        .tokenize()
+        .ok()?;
+    let mut out = String::with_capacity(sql.len());
+    for t in &tokens {
+        match t {
+            Token::Number(..)
+            | Token::SingleQuotedString(_)
+            | Token::DoubleQuotedString(_)
+            | Token::TripleSingleQuotedString(_)
+            | Token::TripleDoubleQuotedString(_)
+            | Token::DollarQuotedString(_)
+            | Token::SingleQuotedByteStringLiteral(_)
+            | Token::DoubleQuotedByteStringLiteral(_)
+            | Token::TripleSingleQuotedByteStringLiteral(_)
+            | Token::TripleDoubleQuotedByteStringLiteral(_)
+            | Token::SingleQuotedRawStringLiteral(_)
+            | Token::DoubleQuotedRawStringLiteral(_)
+            | Token::TripleSingleQuotedRawStringLiteral(_)
+            | Token::TripleDoubleQuotedRawStringLiteral(_)
+            | Token::NationalStringLiteral(_)
+            | Token::EscapedStringLiteral(_)
+            | Token::UnicodeStringLiteral(_)
+            | Token::HexStringLiteral(_) => out.push('?'),
+            Token::Whitespace(
+                Whitespace::SingleLineComment { .. } | Whitespace::MultiLineComment(_),
+            ) => out.push(' '),
+            other => out.push_str(&other.to_string()),
+        }
+    }
+    Some(out.trim().to_string())
 }
 
 /// Normalizes a SQL statement so no user data (literals) is reported: constants
@@ -1033,6 +1095,64 @@ mod tests {
         assert!(out.contains("$1"), "expected placeholder, got: {out}");
         assert!(out.contains("$2"), "expected placeholder, got: {out}");
         assert!(!out.contains("alice@acme.com"), "PII leaked: {out}");
+    }
+
+    /// MySQL text is normalized with the MySQL lexer: a double-quoted value is a
+    /// string there (libpg_query reads it as an identifier and keeps it), and a
+    /// backtick-quoted identifier, which every MySQL rewrite uses, is not an
+    /// error. Literals and comments go; identifiers and placeholders stay.
+    #[test]
+    fn sanitize_mysql_text_with_the_mysql_lexer() {
+        let my = Dialect::Mysql;
+        let out = sanitize_for(
+            "SELECT CONCAT('****', RIGHT(CAST(`card` AS CHAR), 4)) AS `card` FROM customers \
+             WHERE name = \"Alice Secret\" AND note = 'it\\'s' AND id = 42 AND x = ? \
+             AND h = x'4142' /* Bob */ -- Carol\n# Dave\n LIMIT 5",
+            my,
+        );
+        for leaked in [
+            "Alice", "it", "42", "4142", "Bob", "Carol", "Dave", "'****'", "4)", "5",
+        ] {
+            assert!(!out.contains(leaked), "{leaked} leaked: {out}");
+        }
+        assert!(out.contains("AS `card` FROM customers"), "{out}");
+        assert!(out.contains("x = ?"), "{out}");
+        // Not lexable: redacted, never raw.
+        assert_eq!(
+            sanitize_for("SELECT 'abc", my),
+            "<unparseable query redacted>"
+        );
+        // Postgres keeps libpg_query.
+        assert_eq!(
+            sanitize_for("SELECT 1", Dialect::Postgres),
+            sanitize_query("SELECT 1")
+        );
+    }
+
+    /// The masked rewrite of a MySQL query is reported sanitized, not redacted.
+    #[test]
+    fn sanitized_mode_reports_a_mysql_rewrite() {
+        let rewritten =
+            "SELECT CONCAT('****', RIGHT(`card`, 4)) AS `card` FROM customers WHERE name = 'Alice'";
+        let decision = TcpDecision::Forward {
+            observation: None,
+            violations: vec![sensitive_violation(rewritten)],
+            rewritten_query: Some(rewritten.to_string()),
+            sensitive_columns: vec![touched(0, vericto_engine::SensitivePolicy::Mask)],
+        };
+        let ev = build_event(
+            "db1",
+            "SELECT card FROM customers WHERE name = \"Alice\"",
+            Dialect::Mysql,
+            &decision,
+            1,
+            crate::tcp::rules_sync::TelemetryQueryMode::Sanitized,
+        );
+        assert_eq!(ev.query_text, "SELECT card FROM customers WHERE name = ?");
+        assert_eq!(
+            ev.rewritten_query.as_deref(),
+            Some("SELECT CONCAT(?, RIGHT(`card`, ?)) AS `card` FROM customers WHERE name = ?")
+        );
     }
 
     #[test]

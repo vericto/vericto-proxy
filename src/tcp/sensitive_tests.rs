@@ -12,6 +12,13 @@
 //!   (`tokio-postgres`) talks to the proxy, which fronts a real Postgres, over
 //!   the simple and the extended protocol, and must receive masked values. Each
 //!   test creates its own database and drops it afterwards, also on failure.
+//! * **Real MySQL** (run when `VERICTO_TEST_MYSQL_URL` is set, e.g.
+//!   `mysql://root:mysql@127.0.0.1:33061`): a real driver (`mysql_async`) talks to
+//!   the proxy over COM_QUERY and prepared statements (COM_STMT_PREPARE /
+//!   COM_STMT_EXECUTE with bound parameters). Same own-database rule. For an
+//!   upstream that requires TLS, MySQL needs TLS on both hops (see the README):
+//!   set `VERICTO_TEST_MYSQL_SSLMODE=require` and the proxy's certificate and key
+//!   in `VERICTO_TEST_MYSQL_TLS_CERT` / `VERICTO_TEST_MYSQL_TLS_KEY`.
 
 use std::sync::Arc;
 
@@ -54,18 +61,32 @@ fn config(
     policy: EnforcementPolicy,
     mode: TelemetryQueryMode,
 ) -> (Arc<PgProxyConfig>, Arc<MemoryQueue>) {
+    config_with(
+        upstream,
+        policy,
+        mode,
+        crate::tcp::evaluator::default_ruleset(),
+        crate::tcp::upstream::UpstreamTlsMode::Disable,
+    )
+}
+
+fn config_with(
+    upstream: (&str, u16),
+    policy: EnforcementPolicy,
+    mode: TelemetryQueryMode,
+    rules: Vec<vericto_engine::Rule>,
+    upstream_tls: crate::tcp::upstream::UpstreamTlsMode,
+) -> (Arc<PgProxyConfig>, Arc<MemoryQueue>) {
     let queue = Arc::new(MemoryQueue::new(100));
     let cfg = Arc::new(PgProxyConfig {
         upstream_host: upstream.0.to_string(),
         upstream_port: upstream.1,
-        upstream_tls: crate::tcp::upstream::UpstreamTlsMode::Disable,
+        upstream_tls,
         upstream_ca_path: None,
         upstream_client_cert: None,
         upstream_client_key: None,
         client_tls_acceptor: None,
-        ruleset: Arc::new(ArcSwap::from_pointee(
-            crate::tcp::evaluator::default_ruleset(),
-        )),
+        ruleset: Arc::new(ArcSwap::from_pointee(rules)),
         policy: Arc::new(ArcSwap::from_pointee(policy)),
         telemetry_mode: Arc::new(ArcSwap::from_pointee(mode)),
         telemetry: Some(TelemetrySink {
@@ -490,8 +511,144 @@ async fn my_first_query_reaching_db(w: &mut Wire) -> String {
     String::from_utf8_lossy(&p.payload[1..]).into_owned()
 }
 
+const COM_STMT_EXECUTE: u8 = 0x17;
+const COM_STMT_SEND_LONG_DATA: u8 = 0x18;
+
+/// SQL of a COM_QUERY / COM_STMT_PREPARE as the database received it.
+fn my_sql(p: &MySqlPacket) -> String {
+    p.extract_sql().expect("a SQL command")
+}
+
 #[tokio::test]
-async fn mysql_mask_is_blocked_with_err_1142() {
+async fn mysql_com_query_mask_forwards_the_rewritten_sql() {
+    let mut w = wire(
+        Box::new(MysqlProtocol),
+        policy_with_tags(),
+        TelemetryQueryMode::Raw,
+    );
+    let sql = "SELECT id, email, card FROM customers WHERE id = 7 LIMIT 5";
+    w.client.write_all(&my_cmd(COM_QUERY, sql)).await.unwrap();
+
+    let p = read_my(&mut w.db).await;
+    assert_eq!(p.seq, 0, "the sequence id is kept");
+    assert_eq!(p.payload[0], COM_QUERY, "still a COM_QUERY");
+    let forwarded = my_sql(&p);
+    assert_ne!(forwarded, sql, "the original must never be forwarded");
+    assert!(forwarded.contains("'****'"), "last4 mask: {forwarded}");
+    assert!(
+        forwarded.contains("AS `email`") || forwarded.contains("AS email"),
+        "{forwarded}"
+    );
+
+    let ev = events(&w.queue);
+    assert_eq!(ev.len(), 1);
+    let e = &ev[0];
+    assert_eq!(
+        e["query_text"], sql,
+        "the original is reported as query_text"
+    );
+    assert_eq!(e["rewritten_query"], forwarded.as_str());
+    assert_eq!(e["dialect"], "mysql");
+    assert_eq!(e["rule_code"], "VERICTO-085");
+    assert_eq!(e["status"], "FLAGGED");
+    assert_eq!(e["sensitive_columns"].as_array().unwrap().len(), 2);
+}
+
+/// MySQL 8.0.23+ clients prefix COM_QUERY with query attributes; the rewrite
+/// keeps that prefix, which the server parses before the SQL.
+#[tokio::test]
+async fn mysql_com_query_mask_keeps_the_query_attributes_prefix() {
+    let mut w = wire(
+        Box::new(MysqlProtocol),
+        policy_with_tags(),
+        TelemetryQueryMode::Raw,
+    );
+    let sql = "SELECT email FROM customers LIMIT 5";
+    let mut payload = vec![COM_QUERY, 0x00, 0x01];
+    payload.extend_from_slice(sql.as_bytes());
+    w.client
+        .write_all(&MySqlPacket { seq: 0, payload }.encode())
+        .await
+        .unwrap();
+    let p = read_my(&mut w.db).await;
+    assert_eq!(&p.payload[..3], &[COM_QUERY, 0x00, 0x01]);
+    let forwarded = my_sql(&p);
+    assert_ne!(forwarded, sql);
+    assert!(forwarded.starts_with("SELECT"), "{forwarded}");
+}
+
+/// A prepared statement: COM_STMT_PREPARE carries the rewrite with the same
+/// `?` parameters; COM_STMT_SEND_LONG_DATA and COM_STMT_EXECUTE, which only
+/// carry the server's statement id and the bound values, pass through byte for
+/// byte. The proxy keeps no statement map: the id the client executes is the
+/// one the server assigned to the rewritten statement.
+#[tokio::test]
+async fn mysql_prepare_mask_forwards_the_rewrite_and_execute_passes_through() {
+    let mut w = wire(
+        Box::new(MysqlProtocol),
+        policy_with_tags(),
+        TelemetryQueryMode::Raw,
+    );
+    let sql = "SELECT id, card FROM customers WHERE id = ? AND name = ? LIMIT 5";
+    w.client
+        .write_all(&my_cmd(COM_STMT_PREPARE, sql))
+        .await
+        .unwrap();
+    let p = read_my(&mut w.db).await;
+    assert_eq!(p.payload[0], COM_STMT_PREPARE);
+    let forwarded = my_sql(&p);
+    assert_ne!(forwarded, sql);
+    assert!(forwarded.contains("'****'"), "{forwarded}");
+    assert_eq!(
+        forwarded.matches('?').count(),
+        2,
+        "both parameters survive: {forwarded}"
+    );
+
+    // stmt_id 1, a long-data chunk for parameter 1, then the execute.
+    let long_data = MySqlPacket {
+        seq: 0,
+        payload: [&[COM_STMT_SEND_LONG_DATA, 1, 0, 0, 0, 1, 0][..], b"Ann"].concat(),
+    };
+    let execute = MySqlPacket {
+        seq: 0,
+        payload: vec![
+            COM_STMT_EXECUTE,
+            1,
+            0,
+            0,
+            0, // stmt_id
+            0,
+            1,
+            0,
+            0,
+            0, // flags, iteration_count
+            0, // null bitmap
+            1,
+            3,
+            0,
+            0xfe,
+            0, // new_params_bound, types (LONG, STRING)
+            7,
+            0,
+            0,
+            0, // id = 7 (name was sent as long data)
+        ],
+    };
+    for pkt in [&long_data, &execute] {
+        w.client.write_all(&pkt.encode()).await.unwrap();
+        assert_eq!(&read_my(&mut w.db).await, pkt, "forwarded unchanged");
+    }
+    let ev = events(&w.queue);
+    assert_eq!(ev.len(), 1, "only the prepare is evaluated");
+    assert_eq!(ev[0]["rewritten_query"], forwarded.as_str());
+}
+
+/// A mask the engine cannot rewrite (`*` over a masked column) still blocks
+/// with ERROR 1142, on COM_QUERY and COM_STMT_PREPARE: nothing reaches the
+/// database.
+#[tokio::test]
+async fn mysql_mask_without_a_rewrite_is_blocked_with_err_1142() {
     let mut w = wire(
         Box::new(MysqlProtocol),
         policy_with_tags(),
@@ -499,17 +656,63 @@ async fn mysql_mask_is_blocked_with_err_1142() {
     );
     for cmd in [COM_QUERY, COM_STMT_PREPARE] {
         w.client
-            .write_all(&my_cmd(cmd, "SELECT email FROM customers LIMIT 1"))
+            .write_all(&my_cmd(cmd, "SELECT * FROM customers LIMIT 1"))
             .await
             .unwrap();
-        let (code, msg) = my_err(&read_my(&mut w.client).await);
+        let reply = read_my(&mut w.client).await;
+        assert_eq!(reply.seq, 1);
+        let (code, msg) = my_err(&reply);
         assert_eq!(code, 1142);
-        assert!(msg.contains("VERICTO-085") && msg.contains("mask"), "{msg}");
+        assert!(
+            msg.contains("VERICTO-085") && msg.contains("list the columns"),
+            "{msg}"
+        );
     }
     assert_eq!(my_first_query_reaching_db(&mut w).await, "SELECT 1");
     let ev = events(&w.queue);
     assert_eq!(ev[0]["status"], "BLOCKED");
-    assert_eq!(ev[0]["sensitive_columns"][0]["column"], "email");
+    assert!(ev[0].get("rewritten_query").is_none());
+}
+
+/// monitor_mode never changes what runs: the original is forwarded on both
+/// commands, and the would-be rewrite is only reported.
+#[tokio::test]
+async fn mysql_monitor_mode_forwards_the_original() {
+    let mut policy = policy_with_tags();
+    policy.monitor_mode = true;
+    let mut w = wire(Box::new(MysqlProtocol), policy, TelemetryQueryMode::Raw);
+    for cmd in [COM_QUERY, COM_STMT_PREPARE] {
+        let sql = "SELECT email FROM customers WHERE id = 1 LIMIT 5";
+        w.client.write_all(&my_cmd(cmd, sql)).await.unwrap();
+        assert_eq!(my_sql(&read_my(&mut w.db).await), sql);
+    }
+    for e in events(&w.queue) {
+        assert!(e.get("rewritten_query").is_none());
+        assert_eq!(e["sensitive_columns"][0]["policy"], "mask");
+    }
+}
+
+/// Sanitized telemetry covers the MySQL rewrite too: its literals never leave.
+#[tokio::test]
+async fn mysql_sanitized_mode_sanitizes_the_rewritten_query_too() {
+    let mut w = wire(
+        Box::new(MysqlProtocol),
+        policy_with_tags(),
+        TelemetryQueryMode::Sanitized,
+    );
+    let sql = "SELECT email FROM customers WHERE name = 'Alice Secret' LIMIT 5";
+    w.client.write_all(&my_cmd(COM_QUERY, sql)).await.unwrap();
+    let forwarded = my_sql(&read_my(&mut w.db).await);
+    assert!(
+        forwarded.contains("Alice Secret"),
+        "the database gets the real query"
+    );
+
+    let ev = events(&w.queue);
+    let body = serde_json::to_string(&ev[0]).unwrap();
+    assert!(!body.contains("Alice Secret"), "{body}");
+    let reported = ev[0]["rewritten_query"].as_str().expect("rewritten_query");
+    assert_ne!(reported, forwarded);
 }
 
 #[tokio::test]
@@ -554,6 +757,101 @@ async fn mysql_parse_error_with_a_block_tag_blocks() {
     assert_eq!(code, 1142);
     assert!(msg.contains("VERICTO-PARSE-ERROR"), "{msg}");
     assert_eq!(my_first_query_reaching_db(&mut w).await, "SELECT 1");
+}
+
+// ── VERICTO-086: text MySQL and the engine would read differently ────────────
+
+/// A statement inside an executable comment that is never closed: what MySQL
+/// runs depends on how it ends the comment, so the engine cannot vouch for it.
+const DIVERGENT: &str = "/*!50000 SELECT id FROM accounts";
+
+/// VERICTO-086 blocks with no tags at all, on COM_QUERY and COM_STMT_PREPARE,
+/// as a native ERROR 1142 naming the rule; nothing reaches the database, and the
+/// event is a BLOCKED one with the original text (raw mode).
+#[tokio::test]
+async fn mysql_text_divergence_is_blocked_with_err_1142() {
+    let mut w = wire(
+        Box::new(MysqlProtocol),
+        EnforcementPolicy::default(),
+        TelemetryQueryMode::Raw,
+    );
+    for cmd in [COM_QUERY, COM_STMT_PREPARE] {
+        w.client.write_all(&my_cmd(cmd, DIVERGENT)).await.unwrap();
+        let reply = read_my(&mut w.client).await;
+        assert_eq!(reply.seq, 1);
+        let (code, msg) = my_err(&reply);
+        assert_eq!(code, 1142);
+        assert!(msg.contains("[VERICTO-086]"), "{msg}");
+    }
+    assert_eq!(my_first_query_reaching_db(&mut w).await, "SELECT 1");
+    let ev = events(&w.queue);
+    for e in &ev[..2] {
+        assert_eq!(e["status"], "BLOCKED");
+        assert_eq!(e["rule_code"], "VERICTO-086");
+        assert_eq!(e["enforcement_action"], "block");
+        assert_eq!(e["violations"][0]["rule_code"], "VERICTO-086");
+        assert_eq!(e["query_text"], DIVERGENT);
+        assert!(e.get("parse_error").is_none(), "not a parse error");
+    }
+}
+
+/// In sanitized mode the text does not tokenize, so it is redacted; the
+/// rule's message carries no query text either.
+#[tokio::test]
+async fn mysql_text_divergence_in_sanitized_mode_leaks_nothing() {
+    let mut w = wire(
+        Box::new(MysqlProtocol),
+        EnforcementPolicy::default(),
+        TelemetryQueryMode::Sanitized,
+    );
+    w.client
+        .write_all(&my_cmd(COM_QUERY, DIVERGENT))
+        .await
+        .unwrap();
+    assert_eq!(my_err(&read_my(&mut w.client).await).0, 1142);
+    let ev = events(&w.queue);
+    assert_eq!(ev[0]["rule_code"], "VERICTO-086");
+    assert_eq!(ev[0]["query_text"], "<unparseable query redacted>");
+    let body = serde_json::to_string(&ev[0]).unwrap();
+    assert!(!body.contains("accounts"), "{body}");
+}
+
+/// monitor_mode never blocks: forwarded as sent, reported as FLAGGED.
+#[tokio::test]
+async fn mysql_text_divergence_under_monitor_mode_is_flagged() {
+    let policy = EnforcementPolicy {
+        monitor_mode: true,
+        ..EnforcementPolicy::default()
+    };
+    let mut w = wire(Box::new(MysqlProtocol), policy, TelemetryQueryMode::Raw);
+    w.client
+        .write_all(&my_cmd(COM_QUERY, DIVERGENT))
+        .await
+        .unwrap();
+    assert_eq!(my_sql(&read_my(&mut w.db).await), DIVERGENT);
+    let ev = events(&w.queue);
+    assert_eq!(ev[0]["status"], "FLAGGED");
+    assert_eq!(ev[0]["rule_code"], "VERICTO-086");
+}
+
+/// The engine raises VERICTO-086 on MySQL text only, but a block is rendered
+/// per protocol from its rule code: on Postgres it is the native
+/// ErrorResponse 42501 (+ ReadyForQuery) naming the rule.
+#[test]
+fn a_vericto_086_block_on_postgres_is_42501() {
+    let block = PostgresProtocol.build_block_response(&crate::tcp::protocol::BlockContext {
+        rule_code: "VERICTO-086",
+        ast_node_path: "LexicalDivergence > MySQL may read this text differently (…)",
+        suggested_safe_query: None,
+        kind: crate::tcp::protocol::QueryKind::Simple,
+        client_seq: 0,
+    });
+    assert_eq!(block.bytes[0], b'E');
+    let len = i32::from_be_bytes(block.bytes[1..5].try_into().unwrap()) as usize;
+    let (code, msg) = pg_error(&block.bytes[5..1 + len]);
+    assert_eq!(code, "42501");
+    assert!(msg.contains("[VERICTO-086]"), "{msg}");
+    assert_eq!(block.bytes[1 + len], b'Z');
 }
 
 // ── Real Postgres ────────────────────────────────────────────────────────────
@@ -763,6 +1061,261 @@ async fn real_pg_block_and_flag() {
             .await
             .unwrap();
         assert_eq!(row.get::<_, String>(0), "555-0101");
+    })
+    .await;
+}
+
+// ── Real MySQL ───────────────────────────────────────────────────────────────
+
+use mysql_async::prelude::Queryable;
+
+/// URL of an admin connection (`mysql://user:pass@host:port`), or None to skip.
+fn mysql_url() -> Option<String> {
+    std::env::var("VERICTO_TEST_MYSQL_URL")
+        .ok()
+        .filter(|s| !s.is_empty())
+}
+
+/// A proxy fronting `upstream` on an ephemeral port; returns that port.
+async fn spawn_mysql_proxy(cfg: Arc<PgProxyConfig>) -> u16 {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        while let Ok((sock, _)) = listener.accept().await {
+            tokio::spawn(crate::tcp::session::handle_mysql_connection(
+                sock,
+                cfg.clone(),
+            ));
+        }
+    });
+    port
+}
+
+/// Driver options for a connection to the proxy on `port`. `prefer_socket` off:
+/// otherwise the driver reconnects to the server's own unix socket and bypasses
+/// the proxy.
+fn via_proxy(
+    admin: &mysql_async::Opts,
+    port: u16,
+    db: Option<&str>,
+    tls: bool,
+) -> mysql_async::Opts {
+    mysql_async::OptsBuilder::default()
+        .ip_or_hostname("127.0.0.1")
+        .tcp_port(port)
+        .user(admin.user())
+        .pass(admin.pass())
+        .db_name(db)
+        .prefer_socket(false)
+        // The proxy's test certificate is not issued for 127.0.0.1.
+        .ssl_opts(
+            tls.then(|| mysql_async::SslOpts::default().with_danger_accept_invalid_certs(true)),
+        )
+        .into()
+}
+
+/// The proxy's client-side TLS acceptor when the upstream hop is TLS (MySQL
+/// needs both hops or neither).
+fn mysql_client_tls(
+    tls: crate::tcp::upstream::UpstreamTlsMode,
+) -> Option<tokio_rustls::TlsAcceptor> {
+    if tls == crate::tcp::upstream::UpstreamTlsMode::Disable {
+        return None;
+    }
+    let var = |k: &str| std::env::var(k).unwrap_or_else(|_| panic!("{k} is required with TLS"));
+    Some(
+        crate::tcp::client_tls::build_acceptor(
+            &var("VERICTO_TEST_MYSQL_TLS_CERT"),
+            &var("VERICTO_TEST_MYSQL_TLS_KEY"),
+        )
+        .expect("proxy certificate"),
+    )
+}
+
+/// Runs `body` against a fresh database seeded with `customers`, reached
+/// through a proxy with [`tags`] and the default rules. Seeding and cleanup go
+/// through a second proxy with no tags and no rules (the upstream may require
+/// TLS, which the test driver does not speak). The database is dropped
+/// afterwards, also when `body` panics.
+async fn with_real_mysql<F, Fut>(body: F)
+where
+    F: FnOnce(mysql_async::Opts) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = ()> + Send + 'static,
+{
+    let Some(url) = mysql_url() else {
+        eprintln!("VERICTO_TEST_MYSQL_URL not set: skipping the real-MySQL test");
+        return;
+    };
+    // The upstream TLS hop needs a process-level provider (main.rs installs it).
+    let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
+    let admin = mysql_async::Opts::from_url(&url).expect("VERICTO_TEST_MYSQL_URL");
+    let upstream = (admin.ip_or_hostname().to_string(), admin.tcp_port());
+    let tls = crate::tcp::upstream::UpstreamTlsMode::from_env_str(
+        &std::env::var("VERICTO_TEST_MYSQL_SSLMODE").unwrap_or_default(),
+    );
+    let (plain, _) = config_with(
+        (&upstream.0, upstream.1),
+        EnforcementPolicy::default(),
+        TelemetryQueryMode::Raw,
+        Vec::new(),
+        tls,
+    );
+    let (tagged, _) = config_with(
+        (&upstream.0, upstream.1),
+        policy_with_tags(),
+        TelemetryQueryMode::Raw,
+        crate::tcp::evaluator::default_ruleset(),
+        tls,
+    );
+    let acceptor = mysql_client_tls(tls);
+    let client_tls = acceptor.is_some();
+    let with_tls = |cfg: Arc<PgProxyConfig>| {
+        let mut cfg = Arc::into_inner(cfg).expect("unshared config");
+        cfg.client_tls_acceptor = acceptor.clone();
+        Arc::new(cfg)
+    };
+    let admin_port = spawn_mysql_proxy(with_tls(plain)).await;
+    let tagged_port = spawn_mysql_proxy(with_tls(tagged)).await;
+    let db = format!(
+        "vericto_proxy_pii_{}",
+        &uuid::Uuid::new_v4().simple().to_string()[..12]
+    );
+
+    let mut conn = mysql_async::Conn::new(via_proxy(&admin, admin_port, None, client_tls))
+        .await
+        .expect("connect (admin, through an untagged proxy)");
+    conn.query_drop(format!("CREATE DATABASE {db}"))
+        .await
+        .unwrap();
+    let seed = [
+        format!(
+            "CREATE TABLE {db}.customers (id INT PRIMARY KEY, name VARCHAR(40), \
+             email VARCHAR(80), card VARCHAR(20), ssn VARCHAR(11), phone VARCHAR(20))"
+        ),
+        format!(
+            "INSERT INTO {db}.customers (id, name, email, card, ssn, phone) VALUES \
+               (1, 'Ann',  'ann@example.io', '4111111111114242', '123-45-6789', '555-0101'), \
+               (2, 'Bob',  'plainvalue',     '5500000000000004', '987-65-4321', '555-0102'), \
+               (3, 'Cleo', NULL,             NULL,               NULL,          NULL)"
+        ),
+    ];
+    let mut seeded = Ok(());
+    for sql in seed {
+        if let Err(e) = conn.query_drop(sql).await {
+            seeded = Err(e);
+            break;
+        }
+    }
+
+    let result: Result<(), Box<dyn std::any::Any + Send>> = match seeded {
+        Ok(()) => tokio::spawn(body(via_proxy(&admin, tagged_port, Some(&db), client_tls)))
+            .await
+            .map_err(|e| e.into_panic()),
+        Err(e) => Err(Box::new(format!("seeding failed: {e}"))),
+    };
+
+    conn.query_drop(format!("DROP DATABASE IF EXISTS {db}"))
+        .await
+        .unwrap();
+    conn.disconnect().await.unwrap();
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+type MaskedRow = (i64, Option<String>, Option<String>);
+
+const EXPECTED_MASKED: [(i64, Option<&str>, Option<&str>); 3] = [
+    (1, Some("a***@example.io"), Some("****4242")),
+    (2, Some("p***"), Some("****0004")),
+    (3, None, None),
+];
+
+fn expected_masked() -> Vec<MaskedRow> {
+    EXPECTED_MASKED
+        .iter()
+        .map(|(i, e, c)| (*i, e.map(str::to_string), c.map(str::to_string)))
+        .collect()
+}
+
+/// COM_QUERY (the text protocol).
+#[tokio::test]
+async fn real_mysql_text_query_returns_masked_values() {
+    with_real_mysql(|opts| async move {
+        let mut c = mysql_async::Conn::new(opts).await.unwrap();
+        let rows: Vec<MaskedRow> = c
+            .query("SELECT id, email, card FROM customers ORDER BY id LIMIT 10")
+            .await
+            .unwrap();
+        assert_eq!(rows, expected_masked());
+        c.disconnect().await.unwrap();
+    })
+    .await;
+}
+
+/// COM_STMT_PREPARE + COM_STMT_EXECUTE with a bound parameter (the binary
+/// protocol), and a prepared statement executed twice.
+#[tokio::test]
+async fn real_mysql_prepared_statement_returns_masked_values() {
+    with_real_mysql(|opts| async move {
+        let mut c = mysql_async::Conn::new(opts).await.unwrap();
+        let rows: Vec<MaskedRow> = c
+            .exec(
+                "SELECT id, email, card FROM customers WHERE id >= ? ORDER BY id LIMIT 10",
+                (1,),
+            )
+            .await
+            .unwrap();
+        assert_eq!(rows, expected_masked());
+
+        let stmt = c
+            .prep("SELECT card, name FROM customers WHERE id = ?")
+            .await
+            .unwrap();
+        assert_eq!(stmt.num_params(), 1, "the server's parameter count");
+        assert_eq!(
+            stmt.columns()[0].name_str(),
+            "card",
+            "the masked column keeps its name"
+        );
+        for (id, want) in [(1, "****4242"), (2, "****0004")] {
+            let row: Option<(String, String)> = c.exec_first(&stmt, (id,)).await.unwrap();
+            assert_eq!(row.unwrap().0, want);
+        }
+        c.disconnect().await.unwrap();
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn real_mysql_block_and_flag() {
+    with_real_mysql(|opts| async move {
+        let mut c = mysql_async::Conn::new(opts).await.unwrap();
+        let code = |e: mysql_async::Error| match e {
+            mysql_async::Error::Server(s) => (s.code, s.message),
+            other => panic!("expected a server error, got {other}"),
+        };
+        for sql in [
+            "SELECT ssn FROM customers LIMIT 1",
+            "SELECT * FROM customers LIMIT 1",
+        ] {
+            let (n, msg) = code(c.query_drop(sql).await.unwrap_err());
+            assert_eq!(n, 1142, "{msg}");
+            assert!(msg.contains("VERICTO-085"), "{msg}");
+            let (n, _) = code(
+                c.exec_drop(format!("{sql} OFFSET ?").as_str(), (0,))
+                    .await
+                    .unwrap_err(),
+            );
+            assert_eq!(n, 1142);
+        }
+        // The connection is still usable, and flag returns the value in clear.
+        let phone: Option<String> = c
+            .exec_first("SELECT phone FROM customers WHERE id = ?", (1,))
+            .await
+            .unwrap();
+        assert_eq!(phone.as_deref(), Some("555-0101"));
+        c.disconnect().await.unwrap();
     })
     .await;
 }

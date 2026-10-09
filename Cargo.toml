@@ -1,6 +1,6 @@
 [package]
 name = "vericto-proxy"
-version = "4.6.0"
+version = "4.7.0"
 edition = "2024"
 rust-version = "1.88"
 description = "Vericto — Deterministic SQL firewall — TCP wire-protocol proxy for customer infrastructure"
@@ -14,13 +14,19 @@ path = "src/main.rs"
 
 [dependencies]
 # AST engine (open-core shared library)
-vericto-engine = { git = "https://github.com/vericto/vericto-engine", tag = "v3.6.1" }
+vericto-engine = { git = "https://github.com/vericto/vericto-engine", tag = "v3.7.0" }
 
 # PostgreSQL query normalization for sanitized telemetry (literals → $1, $2…).
 # Same major version the engine uses, so libpg_query resolves to a single build.
 # Both statically link libpg_query, so a major-version split here would compile
 # and link two copies of it: bump this line and the engine tag above together.
 pg_query = "6.2"
+
+# MySQL tokenizer: the `?` count check on a masked COM_STMT_PREPARE
+# (src/tcp/evaluator.rs) and sanitized telemetry of MySQL text (src/tcp/postgres.rs).
+# The engine parses MySQL with this same crate, so it adds no code; keep the
+# version the engine's: bump this line and the engine tag together.
+sqlparser = "0.52"
 
 # Async runtime
 tokio = { version = "1.38", features = ["full"] }
@@ -68,6 +74,11 @@ axum = "0.7"
 # (src/tcp/sensitive_tests.rs), run against a live database when
 # VERICTO_TEST_PG_URL is set. Dev-only: nothing of it ships in the binary.
 tokio-postgres = "0.7"
+# A real MySQL driver for the same tests, over COM_QUERY and prepared
+# statements (COM_STMT_PREPARE / COM_STMT_EXECUTE), run when
+# VERICTO_TEST_MYSQL_URL is set. rustls on ring (already in the tree) for the
+# both-hops-TLS run; no C zlib.
+mysql_async = { version = "0.37", default-features = false, features = ["default-rustls-ring"] }
 
 [profile.release]
 opt-level = 3

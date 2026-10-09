@@ -27,7 +27,7 @@ pub enum TcpDecision {
         /// no engine violations to report.
         violations: Vec<ReportedViolation>,
         /// The SQL to send INSTEAD of the original: a `mask` tag was applied
-        /// (Postgres only). When `Some`, the session forwards this text and never
+        /// (Postgres and MySQL). When `Some`, the session forwards this text and never
         /// the original; `evaluate` has already checked it is consistent.
         rewritten_query: Option<String>,
         /// Every tagged column the query reads (VERICTO-085), for the audit trail.
@@ -178,14 +178,15 @@ pub fn evaluate(
 
 /// [`evaluate`], plus the checks that depend on how the query arrived.
 ///
-/// A `Parse` message is followed by a `Bind` the client built for the
-/// parameters of the statement it sent. The engine keeps `$n` placeholders, but
-/// a computed expression over a masked column is masked whole, so
-/// `substring(card, $1, 4)` becomes a constant and `$1` disappears: the
-/// client's `Bind` no longer fits the statement. That is refused here, with a
-/// message that says why, instead of forwarding a statement that fails later
-/// with a confusing protocol error. Checked before telemetry so the event
-/// records what actually happened.
+/// A prepared statement (Postgres `Parse`, MySQL `COM_STMT_PREPARE`) is
+/// followed by values the client binds to the parameters of the statement it
+/// sent. A rewrite that changes those parameters no longer fits the client's
+/// `Bind` / `COM_STMT_EXECUTE`, so it is refused here, with a message that says
+/// why, instead of forwarding a statement that fails later with a confusing
+/// protocol error (or, on MySQL, binds a value to the wrong `?`). The engine
+/// keeps every parameter (3.6.1 for `$n`, 3.7.0 for `?`); this is the proxy not
+/// taking that on trust. Checked before telemetry so the event records what
+/// actually happened.
 pub fn evaluate_message(
     sql: &str,
     dialect: Dialect,
@@ -193,12 +194,21 @@ pub fn evaluate_message(
     rules: &[Rule],
     policy: &EnforcementPolicy,
 ) -> TcpDecision {
-    let decision = evaluate(sql, dialect, rules, policy);
+    checked_for_kind(evaluate(sql, dialect, rules, policy), sql, dialect, kind)
+}
+
+/// The parameter check of [`evaluate_message`] on an already evaluated query.
+fn checked_for_kind(
+    decision: TcpDecision,
+    sql: &str,
+    dialect: Dialect,
+    kind: QueryKind,
+) -> TcpDecision {
     match decision {
         TcpDecision::Forward {
             rewritten_query: Some(ref rewritten),
             ..
-        } if kind == QueryKind::Prepared => match parameter_mismatch(sql, rewritten) {
+        } if kind == QueryKind::Prepared => match parameter_mismatch(sql, rewritten, dialect) {
             None => decision,
             Some(reason) => {
                 let TcpDecision::Forward {
@@ -234,7 +244,7 @@ fn rewrite_inconsistency(
         .iter()
         .any(|c| c.policy == SensitivePolicy::Mask);
     match &outcome.rewritten_query {
-        Some(_) if dialect != Dialect::Postgres => {
+        Some(_) if !matches!(dialect, Dialect::Postgres | Dialect::Mysql) => {
             Some("a rewritten query was returned for a dialect the rewrite does not support")
         }
         Some(_) if !masked => Some("a rewritten query was returned but no masked column was read"),
@@ -269,9 +279,51 @@ fn placeholders(sql: &str) -> Option<Vec<i32>> {
     Some(n)
 }
 
+/// Number of `?` parameters of a MySQL statement, counted with the MySQL lexer
+/// (as the server counts them: not inside a string, a quoted identifier or a
+/// comment). `None` when it does not lex.
+fn mysql_placeholders(sql: &str) -> Option<usize> {
+    let tokens = sqlparser::tokenizer::Tokenizer::new(&sqlparser::dialect::MySqlDialect {}, sql)
+        .tokenize()
+        .ok()?;
+    Some(
+        tokens
+            .iter()
+            .filter(
+                |t| matches!(t, sqlparser::tokenizer::Token::Placeholder(p) if p.starts_with('?')),
+            )
+            .count(),
+    )
+}
+
 /// Why `rewritten` cannot be bound with the parameters the client prepared
 /// `original` for, or `None` when it can.
-fn parameter_mismatch(original: &str, rewritten: &str) -> Option<String> {
+fn parameter_mismatch(original: &str, rewritten: &str, dialect: Dialect) -> Option<String> {
+    match dialect {
+        Dialect::Mysql => mysql_parameter_mismatch(original, rewritten),
+        _ => postgres_parameter_mismatch(original, rewritten),
+    }
+}
+
+/// MySQL `?` are positional: the server reports their count in
+/// COM_STMT_PREPARE_OK and the client binds that many values, in order. The
+/// engine keeps them in order (contract §10.3); the proxy checks the count,
+/// which is what the client's COM_STMT_EXECUTE depends on.
+fn mysql_parameter_mismatch(original: &str, rewritten: &str) -> Option<String> {
+    let (Some(before), Some(after)) = (mysql_placeholders(original), mysql_placeholders(rewritten))
+    else {
+        return Some("the rewritten statement could not be checked for parameters".to_string());
+    };
+    (before != after).then(|| {
+        format!(
+            "masking changes the number of `?` parameters from {before} to {after}, so the \
+             values the client binds would no longer fit; select the column itself, or compute \
+             on it without a parameter"
+        )
+    })
+}
+
+fn postgres_parameter_mismatch(original: &str, rewritten: &str) -> Option<String> {
     let (Some(before), Some(after)) = (placeholders(original), placeholders(rewritten)) else {
         return Some("the rewritten statement could not be checked for parameters".to_string());
     };
@@ -640,28 +692,54 @@ mod tests {
         assert_eq!(observation.unwrap().rule_code, SENSITIVE_RULE_CODE);
     }
 
+    /// Engine 3.7.0 rewrites a MySQL mask too: the proxy forwards the rewrite
+    /// (it used to block every MySQL mask with "no rewrite for mysql yet").
     #[test]
-    fn mysql_mask_blocks() {
+    fn mysql_mask_forwards_the_rewrite() {
+        for kind in [QueryKind::Simple, QueryKind::Prepared] {
+            let d = evaluate_message(
+                "SELECT id, email FROM customers WHERE id = ? LIMIT 1",
+                Dialect::Mysql,
+                kind,
+                &default_ruleset(),
+                &mask_email(),
+            );
+            let TcpDecision::Forward {
+                rewritten_query: Some(sql),
+                sensitive_columns,
+                observation,
+                ..
+            } = d
+            else {
+                panic!("a successful MySQL mask forwards the rewritten query ({kind:?})");
+            };
+            assert!(!sql.contains("SELECT id, email FROM"), "{sql}");
+            assert_eq!(mysql_placeholders(&sql), Some(1), "{sql}");
+            assert_eq!(sensitive_columns.len(), 1);
+            assert_eq!(sensitive_columns[0].policy, SensitivePolicy::Mask);
+            assert_eq!(observation.unwrap().rule_code, SENSITIVE_RULE_CODE);
+        }
+    }
+
+    /// A MySQL mask the engine cannot rewrite (`*` over a masked column) still
+    /// blocks: there is no rewrite to forward, and the original would leak.
+    #[test]
+    fn mysql_mask_without_a_rewrite_blocks() {
         match evaluate(
-            "SELECT email FROM customers LIMIT 1",
+            "SELECT * FROM customers LIMIT 1",
             Dialect::Mysql,
             &default_ruleset(),
             &mask_email(),
         ) {
             TcpDecision::Block {
                 rule_code,
-                ast_node_path,
                 sensitive_columns,
                 ..
             } => {
                 assert_eq!(rule_code, SENSITIVE_RULE_CODE);
-                assert!(
-                    ast_node_path.contains("mask unsupported"),
-                    "{ast_node_path}"
-                );
                 assert_eq!(sensitive_columns.len(), 1);
             }
-            TcpDecision::Forward { .. } => panic!("mask on MySQL must block"),
+            TcpDecision::Forward { .. } => panic!("`*` under mask must block"),
         }
     }
 
@@ -701,17 +779,25 @@ mod tests {
         assert!(rewrite_inconsistency(&none, pg, &plain).is_some());
         // ... except under monitor_mode, which never changes what runs.
         assert_eq!(rewrite_inconsistency(&none, pg, &monitor), None);
-        // A rewrite for MySQL, without a masked column, empty, or with a NUL.
-        assert!(rewrite_inconsistency(&ok, Dialect::Mysql, &plain).is_some());
-        let unmasked = outcome(Some("SELECT 1"), vec![touched(SensitivePolicy::Flag)]);
-        assert!(rewrite_inconsistency(&unmasked, pg, &plain).is_some());
-        for bad in ["  ", "SELECT 1\0"] {
-            let o = outcome(Some(bad), vec![touched(SensitivePolicy::Mask)]);
-            assert!(rewrite_inconsistency(&o, pg, &plain).is_some(), "{bad:?}");
+        // MySQL has a rewrite too (engine 3.7.0); Oracle and MS SQL do not.
+        assert_eq!(rewrite_inconsistency(&ok, Dialect::Mysql, &plain), None);
+        for d in [Dialect::Oracle, Dialect::MsSql] {
+            assert!(rewrite_inconsistency(&ok, d, &plain).is_some(), "{d:?}");
         }
-        // Nothing masked, nothing rewritten: not this check's business.
-        let flag = outcome(None, vec![touched(SensitivePolicy::Flag)]);
-        assert_eq!(rewrite_inconsistency(&flag, pg, &plain), None);
+        // Without a masked column, empty, or with a NUL: on both dialects.
+        for d in [pg, Dialect::Mysql] {
+            assert!(rewrite_inconsistency(&none, d, &plain).is_some(), "{d:?}");
+            assert_eq!(rewrite_inconsistency(&none, d, &monitor), None, "{d:?}");
+            let unmasked = outcome(Some("SELECT 1"), vec![touched(SensitivePolicy::Flag)]);
+            assert!(rewrite_inconsistency(&unmasked, d, &plain).is_some());
+            for bad in ["", "  ", "SELECT 1\0"] {
+                let o = outcome(Some(bad), vec![touched(SensitivePolicy::Mask)]);
+                assert!(rewrite_inconsistency(&o, d, &plain).is_some(), "{bad:?}");
+            }
+            // Nothing masked, nothing rewritten: not this check's business.
+            let flag = outcome(None, vec![touched(SensitivePolicy::Flag)]);
+            assert_eq!(rewrite_inconsistency(&flag, d, &plain), None);
+        }
     }
 
     #[test]
@@ -719,17 +805,97 @@ mod tests {
         assert_eq!(
             parameter_mismatch(
                 "SELECT email FROM t WHERE id = $1",
-                "SELECT 'x' AS email FROM t WHERE id = $1"
+                "SELECT 'x' AS email FROM t WHERE id = $1",
+                Dialect::Postgres
             ),
             None
         );
         let lost = parameter_mismatch(
             "SELECT substring(card, $1, 4) FROM t WHERE id = $2",
             "SELECT '[redacted]'::text AS substring FROM t WHERE id = $2",
+            Dialect::Postgres,
         )
         .unwrap();
         assert!(lost.contains("$1") && !lost.contains("$2"), "{lost}");
-        assert!(parameter_mismatch("SELECT 1", "SELECT $1").is_some());
+        assert!(parameter_mismatch("SELECT 1", "SELECT $1", Dialect::Postgres).is_some());
+    }
+
+    /// MySQL `?` placeholders are counted as the server counts them: not inside
+    /// a string, a quoted identifier or a comment.
+    #[test]
+    fn mysql_placeholders_are_counted_like_the_server() {
+        assert_eq!(mysql_placeholders("SELECT 1"), Some(0));
+        assert_eq!(
+            mysql_placeholders("SELECT email FROM t WHERE id = ? AND n > ?"),
+            Some(2)
+        );
+        assert_eq!(
+            mysql_placeholders(
+                "SELECT '?', \"?\", `?` FROM t /* ? */ WHERE a = ? -- ?\n AND b = 'x\\'?' # ?"
+            ),
+            Some(1)
+        );
+        // Unterminated string: cannot be counted, so cannot be vouched for.
+        assert_eq!(mysql_placeholders("SELECT 'abc"), None);
+    }
+
+    /// The server answers a COM_STMT_PREPARE with the statement's parameter
+    /// count, and the client binds that many values on COM_STMT_EXECUTE. A
+    /// rewrite that changes the count is refused.
+    #[test]
+    fn a_mysql_rewrite_must_keep_the_parameter_count() {
+        let my = Dialect::Mysql;
+        assert_eq!(
+            parameter_mismatch(
+                "SELECT email FROM t WHERE id = ?",
+                "SELECT CONCAT(LEFT(email, 1), '***') AS email FROM t WHERE id = ?",
+                my
+            ),
+            None
+        );
+        let lost = parameter_mismatch(
+            "SELECT SUBSTRING(card, ?, 4) FROM t WHERE id = ?",
+            "SELECT '[redacted]' AS `SUBSTRING(card, ?, 4)` FROM t WHERE id = ?",
+            my,
+        );
+        // The `?` inside the quoted alias is not a parameter: 2 → 1.
+        let lost = lost.expect("a lost parameter is refused");
+        assert!(lost.contains("2") && lost.contains("1"), "{lost}");
+        assert!(parameter_mismatch("SELECT 1", "SELECT ?", my).is_some());
+        assert!(parameter_mismatch("SELECT ?", "SELECT 'unterminated", my).is_some());
+    }
+
+    /// The `?` check on a COM_STMT_PREPARE blocks with VERICTO-085 and a
+    /// message; a COM_QUERY, which has no parameters to bind, is not checked.
+    #[test]
+    fn a_mysql_prepare_whose_rewrite_loses_a_parameter_is_blocked() {
+        let forward = || TcpDecision::Forward {
+            observation: None,
+            violations: Vec::new(),
+            rewritten_query: Some("SELECT '[redacted]' AS c FROM t".to_string()),
+            sensitive_columns: vec![touched(SensitivePolicy::Mask)],
+        };
+        let sql = "SELECT SUBSTRING(card, ?, 4) AS c FROM t";
+        match checked_for_kind(forward(), sql, Dialect::Mysql, QueryKind::Prepared) {
+            TcpDecision::Block {
+                rule_code,
+                ast_node_path,
+                sensitive_columns,
+                ..
+            } => {
+                assert_eq!(rule_code, SENSITIVE_RULE_CODE);
+                assert!(ast_node_path.contains("parameter"), "{ast_node_path}");
+                assert_eq!(sensitive_columns.len(), 1);
+            }
+            TcpDecision::Forward { .. } => panic!("a lost `?` must block"),
+        }
+        assert!(matches!(
+            checked_for_kind(forward(), sql, Dialect::Mysql, QueryKind::Simple),
+            TcpDecision::Forward {
+                rewritten_query: Some(_),
+                ..
+            }
+        ));
     }
 
     /// A masked expression over a bind parameter keeps the parameter (engine
