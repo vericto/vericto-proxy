@@ -66,6 +66,25 @@ pub enum Classified {
     Terminate,
 }
 
+/// What an agent-access allowlist (VERICTO-087) makes of a client message that
+/// carries no SQL the engine evaluates. Consulted only for messages classified
+/// [`Classified::PassThrough`].
+pub enum AccessControl {
+    /// Statement plumbing (bind/execute/close/sync, ping, copy data, auth
+    /// continuation…): forwarded under any policy.
+    Allowed,
+    /// A command the statement analysis cannot see into and that reaches
+    /// identity, name resolution or data (MySQL COM_INIT_DB, COM_FIELD_LIST;
+    /// Postgres FunctionCall; a query message whose SQL cannot be read; any
+    /// command not known to be plumbing). Refused under a policy, like the SQL
+    /// it stands for (`USE`, `SHOW COLUMNS`, `set_config(…)`); deny by default.
+    Restricted { label: String, kind: QueryKind },
+    /// MySQL COM_CHANGE_USER: the session re-authenticates as `user` (None when
+    /// it cannot be read). Refused when the current or the target user has a
+    /// policy; otherwise the session becomes that user.
+    ChangeUser { user: Option<String> },
+}
+
 /// Context for building a native block response.
 pub struct BlockContext<'a> {
     pub rule_code: &'a str,
@@ -133,6 +152,12 @@ pub trait WireProtocol: Send + Sync {
     /// could forward is the unmasked original. Default: `None`.
     fn with_query(&self, _msg: &RawClientMessage, _sql: &str) -> Option<RawClientMessage> {
         None
+    }
+
+    /// What an agent-access allowlist makes of a message that carries no SQL
+    /// (see [`AccessControl`]). Default: [`AccessControl::Allowed`].
+    fn access_control(&self, _msg: &RawClientMessage) -> AccessControl {
+        AccessControl::Allowed
     }
 }
 

@@ -70,7 +70,7 @@ fn config(
     )
 }
 
-fn config_with(
+pub(super) fn config_with(
     upstream: (&str, u16),
     policy: EnforcementPolicy,
     mode: TelemetryQueryMode,
@@ -88,6 +88,9 @@ fn config_with(
         client_tls_acceptor: None,
         ruleset: Arc::new(ArcSwap::from_pointee(rules)),
         policy: Arc::new(ArcSwap::from_pointee(policy)),
+        agent_access: Arc::new(ArcSwap::from_pointee(
+            vericto_engine::AccessPolicyMap::default(),
+        )),
         telemetry_mode: Arc::new(ArcSwap::from_pointee(mode)),
         telemetry: Some(TelemetrySink {
             queue: queue.clone() as Arc<dyn EventQueue>,
@@ -99,12 +102,12 @@ fn config_with(
 }
 
 /// The interception loop between an in-memory client and an in-memory database.
-struct Wire {
+pub(super) struct Wire {
     /// What the client application writes to / reads from.
-    client: DuplexStream,
+    pub(super) client: DuplexStream,
     /// What the proxy forwarded to the database.
-    db: DuplexStream,
-    queue: Arc<MemoryQueue>,
+    pub(super) db: DuplexStream,
+    pub(super) queue: Arc<MemoryQueue>,
     _task: tokio::task::JoinHandle<std::io::Result<()>>,
 }
 
@@ -113,11 +116,22 @@ fn wire(proto: Box<dyn WireProtocol>, policy: EnforcementPolicy, mode: Telemetry
     wire_with(proto, cfg, queue)
 }
 
-fn wire_with(
+pub(super) fn wire_with(
     proto: Box<dyn WireProtocol>,
     cfg: Arc<PgProxyConfig>,
     queue: Arc<MemoryQueue>,
 ) -> Wire {
+    wire_as(proto, cfg, queue, None)
+}
+
+/// [`wire_with`] for a session authenticated as `user`.
+pub(super) fn wire_as(
+    proto: Box<dyn WireProtocol>,
+    cfg: Arc<PgProxyConfig>,
+    queue: Arc<MemoryQueue>,
+    user: Option<&str>,
+) -> Wire {
+    let user = user.map(str::to_string);
     let (client, proxy_client_side) = tokio::io::duplex(1 << 20);
     let (proxy_db_side, db) = tokio::io::duplex(1 << 20);
     let (cr, cw) = tokio::io::split(proxy_client_side);
@@ -131,6 +145,7 @@ fn wire_with(
             &mut server_write,
             &client_write,
             &cfg,
+            user,
         )
         .await
     });
@@ -142,7 +157,7 @@ fn wire_with(
     }
 }
 
-async fn timeout<T>(f: impl std::future::Future<Output = T>) -> T {
+pub(super) async fn timeout<T>(f: impl std::future::Future<Output = T>) -> T {
     tokio::time::timeout(std::time::Duration::from_secs(5), f)
         .await
         .expect("timed out")
@@ -150,13 +165,13 @@ async fn timeout<T>(f: impl std::future::Future<Output = T>) -> T {
 
 // ── Postgres framing helpers ─────────────────────────────────────────────────
 
-fn pg_query(sql: &str) -> Vec<u8> {
+pub(super) fn pg_query(sql: &str) -> Vec<u8> {
     let mut body = sql.as_bytes().to_vec();
     body.push(0);
     PgMessage { tag: b'Q', body }.encode()
 }
 
-fn pg_parse(name: &str, sql: &str, types: &[i32]) -> Vec<u8> {
+pub(super) fn pg_parse(name: &str, sql: &str, types: &[i32]) -> Vec<u8> {
     let mut body = Vec::new();
     body.extend_from_slice(name.as_bytes());
     body.push(0);
@@ -169,7 +184,7 @@ fn pg_parse(name: &str, sql: &str, types: &[i32]) -> Vec<u8> {
     PgMessage { tag: b'P', body }.encode()
 }
 
-fn pg_sync() -> Vec<u8> {
+pub(super) fn pg_sync() -> Vec<u8> {
     PgMessage {
         tag: b'S',
         body: Vec::new(),
@@ -177,7 +192,7 @@ fn pg_sync() -> Vec<u8> {
     .encode()
 }
 
-async fn read_pg(s: &mut DuplexStream) -> PgMessage {
+pub(super) async fn read_pg(s: &mut DuplexStream) -> PgMessage {
     let mut tag = [0u8; 1];
     timeout(s.read_exact(&mut tag)).await.unwrap();
     let mut len = [0u8; 4];
@@ -188,7 +203,7 @@ async fn read_pg(s: &mut DuplexStream) -> PgMessage {
 }
 
 /// (statement name, query, parameter type OIDs) of a Parse body.
-fn split_parse(body: &[u8]) -> (String, String, Vec<i32>) {
+pub(super) fn split_parse(body: &[u8]) -> (String, String, Vec<i32>) {
     let n = body.iter().position(|&b| b == 0).unwrap();
     let name = String::from_utf8(body[..n].to_vec()).unwrap();
     let rest = &body[n + 1..];
@@ -206,13 +221,13 @@ fn split_parse(body: &[u8]) -> (String, String, Vec<i32>) {
     (name, query, types)
 }
 
-fn cstr(body: &[u8]) -> String {
+pub(super) fn cstr(body: &[u8]) -> String {
     let n = body.iter().position(|&b| b == 0).unwrap_or(body.len());
     String::from_utf8(body[..n].to_vec()).unwrap()
 }
 
 /// SQLSTATE and message of an ErrorResponse body.
-fn pg_error(body: &[u8]) -> (String, String) {
+pub(super) fn pg_error(body: &[u8]) -> (String, String) {
     let (mut code, mut msg) = (String::new(), String::new());
     let mut i = 0;
     while i < body.len() && body[i] != 0 {
@@ -230,7 +245,7 @@ fn pg_error(body: &[u8]) -> (String, String) {
 
 /// Sends a probe the proxy always forwards and returns the first SQL the
 /// database received: proves whether an earlier statement reached it.
-async fn first_query_reaching_db(w: &mut Wire) -> String {
+pub(super) async fn first_query_reaching_db(w: &mut Wire) -> String {
     w.client.write_all(&pg_query("SELECT 1")).await.unwrap();
     let m = read_pg(&mut w.db).await;
     match m.tag {
@@ -240,7 +255,7 @@ async fn first_query_reaching_db(w: &mut Wire) -> String {
     }
 }
 
-fn events(q: &MemoryQueue) -> Vec<serde_json::Value> {
+pub(super) fn events(q: &MemoryQueue) -> Vec<serde_json::Value> {
     q.drain_batch(100)
         .events
         .into_iter()
@@ -488,13 +503,13 @@ async fn pg_monitor_mode_forwards_the_original() {
 
 // ── MySQL, in memory ─────────────────────────────────────────────────────────
 
-fn my_cmd(cmd: u8, sql: &str) -> Vec<u8> {
+pub(super) fn my_cmd(cmd: u8, sql: &str) -> Vec<u8> {
     let mut payload = vec![cmd];
     payload.extend_from_slice(sql.as_bytes());
     MySqlPacket { seq: 0, payload }.encode()
 }
 
-async fn read_my(s: &mut DuplexStream) -> MySqlPacket {
+pub(super) async fn read_my(s: &mut DuplexStream) -> MySqlPacket {
     let mut h = [0u8; 4];
     timeout(s.read_exact(&mut h)).await.unwrap();
     let len = u32::from_le_bytes([h[0], h[1], h[2], 0]) as usize;
@@ -504,13 +519,13 @@ async fn read_my(s: &mut DuplexStream) -> MySqlPacket {
 }
 
 /// ERR_Packet error code and message.
-fn my_err(p: &MySqlPacket) -> (u16, String) {
+pub(super) fn my_err(p: &MySqlPacket) -> (u16, String) {
     assert_eq!(p.payload[0], 0xFF, "expected an ERR_Packet");
     let code = u16::from_le_bytes([p.payload[1], p.payload[2]]);
     (code, String::from_utf8_lossy(&p.payload[9..]).into_owned())
 }
 
-async fn my_first_query_reaching_db(w: &mut Wire) -> String {
+pub(super) async fn my_first_query_reaching_db(w: &mut Wire) -> String {
     w.client
         .write_all(&my_cmd(COM_QUERY, "SELECT 1"))
         .await
@@ -523,7 +538,7 @@ const COM_STMT_EXECUTE: u8 = 0x17;
 const COM_STMT_SEND_LONG_DATA: u8 = 0x18;
 
 /// SQL of a COM_QUERY / COM_STMT_PREPARE as the database received it.
-fn my_sql(p: &MySqlPacket) -> String {
+pub(super) fn my_sql(p: &MySqlPacket) -> String {
     p.extract_sql().expect("a SQL command")
 }
 
@@ -892,13 +907,13 @@ fn a_vericto_086_block_on_postgres_is_42501() {
 // ── Real Postgres ────────────────────────────────────────────────────────────
 
 /// URL of an admin connection (`postgres://user:pass@host:port/db`), or None to skip.
-fn pg_url() -> Option<String> {
+pub(super) fn pg_url() -> Option<String> {
     std::env::var("VERICTO_TEST_PG_URL")
         .ok()
         .filter(|s| !s.is_empty())
 }
 
-async fn connect(cfg: &tokio_postgres::Config) -> tokio_postgres::Client {
+pub(super) async fn connect(cfg: &tokio_postgres::Config) -> tokio_postgres::Client {
     let (client, conn) = cfg.connect(tokio_postgres::NoTls).await.expect("connect");
     tokio::spawn(conn);
     client
@@ -1105,14 +1120,14 @@ async fn real_pg_block_and_flag() {
 use mysql_async::prelude::Queryable;
 
 /// URL of an admin connection (`mysql://user:pass@host:port`), or None to skip.
-fn mysql_url() -> Option<String> {
+pub(super) fn mysql_url() -> Option<String> {
     std::env::var("VERICTO_TEST_MYSQL_URL")
         .ok()
         .filter(|s| !s.is_empty())
 }
 
 /// A proxy fronting `upstream` on an ephemeral port; returns that port.
-async fn spawn_mysql_proxy(cfg: Arc<PgProxyConfig>) -> u16 {
+pub(super) async fn spawn_mysql_proxy(cfg: Arc<PgProxyConfig>) -> u16 {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     tokio::spawn(async move {
@@ -1129,7 +1144,7 @@ async fn spawn_mysql_proxy(cfg: Arc<PgProxyConfig>) -> u16 {
 /// Driver options for a connection to the proxy on `port`. `prefer_socket` off:
 /// otherwise the driver reconnects to the server's own unix socket and bypasses
 /// the proxy.
-fn via_proxy(
+pub(super) fn via_proxy(
     admin: &mysql_async::Opts,
     port: u16,
     db: Option<&str>,
@@ -1151,7 +1166,7 @@ fn via_proxy(
 
 /// The proxy's client-side TLS acceptor when the upstream hop is TLS (MySQL
 /// needs both hops or neither).
-fn mysql_client_tls(
+pub(super) fn mysql_client_tls(
     tls: crate::tcp::upstream::UpstreamTlsMode,
 ) -> Option<tokio_rustls::TlsAcceptor> {
     if tls == crate::tcp::upstream::UpstreamTlsMode::Disable {

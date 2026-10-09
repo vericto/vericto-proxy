@@ -10,10 +10,11 @@ use vericto_engine::parser::Dialect;
 
 use crate::tcp::codec_mysql::{
     COM_QUIT, MySqlPacket, VERICTO_BLOCK_ERR_CODE, VERICTO_BLOCK_SQLSTATE, build_err_packet,
-    read_packet,
+    read_change_user_name, read_packet,
 };
 use crate::tcp::protocol::{
-    BlockContext, BlockResponse, Classified, QueryKind, RawClientMessage, WireProtocol,
+    AccessControl, BlockContext, BlockResponse, Classified, QueryKind, RawClientMessage,
+    WireProtocol,
 };
 
 pub struct MysqlProtocol;
@@ -79,6 +80,56 @@ impl WireProtocol for MysqlProtocol {
             return None;
         };
         p.with_sql(sql).map(RawClientMessage::Mysql)
+    }
+
+    /// Under an allowlist, only commands known to be plumbing pass: ping,
+    /// statistics, the COM_STMT_* follow-ups of a statement evaluated at its
+    /// COM_STMT_PREPARE, COM_SET_OPTION and COM_RESET_CONNECTION (the user
+    /// stays). COM_INIT_DB is `USE` (it moves where unqualified names resolve),
+    /// COM_FIELD_LIST is `SHOW COLUMNS`, the replication and process commands
+    /// reach server state; they and any unknown command are refused, deny by
+    /// default. Only command packets (sequence id 0) are commands: packets
+    /// inside a command (auth continuation, LOCAL INFILE data) pass.
+    fn access_control(&self, msg: &RawClientMessage) -> AccessControl {
+        let RawClientMessage::Mysql(p) = msg else {
+            return AccessControl::Allowed;
+        };
+        if p.seq != 0 {
+            return AccessControl::Allowed;
+        }
+        let (label, kind) = match p.command_tag() {
+            // PING, STATISTICS, STMT_EXECUTE, STMT_SEND_LONG_DATA, STMT_CLOSE,
+            // STMT_RESET, SET_OPTION, STMT_FETCH, RESET_CONNECTION; QUIT.
+            Some(0x0e | 0x09 | 0x17 | 0x18 | 0x19 | 0x1a | 0x1b | 0x1c | 0x1f | 0x01) => {
+                return AccessControl::Allowed;
+            }
+            Some(0x11) => {
+                return AccessControl::ChangeUser {
+                    user: read_change_user_name(&p.payload),
+                };
+            }
+            Some(0x02) => ("COM_INIT_DB", QueryKind::Simple),
+            Some(0x04) => ("COM_FIELD_LIST", QueryKind::Simple),
+            Some(0x03) => ("COM_QUERY (unreadable SQL)", QueryKind::Simple),
+            Some(0x16) => ("COM_STMT_PREPARE (unreadable SQL)", QueryKind::Prepared),
+            Some(0x0a) => ("COM_PROCESS_INFO", QueryKind::Simple),
+            Some(0x0c) => ("COM_PROCESS_KILL", QueryKind::Simple),
+            Some(0x0d) => ("COM_DEBUG", QueryKind::Simple),
+            Some(0x12) => ("COM_BINLOG_DUMP", QueryKind::Simple),
+            Some(0x15) => ("COM_REGISTER_SLAVE", QueryKind::Simple),
+            Some(0x1e) => ("COM_BINLOG_DUMP_GTID", QueryKind::Simple),
+            Some(t) => {
+                return AccessControl::Restricted {
+                    label: format!("command 0x{t:02x}"),
+                    kind: QueryKind::Simple,
+                };
+            }
+            None => ("empty command", QueryKind::Simple),
+        };
+        AccessControl::Restricted {
+            label: label.to_string(),
+            kind,
+        }
     }
 
     fn build_block_response(&self, ctx: &BlockContext) -> BlockResponse {

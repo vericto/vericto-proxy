@@ -94,6 +94,70 @@ pub struct TelemetryEvent {
     /// event from a database without tags is exactly what it was before.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub sensitive_columns: Vec<SensitiveColumnPayload>,
+    /// The database user of the session that issued the query (Postgres
+    /// StartupMessage `user`, MySQL HandshakeResponse username): the identity
+    /// agent-access allowlists are selected by. A user name, not query data, so
+    /// it is sent in sanitized mode too. Omitted when it could not be read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub db_user: Option<String>,
+    /// `"observe"` | `"enforce"`: the mode of the session user's agent-access
+    /// policy when one applied. Omitted when the user has none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub access_policy_mode: Option<String>,
+    /// What the session user's allowlist denied (VERICTO-087), as the engine
+    /// lists it (engine contract §3.2). Names only. Omitted when nothing was.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub access_denied: Vec<AccessDeniedPayload>,
+}
+
+/// One reference an agent-access allowlist denied, shaped for the ingest schema:
+/// `{schema, table, column, needed}`; `schema` / `column` null when absent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AccessDeniedPayload {
+    pub schema: Option<String>,
+    pub table: String,
+    pub column: Option<String>,
+    /// "read" | "write" | "ddl".
+    pub needed: String,
+}
+
+impl AccessDeniedPayload {
+    /// The engine's reference with every name cut to [`MAX_REPORTED_NAME_BYTES`].
+    pub fn from_denied(d: &vericto_engine::DeniedRef) -> Self {
+        Self {
+            schema: d.schema.as_deref().map(truncate_reported_name),
+            table: truncate_reported_name(&d.table),
+            column: d.column.as_deref().map(truncate_reported_name),
+            needed: d.needed.as_str().to_string(),
+        }
+    }
+}
+
+/// Largest number of denied references reported per event: the ingest schema's
+/// bound (`.max(64)`), which would otherwise reject the whole batch. The engine
+/// sorts the list; the decision never depends on it.
+pub const MAX_REPORTED_ACCESS_DENIED: usize = 64;
+
+/// Longest name (schema, table, column) reported in `access_denied`, in bytes:
+/// the ingest schema's `.max(63)`. MySQL names may be 64 characters, and a name
+/// can be whatever the query wrote, so it is cut here rather than letting one
+/// long name reject the batch. Bytes bound the schema's UTF-16 length from above.
+pub const MAX_REPORTED_NAME_BYTES: usize = 63;
+
+/// A name cut to [`MAX_REPORTED_NAME_BYTES`] on a character boundary.
+pub fn truncate_reported_name(name: &str) -> String {
+    name[..floor_char_boundary(name, MAX_REPORTED_NAME_BYTES)].to_string()
+}
+
+/// Longest `ast_node_path` reported (flat and per violation), in bytes: the
+/// ingest schema's `.max(512)`. A VERICTO-087 path names what the query
+/// referenced and a parse-error path carries the parser message, so either can
+/// be longer; one over the cap would reject the whole batch.
+pub const MAX_REPORTED_AST_PATH_BYTES: usize = 512;
+
+/// Bound an `ast_node_path` to [`MAX_REPORTED_AST_PATH_BYTES`], marking the cut.
+pub fn truncate_reported_ast_path(path: &str) -> String {
+    truncate_to(path, MAX_REPORTED_AST_PATH_BYTES)
 }
 
 /// One tagged column a query read, shaped for the ingest schema:
@@ -376,6 +440,9 @@ mod tests {
             violations: Vec::new(),
             rewritten_query: None,
             sensitive_columns: Vec::new(),
+            db_user: None,
+            access_policy_mode: None,
+            access_denied: Vec::new(),
         }
     }
 

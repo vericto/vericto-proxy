@@ -21,7 +21,9 @@ use tokio::net::TcpListener;
 
 use crate::tcp::client_tls::ClientTlsMode;
 use crate::tcp::postgres::{PgProxyConfig, TelemetrySink, handle_connection};
-use crate::tcp::rules_sync::{SharedPolicy, SharedRuleset, SharedTelemetryMode};
+use crate::tcp::rules_sync::{
+    SharedAccessPolicies, SharedPolicy, SharedRuleset, SharedTelemetryMode,
+};
 
 pub mod client_tls;
 
@@ -117,6 +119,7 @@ pub async fn run_pg_proxy(
     opts: TcpProxyOptions,
     ruleset: SharedRuleset,
     policy: SharedPolicy,
+    agent_access: SharedAccessPolicies,
     telemetry_mode: SharedTelemetryMode,
     telemetry: Option<TelemetrySink>,
 ) -> std::io::Result<()> {
@@ -152,6 +155,7 @@ pub async fn run_pg_proxy(
         client_tls_acceptor,
         ruleset,
         policy,
+        agent_access,
         telemetry_mode,
         telemetry,
         // Resolved here rather than per query: the wire protocol is fixed at
@@ -198,6 +202,7 @@ pub async fn run_mysql_proxy(
     opts: TcpProxyOptions,
     ruleset: SharedRuleset,
     policy: SharedPolicy,
+    agent_access: SharedAccessPolicies,
     telemetry_mode: SharedTelemetryMode,
     telemetry: Option<TelemetrySink>,
 ) -> std::io::Result<()> {
@@ -232,6 +237,7 @@ pub async fn run_mysql_proxy(
         client_tls_acceptor,
         ruleset,
         policy,
+        agent_access,
         telemetry_mode,
         telemetry,
         max_query_bytes: query_limit::effective_max_query_bytes(
@@ -268,5 +274,7 @@ pub async fn run_mysql_proxy(
 pub mod rules_cache;
 pub mod rules_sync;
 
+#[cfg(test)]
+mod access_tests;
 #[cfg(test)]
 mod sensitive_tests;

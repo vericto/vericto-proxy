@@ -13,7 +13,8 @@ use crate::tcp::codec::{
     extract_parse_query, extract_simple_query, read_message, with_replaced_query,
 };
 use crate::tcp::protocol::{
-    BlockContext, BlockResponse, Classified, QueryKind, RawClientMessage, WireProtocol,
+    AccessControl, BlockContext, BlockResponse, Classified, QueryKind, RawClientMessage,
+    WireProtocol,
 };
 
 pub struct PostgresProtocol;
@@ -66,6 +67,33 @@ impl WireProtocol for PostgresProtocol {
             return None;
         };
         with_replaced_query(m, sql).map(RawClientMessage::Postgres)
+    }
+
+    /// Under an allowlist, only the extended-protocol plumbing of a statement
+    /// already evaluated at its Parse, COPY data, authentication messages and
+    /// Terminate pass. A FunctionCall (`'F'`) calls a function by OID with no
+    /// SQL to analyse, e.g. `set_config('role', …)`, which as SQL the engine
+    /// denies; a Query or Parse whose SQL cannot be read is not evaluated; any
+    /// other message is unknown. All refused: deny by default.
+    fn access_control(&self, msg: &RawClientMessage) -> AccessControl {
+        let RawClientMessage::Postgres(m) = msg else {
+            return AccessControl::Allowed;
+        };
+        let (label, kind) = match m.tag {
+            // Bind, Execute, Describe, Close, Sync, Flush; CopyData/Done/Fail;
+            // PasswordMessage / SASL / GSS responses; Terminate.
+            b'B' | b'E' | b'D' | b'C' | b'S' | b'H' | b'd' | b'c' | b'f' | b'p' | b'X' => {
+                return AccessControl::Allowed;
+            }
+            b'F' => ("FunctionCall".to_string(), QueryKind::Simple),
+            b'Q' => ("Query (unreadable SQL)".to_string(), QueryKind::Simple),
+            b'P' => ("Parse (unreadable SQL)".to_string(), QueryKind::Prepared),
+            t => (
+                format!("protocol message {:?}", t as char),
+                QueryKind::Simple,
+            ),
+        };
+        AccessControl::Restricted { label, kind }
     }
 
     fn build_block_response(&self, ctx: &BlockContext) -> BlockResponse {
