@@ -23,6 +23,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   exchanges through the proxy, with every read bounded so a wrong
   turn fails instead of hanging. Against a real MySQL (`VERICTO_TEST_MYSQL_URL`),
   many logins as one user, in a row and at once.
+- **MySQL clients in the default `ssl-mode=PREFERRED` connect to a plaintext
+  proxy.** The proxy relayed the server's greeting as is, so it offered TLS it
+  cannot provide without `PROXY_TLS_MODE`: the client sent an SSL Request and a
+  TLS handshake, and failed with `SSL connection error: wrong version number`.
+  The greeting now offers TLS only when the proxy terminates it, and a client
+  then falls back to plaintext as it does against a server without TLS.
+- **MySQL protocol compression is never negotiated.** After the OK, a client that
+  asked for zlib or zstd switched to compressed framing, which the proxy does
+  not decode: every command hung, and none was evaluated. The proxy clears
+  `CLIENT_COMPRESS` and `CLIENT_ZSTD_COMPRESSION_ALGORITHM` from the greeting
+  and from the client's response, so clients get what a server with
+  `protocol_compression_algorithms=uncompressed` offers: one that prefers
+  compression runs uncompressed, one that allows only `zlib` or `zstd` is refused
+  at connect (`ERROR 2066`) instead of hanging.
+- **`PROXY_TLS_MODE=require` refuses a plaintext MySQL login with an error**:
+  `ERROR 3159 (HY000)`, as MySQL does under `require_secure_transport`, instead
+  of closing the connection ("Lost connection to MySQL server").
 
 ## [4.8.0] — 2026-10-09
 

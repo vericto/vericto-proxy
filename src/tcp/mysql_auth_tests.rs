@@ -37,17 +37,32 @@ enum Step {
 
 const OK: [u8; 7] = [0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00];
 
-/// Protocol v10 handshake announcing caching_sha2_password, without CLIENT_SSL.
+/// Server capabilities of the scripted handshake: everything a MySQL 8.4 with TLS
+/// offers, including CLIENT_SSL (0x0800), CLIENT_COMPRESS (0x0020) and
+/// CLIENT_ZSTD_COMPRESSION_ALGORITHM (0x0400_0000).
+const SERVER_CAPS: u32 = 0xdfff_ffff;
+/// Where the two capability halves sit in [`handshake`]: after the version
+/// string, thread id (4), auth data part 1 (8) and filler (1); the upper half
+/// after character set (1) and status (2).
+const CAPS_LOWER_AT: usize = 1 + b"8.4.0-scripted\0".len() + 13;
+const CAPS_UPPER_AT: usize = CAPS_LOWER_AT + 5;
+/// What the proxy may not let a session negotiate when it does not terminate
+/// client TLS: compression, and TLS itself. Spelled out here, not taken from
+/// `codec_mysql`, so the tests check the values rather than restate them.
+const NOT_CARRIED_PLAIN: u32 = 0x0400_0000 | 0x0000_0020 | 0x0000_0800;
+const COMPRESSION: u32 = 0x0400_0000 | 0x0000_0020;
+
+/// Protocol v10 handshake announcing caching_sha2_password.
 fn handshake() -> Vec<u8> {
     let mut p = vec![0x0a];
     p.extend_from_slice(b"8.4.0-scripted\0");
     p.extend_from_slice(&7u32.to_le_bytes()); // thread id
     p.extend_from_slice(b"scramble"); // auth-plugin-data, part 1
     p.push(0); // filler
-    p.extend_from_slice(&0xf7ffu16.to_le_bytes()); // capabilities, lower (no CLIENT_SSL)
+    p.extend_from_slice(&(SERVER_CAPS as u16).to_le_bytes()); // capabilities, lower
     p.push(0xff); // character set
     p.extend_from_slice(&0x0002u16.to_le_bytes()); // status
-    p.extend_from_slice(&0x00ffu16.to_le_bytes()); // capabilities, upper
+    p.extend_from_slice(&((SERVER_CAPS >> 16) as u16).to_le_bytes()); // capabilities, upper
     p.push(21); // auth-plugin-data length
     p.extend_from_slice(&[0; 10]); // reserved
     p.extend_from_slice(b"-part-two-12\0"); // auth-plugin-data, part 2
@@ -68,6 +83,31 @@ fn handshake_response() -> Vec<u8> {
     p.extend_from_slice(&[0x5a; 32]); // scrambled password
     p.extend_from_slice(b"caching_sha2_password\0");
     p
+}
+
+/// The capabilities of a handshake payload laid out like [`handshake`].
+fn greeting_caps(payload: &[u8]) -> u32 {
+    let lo = u16::from_le_bytes([payload[CAPS_LOWER_AT], payload[CAPS_LOWER_AT + 1]]) as u32;
+    let hi = u16::from_le_bytes([payload[CAPS_UPPER_AT], payload[CAPS_UPPER_AT + 1]]) as u32;
+    (hi << 16) | lo
+}
+
+/// The handshake as the client should receive it through a plaintext proxy:
+/// the same bytes with [`NOT_CARRIED_PLAIN`] cleared.
+fn greeting_as_relayed(payload: &[u8]) -> Vec<u8> {
+    let mut out = payload.to_vec();
+    let caps = greeting_caps(payload) & !NOT_CARRIED_PLAIN;
+    out[CAPS_LOWER_AT..CAPS_LOWER_AT + 2].copy_from_slice(&(caps as u16).to_le_bytes());
+    out[CAPS_UPPER_AT..CAPS_UPPER_AT + 2].copy_from_slice(&((caps >> 16) as u16).to_le_bytes());
+    out
+}
+
+/// A HandshakeResponse as the server should receive it: compression cleared.
+fn response_as_relayed(payload: &[u8]) -> Vec<u8> {
+    let mut out = payload.to_vec();
+    let caps = u32::from_le_bytes([out[0], out[1], out[2], out[3]]) & !COMPRESSION;
+    out[0..4].copy_from_slice(&caps.to_le_bytes());
+    out
 }
 
 fn err_1045() -> Vec<u8> {
@@ -105,10 +145,13 @@ enum Upstream {
 }
 
 /// Plays `script` between a scripted client and a fake MySQL server, through a
-/// proxy that enforces the default ruleset. Returns what the client received
-/// for its commands: after a successful login, a `DELETE` with no `WHERE`
-/// (expected: blocked by the proxy) and a `SELECT 1` (expected: answered by the
-/// server); and what the server received.
+/// proxy that enforces the default ruleset. Every packet must arrive as sent,
+/// except the two the proxy edits on purpose: the handshake (seq 0) reaches the
+/// client as [`greeting_as_relayed`], and the HandshakeResponse (seq 1) reaches
+/// the server as [`response_as_relayed`]. Returns what the client received for
+/// its commands: after a successful login, a `DELETE` with no `WHERE` (expected:
+/// blocked by the proxy) and a `SELECT 1` (expected: answered by the server);
+/// and what the server received.
 async fn play(script: Vec<Step>) -> (Vec<MySqlPacket>, Upstream) {
     let db = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let db_port = db.local_addr().unwrap().port();
@@ -130,7 +173,12 @@ async fn play(script: Vec<Step>) -> (Vec<MySqlPacket>, Upstream) {
             } else {
                 let got = recv(&mut s, "the client's auth packet at the server").await;
                 let got = got.expect("proxy closed before relaying the client's packet");
-                assert_eq!((got.seq as usize, got.payload), (seq, payload));
+                let want = if seq == 1 {
+                    response_as_relayed(&payload)
+                } else {
+                    payload
+                };
+                assert_eq!((got.seq as usize, got.payload), (seq, want));
             }
         }
         match recv(&mut s, "a command at the server").await {
@@ -158,7 +206,12 @@ async fn play(script: Vec<Step>) -> (Vec<MySqlPacket>, Upstream) {
             Step::Server(p) => {
                 let got = recv(&mut c, "the server's auth packet at the client").await;
                 let got = got.expect("proxy closed before relaying the server's packet");
-                assert_eq!((got.seq as usize, &got.payload), (seq, p));
+                let want = if seq == 0 {
+                    greeting_as_relayed(p)
+                } else {
+                    p.clone()
+                };
+                assert_eq!((got.seq as usize, got.payload), (seq, want));
             }
             Step::Client(p) => send(&mut c, seq, p).await,
         }
@@ -372,4 +425,131 @@ async fn real_mysql_repeated_logins_as_one_user() {
         }
     })
     .await;
+}
+
+// ── What the greeting offers ─────────────────────────────────────────────────
+
+/// A TLS acceptor that never gets to present a certificate: enough to put the
+/// proxy in `PROXY_TLS_MODE=require` for tests that end before the handshake.
+fn tls_required_acceptor() -> tokio_rustls::TlsAcceptor {
+    use tokio_rustls::rustls;
+
+    #[derive(Debug)]
+    struct NoCertificate;
+    impl rustls::server::ResolvesServerCert for NoCertificate {
+        fn resolve(
+            &self,
+            _: rustls::server::ClientHello<'_>,
+        ) -> Option<std::sync::Arc<rustls::sign::CertifiedKey>> {
+            None
+        }
+    }
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let config = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_cert_resolver(std::sync::Arc::new(NoCertificate));
+    tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(config))
+}
+
+/// A proxy in front of a fake server that sends [`handshake`] and then expects
+/// nothing; returns the port, and the server task, which reports whether the
+/// proxy closed its connection.
+async fn proxy_in_front_of_a_greeting(
+    client_tls: bool,
+) -> (u16, tokio::task::JoinHandle<Option<MySqlPacket>>) {
+    let db = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let db_port = db.local_addr().unwrap().port();
+    let server = tokio::spawn(async move {
+        let (mut s, _) = db.accept().await.unwrap();
+        send(&mut s, 0, &handshake()).await;
+        recv(&mut s, "the proxy to close or relay").await
+    });
+    let (cfg, _) = config_with(
+        ("127.0.0.1", db_port),
+        EnforcementPolicy::default(),
+        TelemetryQueryMode::Raw,
+        crate::tcp::evaluator::default_ruleset(),
+        crate::tcp::upstream::UpstreamTlsMode::Disable,
+    );
+    let cfg = if client_tls {
+        let mut cfg = std::sync::Arc::into_inner(cfg).expect("unshared config");
+        cfg.client_tls_acceptor = Some(tls_required_acceptor());
+        std::sync::Arc::new(cfg)
+    } else {
+        cfg
+    };
+    (spawn_mysql_proxy(cfg).await, server)
+}
+
+/// Without client TLS the client is offered neither TLS nor compression, and
+/// every other capability and byte of the greeting is the server's. A client in
+/// the default `ssl-mode=PREFERRED` then stays in plaintext instead of starting a
+/// TLS handshake the proxy cannot answer, and no client switches to compressed
+/// framing the proxy cannot read.
+#[tokio::test]
+async fn plaintext_greeting_offers_neither_tls_nor_compression() {
+    let (port, _server) = proxy_in_front_of_a_greeting(false).await;
+    let mut c = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    let got = recv(&mut c, "the greeting").await.unwrap();
+    assert_eq!(got.seq, 0);
+    assert_eq!(
+        greeting_caps(&got.payload),
+        SERVER_CAPS & !NOT_CARRIED_PLAIN
+    );
+    assert_eq!(got.payload, greeting_as_relayed(&handshake()));
+}
+
+/// With client TLS the greeting keeps CLIENT_SSL, and still offers no
+/// compression.
+#[tokio::test]
+async fn tls_greeting_keeps_tls_and_drops_compression() {
+    let (port, _server) = proxy_in_front_of_a_greeting(true).await;
+    let mut c = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    let got = recv(&mut c, "the greeting").await.unwrap();
+    assert_eq!(greeting_caps(&got.payload), SERVER_CAPS & !COMPRESSION);
+}
+
+/// A client that asks for compression anyway does not get it: the server
+/// receives the response with both compression bits cleared, so it never
+/// switches to compressed framing.
+#[tokio::test]
+async fn compression_requested_anyway_is_not_forwarded() {
+    let mut response = handshake_response();
+    let caps = u32::from_le_bytes([response[0], response[1], response[2], response[3]]);
+    response[0..4].copy_from_slice(&(caps | COMPRESSION).to_le_bytes());
+    // `play` checks the server receives `response_as_relayed(response)`.
+    let (replies, upstream) = play(vec![
+        Step::Server(handshake()),
+        Step::Client(response),
+        Step::Server(vec![0x01, 0x03]),
+        Step::Server(OK.to_vec()),
+    ])
+    .await;
+    assert_command_phase(&replies, upstream);
+}
+
+/// `PROXY_TLS_MODE=require` and a client that answers the greeting without
+/// asking for TLS: it gets the error MySQL itself sends under
+/// `require_secure_transport` (3159, HY000), then the connection closes, and the
+/// server never receives the client's credentials.
+#[tokio::test]
+async fn tls_required_refuses_a_plaintext_login_with_err_3159() {
+    let (port, server) = proxy_in_front_of_a_greeting(true).await;
+    let mut c = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    recv(&mut c, "the greeting").await.unwrap();
+    send(&mut c, 1, &handshake_response()).await;
+    let err = recv(&mut c, "the refusal")
+        .await
+        .expect("an ERR, not a close");
+    assert_eq!(err.seq, 2);
+    assert_eq!(err.payload[0], 0xff);
+    assert_eq!(u16::from_le_bytes([err.payload[1], err.payload[2]]), 3159);
+    assert_eq!(&err.payload[3..9], b"#HY000");
+    let message = String::from_utf8_lossy(&err.payload[9..]);
+    assert!(message.contains("PROXY_TLS_MODE=require"), "{message}");
+    assert!(recv(&mut c, "the close").await.is_none());
+    assert!(
+        timeout(server).await.unwrap().is_none(),
+        "the server must not receive the plaintext response"
+    );
 }

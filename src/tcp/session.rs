@@ -478,6 +478,26 @@ async fn run_mysql_session(
         ));
     }
 
+    // The greeting the client sees offers only what this proxy can carry.
+    // - Compression, never: after the OK both ends would switch to compressed
+    //   framing, which the command loop does not decode. A client that asked for
+    //   it hung on its first command, with nothing evaluated.
+    // - CLIENT_SSL, only when the proxy terminates client TLS. Without that, a
+    //   client in the default `ssl-mode=PREFERRED` answered with an SSL Request
+    //   and a TLS handshake the proxy cannot complete, and failed to connect
+    //   ("SSL connection error: wrong version number") instead of falling back to
+    //   plaintext, as it does against a server without TLS.
+    let not_carried = mc::COMPRESSION_CAPABILITIES
+        | if client_tls_enabled {
+            0
+        } else {
+            mc::CLIENT_SSL
+        };
+    let greeting = mc::MySqlPacket {
+        seq: handshake.seq,
+        payload: mc::clear_server_capabilities(&handshake.payload, not_carried),
+    };
+
     // 2. Client TLS is negotiated on the whole stream BEFORE splitting: send the
     //    handshake, read the client's SSL Request, terminate TLS, then split the
     //    resulting TLS stream. Without client TLS we split immediately.
@@ -486,7 +506,7 @@ async fn run_mysql_session(
             use tokio::io::AsyncWriteExt as _;
             let mut client = client;
             // Forward the handshake to the client over plaintext.
-            client.write_all(&handshake.encode()).await?;
+            client.write_all(&greeting.encode()).await?;
             client.flush().await?;
             // Client replies with an SSL Request (seq 1, 32-byte truncated response).
             let ssl_req = mc::read_packet(&mut client).await?.ok_or_else(|| {
@@ -497,6 +517,17 @@ async fn run_mysql_session(
             })?;
             let caps = mc::read_client_capabilities(&ssl_req.payload).unwrap_or(0);
             if caps & mc::CLIENT_SSL == 0 {
+                // Answered the way MySQL answers under require_secure_transport,
+                // so the client reports why instead of "Lost connection".
+                let err = mc::build_err_packet(
+                    ssl_req.seq.wrapping_add(1),
+                    mc::ER_SECURE_TRANSPORT_REQUIRED,
+                    "HY000",
+                    "Connections using insecure transport are prohibited: this proxy \
+                     requires TLS (PROXY_TLS_MODE=require). Connect with --ssl-mode=REQUIRED.",
+                );
+                client.write_all(&err).await?;
+                client.flush().await?;
                 return Err(std::io::Error::other(
                     "PROXY_TLS_MODE=require but the MySQL client did not request TLS (add --ssl-mode=REQUIRED)",
                 ));
@@ -507,7 +538,7 @@ async fn run_mysql_session(
         } else {
             let (r, w) = tokio::io::split(client);
             let mut cw: ClientWrite = Box::new(w);
-            cw.write_all(&handshake.encode()).await?;
+            cw.write_all(&greeting.encode()).await?;
             cw.flush().await?;
             (Box::new(r) as ClientRead, cw)
         };
@@ -523,6 +554,14 @@ async fn run_mysql_session(
     // The user the server authenticates: the session's identity for the
     // agent-access allowlists.
     let session_user = mc::read_handshake_username(&client_resp.payload);
+    // The server enables compression only if the response asks for it. A client
+    // that ignored the greeting and asked anyway does not get it either: its
+    // compressed commands then fail at the server instead of passing the proxy
+    // unread.
+    let client_resp = mc::MySqlPacket {
+        seq: client_resp.seq,
+        payload: mc::clear_client_capabilities(&client_resp.payload, mc::COMPRESSION_CAPABILITIES),
+    };
 
     // 3. Forward the HandshakeResponse to the server, upgrading to TLS first when
     //    upstream TLS is enabled (SSL Request → TLS → response with CLIENT_SSL).
