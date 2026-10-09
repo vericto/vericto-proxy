@@ -2507,7 +2507,7 @@ dependencies = [
 
 [[package]]
 name = "vericto-proxy"
-version = "4.7.1"
+version = "4.8.0"
 dependencies = [
  "arc-swap",
  "async-trait",

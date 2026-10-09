@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [4.8.0] — 2026-10-09
+
 Agent access allowlists (`VERICTO-087`), enforced per database user. Requires
 vericto-engine v3.8.0. A database without policies is evaluated exactly as before.
 
