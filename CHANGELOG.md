@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [4.7.1] — 2026-10-08
+
+### Fixed
+
+- **The built-in ruleset is the engine's whole catalogue again (30 rules, was 28).**
+  It is what the proxy enforces at startup, before the first `/sync/rules`, and
+  whenever there is no control plane and no rules cache. It lacked the two newest
+  engine codes:
+  - `VERICTO-085` (read of a sensitive column, High / block, Security). It only
+    acts on column tags, which come with `/sync/rules`, so listing it changes no
+    decision.
+  - `VERICTO-086` (MySQL text the engine and MySQL would read differently, Critical
+    / block, Security). The engine already raised it without the list. A proxy with
+    no control plane blocks `/*!50000 SELECT id FROM accounts` with ERROR 1142
+    `[VERICTO-086]`, and a test now pins that on the built-in path.
+- A test compares the built-in ruleset with the catalogue of the engine the proxy
+  is built against: same codes, same severities. It reads the engine's README
+  from the locked dependency, so a new engine rule fails the build until it is
+  added here.
+
 ## [4.7.0] — 2026-10-08
 
 MySQL masks. A `mask` tag on MySQL used to block every read of the column with
@@ -867,7 +887,8 @@ the service now targets the rebranded engine.
 - Optional control-plane link: ruleset hot-sync and telemetry reporting.
 - `/health` and `/metrics` (p50/p99 latency) endpoints.
 
-[Unreleased]: https://github.com/vericto/vericto-proxy/compare/v4.7.0...HEAD
+[Unreleased]: https://github.com/vericto/vericto-proxy/compare/v4.7.1...HEAD
+[4.7.1]: https://github.com/vericto/vericto-proxy/compare/v4.7.0...v4.7.1
 [4.7.0]: https://github.com/vericto/vericto-proxy/compare/v4.6.0...v4.7.0
 [4.6.0]: https://github.com/vericto/vericto-proxy/compare/v4.5.1...v4.6.0
 [4.5.1]: https://github.com/vericto/vericto-proxy/compare/v4.5.0...v4.5.1
