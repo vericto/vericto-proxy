@@ -66,6 +66,15 @@ pub const CLIENT_SSL: u32 = 0x0000_0800;
 pub const OK_HEADER: u8 = 0x00;
 pub const ERR_HEADER: u8 = 0xFF;
 
+/// First payload byte of an AuthMoreData packet (connection phase).
+pub const AUTH_MORE_DATA: u8 = 0x01;
+/// caching_sha2_password's "fast auth success", the byte after AUTH_MORE_DATA:
+/// the server found the account's hash in its cache and accepted the scramble.
+/// It sends the OK_Packet right after, with nothing from the client in between;
+/// MySQL's own client returns as soon as it reads this byte and waits for the OK
+/// (`sql-common/client_authentication.cc`).
+pub const CACHING_SHA2_FAST_AUTH_SUCCESS: u8 = 0x03;
+
 /// Outcome of a server→client packet during the auth exchange, classified by
 /// its first payload byte. The proxy transports auth packets in order without
 /// understanding their contents; it only needs to know when the exchange ends.
@@ -75,6 +84,11 @@ pub enum AuthPhase {
     Ok,
     /// ERR_Packet — authentication failed; forward to the client and close.
     Err,
+    /// The server sends the next packet itself, so the client has nothing to
+    /// answer: caching_sha2_password's fast-auth success, followed by the OK.
+    /// Waiting for the client here deadlocks the login, since the client is
+    /// waiting for that OK.
+    ServerContinues,
     /// AuthSwitchRequest / AuthMoreData (or an OK/EOF-lookalike escaped by the
     /// plugin) — more exchanges follow; keep pumping.
     More,
@@ -83,12 +97,14 @@ pub enum AuthPhase {
 /// Classifies a server→client connection-phase packet by its first byte.
 /// Note: a real OK_Packet begins with 0x00, but auth plugins may send 0x01
 /// (AuthMoreData) or 0xFE (AuthSwitchRequest); we treat only 0x00 as OK and
-/// 0xFF as ERR, everything else as "more". An empty payload is treated as More
-/// (defensive — never end the loop on a malformed packet).
+/// 0xFF as ERR, everything else as "more". The one "more" the client does not
+/// answer is the exact two-byte fast-auth success. An empty payload is treated
+/// as More (defensive — never end the loop on a malformed packet).
 pub fn classify_auth_packet(payload: &[u8]) -> AuthPhase {
-    match payload.first().copied() {
-        Some(OK_HEADER) => AuthPhase::Ok,
-        Some(ERR_HEADER) => AuthPhase::Err,
+    match payload {
+        [OK_HEADER, ..] => AuthPhase::Ok,
+        [ERR_HEADER, ..] => AuthPhase::Err,
+        [AUTH_MORE_DATA, CACHING_SHA2_FAST_AUTH_SUCCESS] => AuthPhase::ServerContinues,
         _ => AuthPhase::More,
     }
 }
@@ -615,9 +631,21 @@ mod tests {
             classify_auth_packet(&[ERR_HEADER, 0x15, 0x04]),
             AuthPhase::Err
         );
-        // AuthSwitchRequest (0xFE) and AuthMoreData (0x01) → More
+        // AuthSwitchRequest (0xFE) and AuthMoreData (0x01) the client answers
+        // → More: caching_sha2's "perform full authentication" and its RSA key.
         assert_eq!(classify_auth_packet(&[0xFE]), AuthPhase::More);
-        assert_eq!(classify_auth_packet(&[0x01, 0x03]), AuthPhase::More);
+        assert_eq!(classify_auth_packet(&[0x01, 0x04]), AuthPhase::More);
+        assert_eq!(
+            classify_auth_packet(b"\x01-----BEGIN PUBLIC KEY-----\n"),
+            AuthPhase::More
+        );
+        // caching_sha2's fast-auth success: the server's OK follows, the client
+        // sends nothing. Only the exact two bytes; longer plugin data is More.
+        assert_eq!(
+            classify_auth_packet(&[0x01, 0x03]),
+            AuthPhase::ServerContinues
+        );
+        assert_eq!(classify_auth_packet(&[0x01, 0x03, 0x00]), AuthPhase::More);
         // Empty payload is defensively treated as More (never end on malformed).
         assert_eq!(classify_auth_packet(&[]), AuthPhase::More);
     }

@@ -277,4 +277,6 @@ pub mod rules_sync;
 #[cfg(test)]
 mod access_tests;
 #[cfg(test)]
+mod mysql_auth_tests;
+#[cfg(test)]
 mod sensitive_tests;

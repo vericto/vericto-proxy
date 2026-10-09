@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **MySQL logins no longer hang after the first one for a `caching_sha2_password`
+  account**, the default on MySQL 8.0 and 8.4, with or without TLS. Once the
+  server has the account's hash cached it answers with fast auth: AuthMoreData
+  `0x03`, then the OK, with nothing from the client in between. The proxy waited
+  for a client packet after every AuthMoreData, so the client waited for an OK the
+  proxy never relayed and the login hung until the client gave up. Not affected:
+  the first login after a server restart or `FLUSH PRIVILEGES` (full auth), and
+  `mysql_native_password` accounts.
+- Tests for the connection phase: a fake MySQL server plays the fast-auth,
+  full-auth (with and without the RSA key exchange), AuthSwitchRequest,
+  multi-factor (AuthNextFactor after fast auth), empty-password and failed-login
+  exchanges through the proxy, with every read bounded so a wrong
+  turn fails instead of hanging. Against a real MySQL (`VERICTO_TEST_MYSQL_URL`),
+  many logins as one user, in a row and at once.
+
 ## [4.8.0] — 2026-10-09
 
 Agent access allowlists (`VERICTO-087`), enforced per database user. Requires

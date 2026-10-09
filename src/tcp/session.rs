@@ -577,6 +577,9 @@ async fn run_mysql_session(
         match mc::classify_auth_packet(&srv_pkt.payload) {
             AuthPhase::Ok => break,          // authenticated → command phase
             AuthPhase::Err => return Ok(()), // auth failed; client already notified
+            // The server's next packet (the OK after caching_sha2's fast-auth
+            // success) is already on its way; the client has nothing to send.
+            AuthPhase::ServerContinues => {}
             AuthPhase::More => {
                 // Server wants more auth data; relay the client's next packet.
                 let cli_pkt = match mc::read_packet(&mut client_read).await? {
