@@ -14,10 +14,14 @@
 //!   wrong turn shows up as a timeout. After a successful login the client runs a
 //!   blocked and an allowed query, to prove the command phase is the intercepting
 //!   one.
+//! * **Scripted, inside a command**: the packets that continue a command after
+//!   its sequence id 0 (the auth of a COM_CHANGE_USER, the file of a LOAD DATA
+//!   LOCAL INFILE) are data, and must reach the server as they are.
 //! * **Real MySQL** (run when `VERICTO_TEST_MYSQL_URL` is set): many logins as one
-//!   user. With caching_sha2_password, the default on MySQL 8.0 and 8.4, only the
-//!   first login does the full exchange; the server caches the account's hash and
-//!   answers every later one with fast auth.
+//!   user, and many COM_CHANGE_USER / COM_RESET_CONNECTION on one session. With
+//!   caching_sha2_password, the default on MySQL 8.0 and 8.4, only the first login
+//!   does the full exchange; the server caches the account's hash and answers
+//!   every later one with fast auth.
 
 use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
@@ -552,4 +556,186 @@ async fn tls_required_refuses_a_plaintext_login_with_err_3159() {
         timeout(server).await.unwrap().is_none(),
         "the server must not receive the plaintext response"
     );
+}
+
+// ── Packets inside a command ─────────────────────────────────────────────────
+
+/// One packet of the command phase, with its sequence id: every command starts
+/// again at 0, and the packets that continue it (auth of a COM_CHANGE_USER, the
+/// file of a LOAD DATA LOCAL INFILE) count up from there.
+enum Cmd {
+    Client(u8, Vec<u8>),
+    Server(u8, Vec<u8>),
+}
+
+/// After a fast-auth login, plays `cmds` between the scripted client and the
+/// fake server through a proxy with the default ruleset. Every packet must
+/// arrive as sent, in both directions. Then a `SELECT 1` must still be answered
+/// by the server: the session survived the exchange.
+async fn play_commands(cmds: Vec<Cmd>) {
+    let login = [
+        (true, handshake()),
+        (false, handshake_response()),
+        (true, vec![0x01, 0x03]),
+        (true, OK.to_vec()),
+    ];
+    let db = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let db_port = db.local_addr().unwrap().port();
+    let server_cmds: Vec<(bool, u8, Vec<u8>)> = cmds
+        .iter()
+        .map(|c| match c {
+            Cmd::Server(seq, p) => (true, *seq, p.clone()),
+            Cmd::Client(seq, p) => (false, *seq, p.clone()),
+        })
+        .collect();
+    let server_login = login.clone();
+    let server = tokio::spawn(async move {
+        let (mut s, _) = db.accept().await.unwrap();
+        for (seq, (from_server, payload)) in server_login.into_iter().enumerate() {
+            if from_server {
+                send(&mut s, seq, &payload).await;
+            } else {
+                recv(&mut s, "the login at the server").await.unwrap();
+            }
+        }
+        for (from_server, seq, payload) in server_cmds {
+            if from_server {
+                send(&mut s, seq as usize, &payload).await;
+            } else {
+                let got = recv(&mut s, "a command-phase packet at the server")
+                    .await
+                    .expect("proxy closed the session instead of relaying the packet");
+                assert_eq!((got.seq, got.payload), (seq, payload));
+            }
+        }
+        let last = recv(&mut s, "the closing SELECT 1 at the server")
+            .await
+            .expect("proxy closed the session");
+        assert_eq!(&last.payload[1..], b"SELECT 1");
+        send(&mut s, 1, &OK).await;
+    });
+
+    let (cfg, _) = config_with(
+        ("127.0.0.1", db_port),
+        EnforcementPolicy::default(),
+        TelemetryQueryMode::Raw,
+        crate::tcp::evaluator::default_ruleset(),
+        crate::tcp::upstream::UpstreamTlsMode::Disable,
+    );
+    let mut c = TcpStream::connect(("127.0.0.1", spawn_mysql_proxy(cfg).await))
+        .await
+        .unwrap();
+    for (seq, (from_server, payload)) in login.iter().enumerate() {
+        if *from_server {
+            recv(&mut c, "the login at the client").await.unwrap();
+        } else {
+            send(&mut c, seq, payload).await;
+        }
+    }
+    for cmd in &cmds {
+        match cmd {
+            Cmd::Client(seq, p) => send(&mut c, *seq as usize, p).await,
+            Cmd::Server(seq, p) => {
+                let got = recv(&mut c, "a command-phase packet at the client")
+                    .await
+                    .expect("proxy closed the session");
+                assert_eq!((got.seq, &got.payload), (*seq, p));
+            }
+        }
+    }
+    let mut select = vec![mc::COM_QUERY];
+    select.extend_from_slice(b"SELECT 1");
+    send(&mut c, 0, &select).await;
+    let reply = recv(&mut c, "the reply to SELECT 1")
+        .await
+        .expect("proxy closed the session");
+    assert_eq!(reply.payload, OK);
+    timeout(server).await.unwrap();
+}
+
+fn com_query(sql: &str) -> Vec<u8> {
+    let mut p = vec![mc::COM_QUERY];
+    p.extend_from_slice(sql.as_bytes());
+    p
+}
+
+/// The server's LOCAL INFILE request: 0xFB, then the file name.
+fn local_infile_request(file: &str) -> Vec<u8> {
+    let mut p = vec![0xfb];
+    p.extend_from_slice(file.as_bytes());
+    p
+}
+
+/// LOAD DATA LOCAL INFILE: the client sends the file as packets 2, 3, … and an
+/// empty one to end it. A file that starts with 0x01 used to be read as a
+/// COM_QUIT, and the proxy ended the session in the middle of the upload.
+#[tokio::test]
+async fn local_infile_data_starting_with_0x01_reaches_the_server() {
+    play_commands(vec![
+        Cmd::Client(0, com_query("LOAD DATA LOCAL INFILE 'f.csv' INTO TABLE t")),
+        Cmd::Server(1, local_infile_request("f.csv")),
+        Cmd::Client(2, b"\x014,starts-with-0x01\n".to_vec()),
+        Cmd::Client(3, Vec::new()),
+        Cmd::Server(4, OK.to_vec()),
+    ])
+    .await;
+}
+
+/// File contents that look like a COM_QUERY are data: forwarded byte for byte,
+/// not evaluated (and not blocked mid-upload, which desynchronized the session).
+#[tokio::test]
+async fn local_infile_data_that_looks_like_sql_is_not_evaluated() {
+    play_commands(vec![
+        Cmd::Client(0, com_query("LOAD DATA LOCAL INFILE 'f.csv' INTO TABLE t")),
+        Cmd::Server(1, local_infile_request("f.csv")),
+        Cmd::Client(2, com_query("DROP TABLE t")),
+        Cmd::Client(3, Vec::new()),
+        Cmd::Server(4, OK.to_vec()),
+    ])
+    .await;
+}
+
+/// COM_CHANGE_USER to a caching_sha2_password account: the server restarts
+/// auth with an AuthSwitchRequest and the client answers with a 32-byte
+/// scramble (sequence id 2). About one scramble in 256 starts with 0x01, which
+/// ended the session; this one always does.
+#[tokio::test]
+async fn change_user_scramble_starting_with_0x01_reaches_the_server() {
+    let mut change_user = vec![0x11];
+    change_user.extend_from_slice(b"app2\0\x14");
+    change_user.extend_from_slice(&[0x33; 20]);
+    change_user.extend_from_slice(b"\0\x21\0mysql_native_password\0");
+    let mut switch = vec![0xfe];
+    switch.extend_from_slice(b"caching_sha2_password\0new-scramble-20bytes\0");
+    play_commands(vec![
+        Cmd::Client(0, change_user),
+        Cmd::Server(1, switch),
+        Cmd::Client(2, vec![0x01; 32]),
+        Cmd::Server(3, vec![0x01, 0x03]),
+        Cmd::Server(4, OK.to_vec()),
+    ])
+    .await;
+}
+
+/// COM_CHANGE_USER, COM_RESET_CONNECTION and queries, many times, against a real
+/// MySQL. With a caching_sha2_password account each change of user restarts auth,
+/// so this exercises the packets inside a command at volume.
+#[tokio::test]
+async fn real_mysql_change_user_and_reset() {
+    use mysql_async::prelude::Queryable;
+    with_real_mysql(|opts| async move {
+        let mut c = timeout(mysql_async::Conn::new(opts)).await.unwrap();
+        for i in 0..1000 {
+            timeout(c.change_user(mysql_async::ChangeUserOpts::default()))
+                .await
+                .unwrap_or_else(|e| panic!("COM_CHANGE_USER #{i}: {e}"));
+            if i % 100 == 0 {
+                assert!(timeout(c.reset()).await.unwrap(), "COM_RESET_CONNECTION");
+            }
+            let one: Option<i64> = c.query_first("SELECT 1").await.unwrap();
+            assert_eq!(one, Some(1), "query after change #{i}");
+        }
+        c.disconnect().await.unwrap();
+    })
+    .await;
 }

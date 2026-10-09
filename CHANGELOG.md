@@ -40,6 +40,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`PROXY_TLS_MODE=require` refuses a plaintext MySQL login with an error**:
   `ERROR 3159 (HY000)`, as MySQL does under `require_secure_transport`, instead
   of closing the connection ("Lost connection to MySQL server").
+- **A MySQL packet inside a command is no longer read as a new command.** Only a
+  packet with sequence id 0 starts one; the packets that continue it carry data.
+  The proxy read their first byte as a command tag, so a LOAD DATA LOCAL INFILE
+  file starting with `0x01` ended the session as a `COM_QUIT`, and so did about
+  one COM_CHANGE_USER in 256 to a `caching_sha2_password` account (its scramble
+  starting with `0x01`); file data starting with `0x03` was evaluated as SQL.
+  They are forwarded as they are now, which is safe: MySQL answers a command
+  whose sequence id is not 0 with `ERROR 1156` and does not run it.
 
 ## [4.8.0] — 2026-10-09
 
