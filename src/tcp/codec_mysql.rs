@@ -27,6 +27,35 @@ pub const COM_QUERY: u8 = 0x03;
 pub const COM_STMT_PREPARE: u8 = 0x16;
 pub const COM_QUIT: u8 = 0x01;
 
+/// CLIENT_PROTOCOL_41 capability flag (bit 9): the HandshakeResponse41 layout.
+pub const CLIENT_PROTOCOL_41: u32 = 0x0000_0200;
+
+/// Username of a HandshakeResponse: the user the server authenticates, and so
+/// the session's identity for the agent-access allowlists. HandshakeResponse41
+/// (every client since 4.1): capabilities (4), max packet (4), charset (1),
+/// 23 reserved, then the NUL-terminated username. HandshakeResponse320:
+/// capabilities (2), max packet (3), username. `None` when the packet is
+/// truncated or the name is not UTF-8.
+pub fn read_handshake_username(payload: &[u8]) -> Option<String> {
+    let caps = u16::from_le_bytes([*payload.first()?, *payload.get(1)?]) as u32;
+    let start = if caps & CLIENT_PROTOCOL_41 != 0 {
+        32
+    } else {
+        5
+    };
+    nul_terminated(payload.get(start..)?)
+}
+
+/// Target username of a COM_CHANGE_USER (`0x11`, then the NUL-terminated user).
+pub fn read_change_user_name(payload: &[u8]) -> Option<String> {
+    nul_terminated(payload.get(1..)?)
+}
+
+fn nul_terminated(bytes: &[u8]) -> Option<String> {
+    let end = bytes.iter().position(|&b| b == 0)?;
+    String::from_utf8(bytes[..end].to_vec()).ok()
+}
+
 /// CLIENT_SSL capability flag (bit 11). Present in the 4-byte client capability
 /// flags at the start of both the SSL Request packet and the HandshakeResponse.
 pub const CLIENT_SSL: u32 = 0x0000_0800;
@@ -611,5 +640,34 @@ mod tests {
         let caps = read_server_capabilities(&p).unwrap();
         assert_eq!(caps, (0x000F << 16) | 0xAE85);
         assert!(caps & CLIENT_SSL != 0); // 0xAE85 has bit 11 (0x800) set
+    }
+
+    /// The session identity for agent access is the HandshakeResponse username.
+    #[test]
+    fn handshake_username_is_read_from_both_layouts() {
+        // HandshakeResponse41: caps (PROTOCOL_41 | SECURE_CONNECTION), max packet,
+        // charset, 23 reserved, user\0, auth data.
+        let mut p41 = (CLIENT_PROTOCOL_41 | 0x8000).to_le_bytes().to_vec();
+        p41.extend_from_slice(&0x0100_0000u32.to_le_bytes());
+        p41.push(0x21);
+        p41.extend_from_slice(&[0u8; 23]);
+        p41.extend_from_slice(b"support_agent\0\x14");
+        p41.extend_from_slice(&[7u8; 20]);
+        assert_eq!(
+            read_handshake_username(&p41).as_deref(),
+            Some("support_agent")
+        );
+        // HandshakeResponse320: 2-byte caps, 3-byte max packet, user\0.
+        let p320 = b"\x05\x00\xff\xff\x00old_user\0pw".to_vec();
+        assert_eq!(read_handshake_username(&p320).as_deref(), Some("old_user"));
+        // Truncated or without the terminator: unknown.
+        assert_eq!(read_handshake_username(&p41[..20]), None);
+        assert_eq!(read_handshake_username(&p41[..40]), None);
+        // COM_CHANGE_USER names its target the same way.
+        assert_eq!(
+            read_change_user_name(b"\x11root\0\0").as_deref(),
+            Some("root")
+        );
+        assert_eq!(read_change_user_name(b"\x11"), None);
     }
 }

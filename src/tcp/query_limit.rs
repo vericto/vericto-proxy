@@ -144,6 +144,7 @@ pub fn oversized_decision(
             // Never parsed, so never rewritten and no column analysed.
             rewritten_query: None,
             sensitive_columns: Vec::new(),
+            access_denied: Vec::new(),
         }
     } else {
         TcpDecision::Block {
@@ -157,6 +158,7 @@ pub fn oversized_decision(
             // Same as above: rejected before parsing, so no evaluated rules.
             violations: Vec::new(),
             sensitive_columns: Vec::new(),
+            access_denied: Vec::new(),
         }
     }
 }

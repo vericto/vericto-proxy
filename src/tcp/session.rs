@@ -19,11 +19,110 @@ use std::time::Instant;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
 
+use vericto_engine::{AccessMode, AccessPolicy, AccessPolicyMap, EnforcementPolicy};
+
 use crate::tcp::client_tls::{ClientRead, ClientWrite};
 use crate::tcp::codec::build_ready_for_query;
-use crate::tcp::evaluator::{SENSITIVE_RULE_CODE, TcpDecision, evaluate_message};
-use crate::tcp::postgres::PgProxyConfig;
-use crate::tcp::protocol::{BlockContext, Classified, RawClientMessage, WireProtocol};
+use crate::tcp::evaluator::{
+    SENSITIVE_RULE_CODE, TcpDecision, access_command_decision, evaluate_message,
+};
+use crate::tcp::postgres::{EventIdentity, PgProxyConfig};
+use crate::tcp::protocol::{
+    AccessControl, BlockContext, Classified, QueryKind, RawClientMessage, WireProtocol,
+};
+
+/// Who the session is, for the agent-access allowlists (VERICTO-087), and the
+/// policy its statements are evaluated with.
+///
+/// The user is the one the session authenticated as: the Postgres StartupMessage
+/// `user`, the MySQL HandshakeResponse username. Nothing the client sends later
+/// changes it: `SET ROLE` / `SET SESSION AUTHORIZATION` are SQL, which the engine
+/// denies under a policy, and the protocol commands that change the user or the
+/// default database are refused here (see [`AccessControl`]).
+///
+/// The policy is resolved again for every statement from the live sync state, so
+/// a rules sync that adds, changes or removes this user's policy applies from the
+/// session's next statement. The resolution is cached against the two snapshots it
+/// was built from (`Arc::ptr_eq`): between syncs a statement pays two atomic loads
+/// and no allocation; a session whose user has no policy uses the shared policy
+/// itself, exactly as before.
+pub(crate) struct SessionAccess {
+    user: Option<String>,
+    cached: Option<(
+        Arc<EnforcementPolicy>,
+        Arc<AccessPolicyMap>,
+        Arc<EnforcementPolicy>,
+    )>,
+}
+
+impl SessionAccess {
+    pub(crate) fn new(user: Option<String>) -> Self {
+        Self { user, cached: None }
+    }
+
+    /// The policy for this session's next evaluation.
+    fn policy(&mut self, config: &PgProxyConfig) -> Arc<EnforcementPolicy> {
+        let base = config.policy.load_full();
+        let map = config.agent_access.load_full();
+        if let Some((b, m, effective)) = &self.cached
+            && Arc::ptr_eq(b, &base)
+            && Arc::ptr_eq(m, &map)
+        {
+            return Arc::clone(effective);
+        }
+        let effective = match select_policy(&map, self.user.as_deref()) {
+            None => Arc::clone(&base),
+            Some(access) => Arc::new(EnforcementPolicy {
+                access_policy: Some(access),
+                ..(*base).clone()
+            }),
+        };
+        self.cached = Some((base, map, Arc::clone(&effective)));
+        effective
+    }
+
+    /// The session user's policy in `map`, as [`select_policy`] picks it.
+    fn policy_in(&self, map: &AccessPolicyMap) -> Option<AccessPolicy> {
+        select_policy(map, self.user.as_deref())
+    }
+
+    /// The session became `user` (an allowed MySQL COM_CHANGE_USER).
+    fn set_user(&mut self, user: Option<String>) {
+        self.user = user;
+        self.cached = None;
+    }
+
+    /// Identity fields of a telemetry event evaluated under `policy`.
+    fn identity(&self, policy: &EnforcementPolicy) -> EventIdentity {
+        EventIdentity {
+            db_user: self.user.clone(),
+            access_mode: policy.access_policy.as_ref().map(|p| p.mode),
+        }
+    }
+}
+
+/// The policy of a session of `user`: `AccessPolicyMap::for_user` (exact key,
+/// else `"*"`, else none). A session whose user could not be read gets a
+/// deny-everything enforce policy as soon as any user has one: it might be
+/// one of them, and the proxy cannot show it is not.
+fn select_policy(map: &AccessPolicyMap, user: Option<&str>) -> Option<AccessPolicy> {
+    match user {
+        Some(u) => map.for_user(u).cloned(),
+        None if map.0.is_empty() => None,
+        None => Some(AccessPolicy::default()),
+    }
+}
+
+/// The strictest of the modes of the policies involved: `Enforce` wins.
+fn strictest_mode<'a>(policies: impl IntoIterator<Item = &'a AccessPolicy>) -> Option<AccessMode> {
+    policies.into_iter().map(|p| p.mode).reduce(|a, b| {
+        if a == AccessMode::Enforce || b == AccessMode::Enforce {
+            AccessMode::Enforce
+        } else {
+            AccessMode::Observe
+        }
+    })
+}
 
 /// Runs the generic client→server interception loop for any wire protocol.
 ///
@@ -39,7 +138,12 @@ pub async fn intercept_client_to_server(
     // `Arc` rather than `&PgProxyConfig`: evaluation and telemetry run on the
     // blocking pool, which needs an owned handle.
     config: &Arc<PgProxyConfig>,
+    // The database user the session authenticated as (None when it could not
+    // be read). Selects the session's agent-access policy.
+    session_user: Option<String>,
 ) -> std::io::Result<()> {
+    let mut access = SessionAccess::new(session_user);
+
     // When we block in an extended/prepared sequence, swallow follow-ups until
     // the end-of-sequence marker (Postgres: Sync 'S'). Only the Postgres path
     // sets this; MySQL never requests it.
@@ -82,14 +186,81 @@ pub async fn intercept_client_to_server(
                 break;
             }
             Classified::PassThrough => {
+                // A protocol command outside SQL that reaches identity, name
+                // resolution or data the statement analysis never sees. Only
+                // refused when the session is under an allowlist (or, for a user
+                // change, when either user is).
+                let refused = match proto.access_control(&msg) {
+                    AccessControl::Allowed => None,
+                    AccessControl::Restricted { label, kind } => {
+                        let policy = access.policy(config);
+                        policy.access_policy.as_ref().map(|p| {
+                            let decision =
+                                access_command_decision(&label, p.mode, policy.monitor_mode);
+                            (label, kind, decision, access.identity(&policy))
+                        })
+                    }
+                    AccessControl::ChangeUser { user } => {
+                        let policy = access.policy(config);
+                        let map = config.agent_access.load();
+                        let target = select_policy(&map, user.as_deref());
+                        let current = access.policy_in(&map);
+                        let refused =
+                            strictest_mode(current.iter().chain(target.iter())).map(|mode| {
+                                let label = "COM_CHANGE_USER".to_string();
+                                let decision =
+                                    access_command_decision(&label, mode, policy.monitor_mode);
+                                (label, QueryKind::Simple, decision, access.identity(&policy))
+                            });
+                        // Forwarded (no policy involved, or observe): the session
+                        // is now the target user, for every later statement.
+                        if !matches!(refused, Some((_, _, TcpDecision::Block { .. }, _))) {
+                            access.set_user(user);
+                        }
+                        refused
+                    }
+                };
+                if let Some((label, kind, decision, identity)) = refused {
+                    crate::tcp::postgres::report_telemetry(
+                        config,
+                        &label,
+                        proto.dialect(),
+                        &decision,
+                        0,
+                        &identity,
+                    );
+                    if let TcpDecision::Block {
+                        rule_code,
+                        ast_node_path,
+                        ..
+                    } = &decision
+                    {
+                        crate::tcp::postgres::log_block(&label, rule_code, ast_node_path);
+                        let block = proto.build_block_response(&BlockContext {
+                            rule_code,
+                            ast_node_path,
+                            suggested_safe_query: None,
+                            kind,
+                            client_seq: message_seq(&msg),
+                        });
+                        send_to_client(client_write, &block.bytes).await?;
+                        if block.skip_until_sync {
+                            skip_until_sync = true;
+                        }
+                        continue; // NOT forwarded upstream
+                    }
+                }
                 forward(server_write, &msg.encode()).await?;
             }
             Classified::Query { sql, kind } => {
                 // Read the active ruleset/policy lock-free (syncer may swap them).
                 // `load_full` (not `load`) because both cross into the blocking
-                // pool below, which needs owned handles rather than guards.
+                // pool below, which needs owned handles rather than guards. The
+                // policy is this session's: the workspace policy plus its user's
+                // allowlist, resolved again for every statement.
                 let rules = config.ruleset.load_full();
-                let policy = config.policy.load_full();
+                let policy = access.policy(config);
+                let identity = access.identity(&policy);
 
                 // Admission guard, before any parse. Evaluation cost is linear in
                 // input size, so an oversized statement is refused rather than
@@ -107,6 +278,7 @@ pub async fn intercept_client_to_server(
                         proto.dialect(),
                         &oversized,
                         0,
+                        &identity,
                     );
                     if let TcpDecision::Block {
                         rule_code,
@@ -163,7 +335,7 @@ pub async fn intercept_client_to_server(
                         let eval_us = eval_start.elapsed().as_micros();
                         // Telemetry before any forwarding (R5.7).
                         crate::tcp::postgres::report_telemetry(
-                            &config, &sql, dialect, &decision, eval_us,
+                            &config, &sql, dialect, &decision, eval_us, &identity,
                         );
                         (decision, eval_us)
                     })
@@ -348,6 +520,9 @@ async fn run_mysql_session(
             "client closed during handshake",
         )
     })?;
+    // The user the server authenticates: the session's identity for the
+    // agent-access allowlists.
+    let session_user = mc::read_handshake_username(&client_resp.payload);
 
     // 3. Forward the HandshakeResponse to the server, upgrading to TLS first when
     //    upstream TLS is enabled (SSL Request → TLS → response with CLIENT_SSL).
@@ -424,6 +599,7 @@ async fn run_mysql_session(
         &mut server_write,
         &client_write,
         &config,
+        session_user,
     )
     .await;
 

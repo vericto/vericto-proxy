@@ -49,6 +49,9 @@ pub struct PgProxyConfig {
     pub ruleset: crate::tcp::rules_sync::SharedRuleset,
     /// Hot-swappable enforcement policy shared with the rule syncer.
     pub policy: crate::tcp::rules_sync::SharedPolicy,
+    /// Hot-swappable agent-access allowlists (VERICTO-087) keyed by database user,
+    /// shared with the rule syncer. Each session applies its own user's policy.
+    pub agent_access: crate::tcp::rules_sync::SharedAccessPolicies,
     /// Hot-swappable telemetry query mode (raw | sanitized) shared with the syncer.
     pub telemetry_mode: crate::tcp::rules_sync::SharedTelemetryMode,
     /// Optional telemetry sink: when set, each evaluation is reported. The
@@ -81,7 +84,9 @@ pub async fn handle_connection(client: TcpStream, config: Arc<PgProxyConfig>) {
 async fn run_session(client: TcpStream, config: Arc<PgProxyConfig>) -> std::io::Result<()> {
     // ── Phase 1: negotiate startup. Optionally terminate client TLS, then read
     // the StartupMessage. Returns the (possibly TLS) client halves.
-    let (mut client_read, mut client_write, startup_raw) =
+    // The StartupMessage `user` is the session's identity for the agent-access
+    // allowlists: the role the server authenticates, fixed for the session.
+    let (mut client_read, mut client_write, startup_raw, session_user) =
         negotiate_startup(client, config.client_tls_acceptor.as_ref()).await?;
 
     // ── Phase 2: connect upstream (optionally over TLS) and forward the StartupMessage
@@ -148,7 +153,7 @@ async fn run_session(client: TcpStream, config: Arc<PgProxyConfig>) -> std::io::
     // function's futures closes the sockets, unwinding the client side too.
     let mut relay_handle = relay_handle;
     let result = tokio::select! {
-        r = intercept_client_to_server(&mut client_read, &mut server_write, &client_write, &config) => {
+        r = intercept_client_to_server(&mut client_read, &mut server_write, &client_write, &config, session_user) => {
             // Client ended or a block/forward error unwound the loop: stop the relay.
             relay_handle.abort();
             r
@@ -177,8 +182,8 @@ async fn run_session(client: TcpStream, config: Arc<PgProxyConfig>) -> std::io::
     result
 }
 
-/// Negotiates the startup phase and returns the client transport halves plus the
-/// raw StartupMessage bytes.
+/// Negotiates the startup phase and returns the client transport halves, the
+/// raw StartupMessage bytes and its `user` parameter.
 ///
 /// When `acceptor` is `Some` and the client sends an `SSLRequest`, the proxy
 /// answers `'S'`, performs the server-side TLS handshake, and reads the
@@ -192,7 +197,7 @@ async fn run_session(client: TcpStream, config: Arc<PgProxyConfig>) -> std::io::
 async fn negotiate_startup(
     mut client: TcpStream,
     acceptor: Option<&tokio_rustls::TlsAcceptor>,
-) -> std::io::Result<(ClientRead, ClientWrite, Vec<u8>)> {
+) -> std::io::Result<(ClientRead, ClientWrite, Vec<u8>, Option<String>)> {
     loop {
         match read_startup_packet(&mut client).await? {
             StartupPacket::SslRequest => {
@@ -203,8 +208,8 @@ async fn negotiate_startup(
                     client.flush().await?;
                     let (mut read, write) =
                         crate::tcp::client_tls::accept_tls(acceptor, client).await?;
-                    let raw = read_startup_message(&mut read).await?;
-                    return Ok((read, write, raw));
+                    let (raw, user) = read_startup_message(&mut read).await?;
+                    return Ok((read, write, raw, user));
                 }
                 // TLS not enabled: decline ('N') and keep negotiating in plaintext.
                 client.write_all(b"N").await?;
@@ -240,7 +245,7 @@ async fn negotiate_startup(
                     "StartupMessage received"
                 );
                 let (read, write) = tokio::io::split(client);
-                return Ok((Box::new(read), Box::new(write), raw));
+                return Ok((Box::new(read), Box::new(write), raw, params.user));
             }
         }
     }
@@ -248,7 +253,9 @@ async fn negotiate_startup(
 
 /// Reads a single startup packet expecting the StartupMessage (used after a TLS
 /// handshake, where the next message must be the StartupMessage).
-async fn read_startup_message<R: AsyncRead + Unpin>(reader: &mut R) -> std::io::Result<Vec<u8>> {
+async fn read_startup_message<R: AsyncRead + Unpin>(
+    reader: &mut R,
+) -> std::io::Result<(Vec<u8>, Option<String>)> {
     match read_startup_packet(reader).await? {
         StartupPacket::Startup { raw, params } => {
             tracing::debug!(
@@ -256,7 +263,7 @@ async fn read_startup_message<R: AsyncRead + Unpin>(reader: &mut R) -> std::io::
                 database = ?params.database,
                 "StartupMessage received (over TLS)"
             );
-            Ok(raw)
+            Ok((raw, params.user))
         }
         _ => Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -303,6 +310,7 @@ async fn intercept_client_to_server(
     server_write: &mut crate::tcp::upstream::UpstreamWrite,
     client_write: &Arc<Mutex<ClientWrite>>,
     config: &Arc<PgProxyConfig>,
+    session_user: Option<String>,
 ) -> std::io::Result<()> {
     let proto = crate::tcp::protocol::postgres::PostgresProtocol;
     crate::tcp::session::intercept_client_to_server(
@@ -311,6 +319,7 @@ async fn intercept_client_to_server(
         server_write,
         client_write,
         config,
+        session_user,
     )
     .await
 }
@@ -346,6 +355,14 @@ fn dialect_name(dialect: Dialect) -> &'static str {
     }
 }
 
+/// Who issued a query, for its telemetry event: the session's database user and,
+/// when an agent-access policy applied, its mode.
+#[derive(Debug, Clone, Default)]
+pub struct EventIdentity {
+    pub db_user: Option<String>,
+    pub access_mode: Option<vericto_engine::AccessMode>,
+}
+
 /// [`build_event`] in raw mode, for the tests that only exercise the mapping.
 #[cfg(test)]
 fn build_telemetry_event(
@@ -362,6 +379,7 @@ fn build_telemetry_event(
         decision,
         latency_us,
         crate::tcp::rules_sync::TelemetryQueryMode::Raw,
+        &EventIdentity::default(),
     )
 }
 
@@ -380,6 +398,7 @@ fn build_event(
     decision: &TcpDecision,
     latency_us: u128,
     mode: crate::tcp::rules_sync::TelemetryQueryMode,
+    identity: &EventIdentity,
 ) -> crate::telemetry::TelemetryEvent {
     use crate::tcp::evaluator::SENSITIVE_RULE_CODE;
     use crate::tcp::rules_sync::TelemetryQueryMode;
@@ -453,18 +472,33 @@ fn build_event(
         }
     };
 
-    let (violations, touched, rewritten) = match decision {
+    let (violations, touched, rewritten, denied) = match decision {
         TcpDecision::Forward {
             violations,
             sensitive_columns,
             rewritten_query,
+            access_denied,
             ..
-        } => (violations, sensitive_columns, rewritten_query.as_deref()),
+        } => (
+            violations,
+            sensitive_columns,
+            rewritten_query.as_deref(),
+            access_denied,
+        ),
         TcpDecision::Block {
             violations,
             sensitive_columns,
+            access_denied,
             ..
-        } => (violations, sensitive_columns, None),
+        } => (violations, sensitive_columns, None, access_denied),
+    };
+
+    // VERICTO-087 names what the query referenced. In sanitized mode a name that
+    // may have been a literal is not reported (see `AccessRedaction`); the
+    // allowlist's own path is then rebuilt from the redacted names.
+    let redaction = AccessRedaction::new(sanitized, sql, dialect, denied);
+    let access_path = |path: &str| -> String {
+        crate::telemetry::truncate_reported_ast_path(&redaction.path(path))
     };
 
     // The full violation set, capped and mapped to the wire shape. Taken from the
@@ -491,7 +525,11 @@ fn build_event(
                 rule_code: v.rule_code.clone(),
                 severity: v.severity.as_str().to_string(),
                 enforcement_action: action_str(v.action).to_string(),
-                ast_node_path: Some(v.ast_node_path.clone()),
+                ast_node_path: Some(if v.rule_code == vericto_engine::ACCESS_RULE_CODE {
+                    access_path(&v.ast_node_path)
+                } else {
+                    crate::telemetry::truncate_reported_ast_path(&v.ast_node_path)
+                }),
                 suggested_safe_query: suggestion
                     .as_deref()
                     .map(crate::telemetry::truncate_reported_suggestion),
@@ -528,9 +566,15 @@ fn build_event(
         database_id: database_id.to_string(),
         query_text,
         dialect: dialect_name(dialect).to_string(),
+        ast_node_path: ast_node_path.map(|p| {
+            if rule_code.as_deref() == Some(vericto_engine::ACCESS_RULE_CODE) {
+                access_path(&p)
+            } else {
+                crate::telemetry::truncate_reported_ast_path(&p)
+            }
+        }),
         status,
         rule_code,
-        ast_node_path,
         severity,
         enforcement_action,
         violations,
@@ -542,7 +586,158 @@ fn build_event(
         occurred_at: chrono::Utc::now().to_rfc3339(),
         rewritten_query,
         sensitive_columns,
+        db_user: identity.db_user.clone(),
+        access_policy_mode: identity.access_mode.map(|m| match m {
+            vericto_engine::AccessMode::Observe => "observe".to_string(),
+            vericto_engine::AccessMode::Enforce => "enforce".to_string(),
+        }),
+        access_denied: redaction.payload(),
     }
+}
+
+/// The VERICTO-087 denials of an event, made safe to report.
+///
+/// Names are not values, so they are reported in sanitized mode too, with one
+/// exception: on MySQL a double-quoted `"x"` is a string unless ANSI_QUOTES is
+/// on, and the engine conservatively also reads it as a column `x` (contract
+/// §5). A denied "column" can therefore be a literal the client sent. In
+/// sanitized mode a MySQL name is kept only when the query spells it as an
+/// identifier (bare or backticked); otherwise it is reported as `?` and the
+/// rule's path is rebuilt from the redacted names. Catalogue schemas, `*` and
+/// the keyword of a denied statement come from the engine, not from the text.
+struct AccessRedaction<'a> {
+    denied: &'a [vericto_engine::DeniedRef],
+    /// `Some` when a name had to be redacted: the redacted list, else the list
+    /// is reported as the engine gave it.
+    redacted: Option<Vec<vericto_engine::DeniedRef>>,
+}
+
+impl<'a> AccessRedaction<'a> {
+    fn new(
+        sanitized: bool,
+        sql: &str,
+        dialect: Dialect,
+        denied: &'a [vericto_engine::DeniedRef],
+    ) -> Self {
+        let mut this = Self {
+            denied,
+            redacted: None,
+        };
+        if !sanitized || dialect != Dialect::Mysql || denied.is_empty() {
+            return this;
+        }
+        let words = mysql_identifier_words(sql);
+        let keep = |name: &str| -> bool {
+            name == "*"
+                || words
+                    .as_ref()
+                    .is_some_and(|w| w.contains(&name.to_ascii_lowercase()))
+        };
+        let mut changed = false;
+        let list = denied
+            .iter()
+            .map(|d| {
+                let mut d = d.clone();
+                if d.needed != vericto_engine::Needed::Ddl {
+                    if let Some(s) = &d.schema
+                        && !is_system_schema(s)
+                        && !keep(s)
+                    {
+                        d.schema = Some("?".into());
+                        changed = true;
+                    }
+                    if !keep(&d.table) {
+                        d.table = "?".into();
+                        changed = true;
+                    }
+                    if let Some(c) = &d.column
+                        && !keep(c)
+                    {
+                        d.column = Some("?".into());
+                        changed = true;
+                    }
+                }
+                d
+            })
+            .collect();
+        if changed {
+            this.redacted = Some(list);
+        }
+        this
+    }
+
+    /// The rule's path: unchanged, or rebuilt from the first redacted denial.
+    fn path(&self, original: &str) -> String {
+        let Some(list) = &self.redacted else {
+            return original.to_string();
+        };
+        let first = &list[0];
+        let mut name = String::new();
+        if let Some(s) = &first.schema {
+            name.push_str(s);
+            name.push('.');
+        }
+        name.push_str(&first.table);
+        if let Some(c) = &first.column {
+            name.push('.');
+            name.push_str(c);
+        }
+        let more = match list.len() {
+            1 => String::new(),
+            n => format!(" (+{} more)", n - 1),
+        };
+        format!(
+            "AccessPolicy > {name} ({}): name redacted (sanitized telemetry){more}",
+            first.needed.as_str()
+        )
+    }
+
+    /// The `access_denied` field: capped and with every name bounded to the
+    /// ingest schema's limits, so one long name cannot reject the batch.
+    fn payload(&self) -> Vec<crate::telemetry::AccessDeniedPayload> {
+        self.redacted
+            .as_deref()
+            .unwrap_or(self.denied)
+            .iter()
+            .take(crate::telemetry::MAX_REPORTED_ACCESS_DENIED)
+            .map(crate::telemetry::AccessDeniedPayload::from_denied)
+            .collect()
+    }
+}
+
+/// Catalogue and system schemas (engine contract §5): names the engine itself
+/// assigns (`pg_catalog` for an unqualified `pg_*`), never a literal.
+fn is_system_schema(s: &str) -> bool {
+    [
+        "information_schema",
+        "pg_catalog",
+        "pg_toast",
+        "mysql",
+        "performance_schema",
+        "sys",
+    ]
+    .iter()
+    .any(|k| k.eq_ignore_ascii_case(s))
+}
+
+/// Lowercased words the MySQL lexer reads as identifiers or keywords (bare or
+/// backticked; not `"…"` or `'…'`), or `None` when the text does not lex.
+fn mysql_identifier_words(sql: &str) -> Option<std::collections::HashSet<String>> {
+    use sqlparser::tokenizer::{Token, Tokenizer};
+    let tokens = Tokenizer::new(&sqlparser::dialect::MySqlDialect {}, sql)
+        .tokenize()
+        .ok()?;
+    Some(
+        tokens
+            .into_iter()
+            .filter_map(|t| match t {
+                Token::Word(w) if w.quote_style.is_none_or(|q| q == '`') => {
+                    Some(w.value.to_ascii_lowercase())
+                }
+                _ => None,
+            })
+            .collect(),
+    )
 }
 
 /// Push a telemetry event for an evaluation. Non-blocking and best-effort: if no
@@ -553,6 +748,7 @@ pub(crate) fn report_telemetry(
     dialect: Dialect,
     decision: &TcpDecision,
     latency_us: u128,
+    identity: &EventIdentity,
 ) {
     let Some(sink) = &config.telemetry else {
         return;
@@ -564,6 +760,7 @@ pub(crate) fn report_telemetry(
         decision,
         latency_us,
         **config.telemetry_mode.load(),
+        identity,
     );
     sink.queue.push(event);
 }
@@ -694,6 +891,7 @@ mod tests {
             ],
             rewritten_query: None,
             sensitive_columns: Vec::new(),
+            access_denied: Vec::new(),
         };
         let ev = build_telemetry_event("db1", "SELECT * FROM t", Dialect::Postgres, &decision, 10);
 
@@ -724,6 +922,7 @@ mod tests {
                 ),
             ],
             sensitive_columns: Vec::new(),
+            access_denied: Vec::new(),
         };
         let ev = build_telemetry_event("db1", "DELETE FROM t", Dialect::Postgres, &decision, 10);
 
@@ -756,6 +955,7 @@ mod tests {
             violations: muchas,
             rewritten_query: None,
             sensitive_columns: Vec::new(),
+            access_denied: Vec::new(),
         };
         let ev = build_telemetry_event("db1", "SELECT 1", Dialect::Postgres, &decision, 10);
 
@@ -775,6 +975,7 @@ mod tests {
             violations: Vec::new(),
             rewritten_query: None,
             sensitive_columns: Vec::new(),
+            access_denied: Vec::new(),
         };
         let ev = build_telemetry_event("db1", "SELECT 1", Dialect::Postgres, &decision, 10);
         assert!(ev.violations.is_empty());
@@ -798,6 +999,7 @@ mod tests {
             )],
             rewritten_query: None,
             sensitive_columns: Vec::new(),
+            access_denied: Vec::new(),
         };
         let ev = build_telemetry_event("db1", "SELECT 1", Dialect::Postgres, &decision, 10);
         let json = serde_json::to_string(&ev).expect("event serializes");
@@ -816,6 +1018,7 @@ mod tests {
             }),
             rewritten_query: None,
             sensitive_columns: Vec::new(),
+            access_denied: Vec::new(),
         }
     }
 
@@ -830,6 +1033,7 @@ mod tests {
                 violations: Vec::new(),
                 rewritten_query: None,
                 sensitive_columns: Vec::new(),
+                access_denied: Vec::new(),
             },
             42,
         );
@@ -881,6 +1085,7 @@ mod tests {
             violations: Vec::new(),
             rewritten_query: None,
             sensitive_columns: Vec::new(),
+            access_denied: Vec::new(),
         };
         let sql = format!(
             "SELECT * FROM t WHERE x IN ({})",
@@ -905,6 +1110,7 @@ mod tests {
             violations: Vec::new(),
             rewritten_query: None,
             sensitive_columns: Vec::new(),
+            access_denied: Vec::new(),
         };
         let ev = build_telemetry_event("db1", "SELECT 1", Dialect::Postgres, &decision, 10);
         assert_eq!(ev.query_text, "SELECT 1");
@@ -919,6 +1125,7 @@ mod tests {
             suggested_safe_query: None,
             severity: Severity::Critical,
             sensitive_columns: Vec::new(),
+            access_denied: Vec::new(),
         };
         let ev = build_telemetry_event("db1", "DELETE FROM t", Dialect::Mysql, &decision, 80);
         assert_eq!(ev.status, "BLOCKED");
@@ -942,6 +1149,7 @@ mod tests {
             }),
             rewritten_query: None,
             sensitive_columns: Vec::new(),
+            access_denied: Vec::new(),
         };
         let ev = build_telemetry_event("db1", "@@@", Dialect::Postgres, &decision, 10);
         assert_eq!(ev.status, "PARSE_ERROR");
@@ -962,6 +1170,7 @@ mod tests {
             }),
             rewritten_query: None,
             sensitive_columns: Vec::new(),
+            access_denied: Vec::new(),
         };
         let ev = build_telemetry_event("db1", "@@@", Dialect::Postgres, &decision, 10);
         let msg = ev.parse_error.expect("message kept");
@@ -978,6 +1187,7 @@ mod tests {
             suggested_safe_query: None,
             severity: Severity::Medium,
             sensitive_columns: Vec::new(),
+            access_denied: Vec::new(),
         };
         let ev = build_telemetry_event("db1", "@@@", Dialect::Postgres, &decision, 10);
         assert_eq!(ev.status, "PARSE_ERROR");
@@ -1011,6 +1221,7 @@ mod tests {
             violations: vec![sensitive_violation(rewritten)],
             rewritten_query: Some(rewritten.to_string()),
             sensitive_columns: vec![touched(0, vericto_engine::SensitivePolicy::Mask)],
+            access_denied: Vec::new(),
         };
         let ev = build_telemetry_event(
             "db1",
@@ -1049,6 +1260,7 @@ mod tests {
             ],
             rewritten_query: None,
             sensitive_columns: vec![touched(0, vericto_engine::SensitivePolicy::Mask)],
+            access_denied: Vec::new(),
         };
         let ev = build_event(
             "db1",
@@ -1057,6 +1269,7 @@ mod tests {
             &decision,
             1,
             crate::tcp::rules_sync::TelemetryQueryMode::Sanitized,
+            &EventIdentity::default(),
         );
         let s0 = ev.violations[0].suggested_safe_query.as_deref().unwrap();
         assert!(!s0.contains("Alice"), "{s0}");
@@ -1078,6 +1291,7 @@ mod tests {
             sensitive_columns: (0..100)
                 .map(|i| touched(i, vericto_engine::SensitivePolicy::Block))
                 .collect(),
+            access_denied: Vec::new(),
         };
         let ev = build_telemetry_event("db1", "SELECT 1", Dialect::Postgres, &decision, 1);
         assert_eq!(
@@ -1139,6 +1353,7 @@ mod tests {
             violations: vec![sensitive_violation(rewritten)],
             rewritten_query: Some(rewritten.to_string()),
             sensitive_columns: vec![touched(0, vericto_engine::SensitivePolicy::Mask)],
+            access_denied: Vec::new(),
         };
         let ev = build_event(
             "db1",
@@ -1147,6 +1362,7 @@ mod tests {
             &decision,
             1,
             crate::tcp::rules_sync::TelemetryQueryMode::Sanitized,
+            &EventIdentity::default(),
         );
         assert_eq!(ev.query_text, "SELECT card FROM customers WHERE name = ?");
         assert_eq!(
@@ -1244,6 +1460,9 @@ mod tests {
             )),
             policy: Arc::new(ArcSwap::from_pointee(
                 vericto_engine::EnforcementPolicy::default(),
+            )),
+            agent_access: Arc::new(ArcSwap::from_pointee(
+                vericto_engine::AccessPolicyMap::default(),
             )),
             telemetry_mode: Arc::new(ArcSwap::from_pointee(
                 crate::tcp::rules_sync::TelemetryQueryMode::default(),

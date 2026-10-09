@@ -15,6 +15,11 @@ env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
 
+# Least privilege for the GITHUB_TOKEN (CodeQL actions/missing-workflow-permissions):
+# CI only checks out and builds, so it needs read access to the contents and nothing else.
+permissions:
+  contents: read
+
 jobs:
   test:
     name: fmt + clippy + test

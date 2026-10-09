@@ -2493,8 +2493,8 @@ checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
 
 [[package]]
 name = "vericto-engine"
-version = "3.7.0"
-source = "git+https://github.com/vericto/vericto-engine?tag=v3.7.0#3d7f34334cf87391cb29dcb45d4a1c0d799ebf5a"
+version = "3.8.0"
+source = "git+https://github.com/vericto/vericto-engine?tag=v3.8.0#d5556111f870ac51a78a578b621e49a463451eda"
 dependencies = [
  "pg_query",
  "serde",
@@ -2507,7 +2507,7 @@ dependencies = [
 
 [[package]]
 name = "vericto-proxy"
-version = "4.7.1"
+version = "4.8.0"
 dependencies = [
  "arc-swap",
  "async-trait",

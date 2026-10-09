@@ -23,11 +23,11 @@ mod telemetry;
 use arc_swap::ArcSwap;
 use std::sync::Arc;
 
-use vericto_engine::EnforcementPolicy;
+use vericto_engine::{AccessPolicyMap, EnforcementPolicy};
 
 use crate::tcp::evaluator::default_ruleset;
 use crate::tcp::rules_sync::{
-    SharedPolicy, SharedRuleset, SharedTelemetryMode, TelemetryQueryMode,
+    SharedAccessPolicies, SharedPolicy, SharedRuleset, SharedTelemetryMode, TelemetryQueryMode,
 };
 
 // vericto-engine re-exports through the tcp evaluator module's imports
@@ -57,6 +57,12 @@ async fn main() {
     // parse-error → allow_report).
     let policy: SharedPolicy = Arc::new(ArcSwap::from_pointee(EnforcementPolicy::default()));
 
+    // Shared, hot-swappable agent-access allowlists keyed by database user. Empty
+    // (no user restricted) until a sync sends some: the built-in posture is
+    // today's behaviour, and the rules cache restores them across a restart.
+    let agent_access: SharedAccessPolicies =
+        Arc::new(ArcSwap::from_pointee(AccessPolicyMap::default()));
+
     // Shared, hot-swappable telemetry query mode. Defaults to Raw until the
     // first API sync resolves the workspace's reporting privacy preference.
     let telemetry_mode: SharedTelemetryMode =
@@ -82,6 +88,7 @@ async fn main() {
             let sync_cfg = cp.clone();
             let sync_ruleset = ruleset.clone();
             let sync_policy = policy.clone();
+            let sync_agent_access = agent_access.clone();
             let sync_telemetry_mode = telemetry_mode.clone();
             let sync_readiness = readiness.clone();
             tokio::spawn(async move {
@@ -89,6 +96,7 @@ async fn main() {
                     sync_cfg,
                     sync_ruleset,
                     sync_policy,
+                    sync_agent_access,
                     sync_telemetry_mode,
                     sync_readiness,
                 )
@@ -143,9 +151,27 @@ async fn main() {
 
     let result = match wire_protocol.as_str() {
         "mysql" => {
-            tcp::run_mysql_proxy(tcp_opts, ruleset, policy, telemetry_mode, telemetry_sink).await
+            tcp::run_mysql_proxy(
+                tcp_opts,
+                ruleset,
+                policy,
+                agent_access,
+                telemetry_mode,
+                telemetry_sink,
+            )
+            .await
         }
-        _ => tcp::run_pg_proxy(tcp_opts, ruleset, policy, telemetry_mode, telemetry_sink).await,
+        _ => {
+            tcp::run_pg_proxy(
+                tcp_opts,
+                ruleset,
+                policy,
+                agent_access,
+                telemetry_mode,
+                telemetry_sink,
+            )
+            .await
+        }
     };
 
     if let Err(e) = result {

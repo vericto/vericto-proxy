@@ -266,6 +266,9 @@ mod tests {
             violations: Vec::new(),
             rewritten_query: None,
             sensitive_columns: Vec::new(),
+            db_user: None,
+            access_policy_mode: None,
+            access_denied: Vec::new(),
         }
     }
 

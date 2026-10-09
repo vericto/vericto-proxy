@@ -5,8 +5,9 @@
 
 use vericto_engine::parser::{Dialect, parser_for};
 use vericto_engine::{
-    Decision, EnforcementAction, EnforcementPolicy, EvaluationOutcome, ParseErrorAction,
-    ReportedViolation, Rule, RuleEngine, RuleType, SensitivePolicy, Severity, TouchedColumn,
+    ACCESS_RULE_CODE, AccessMode, Decision, DeniedRef, EnforcementAction, EnforcementPolicy,
+    EvaluationOutcome, Needed, ParseErrorAction, ReportedViolation, Rule, RuleEngine, RuleType,
+    SensitivePolicy, Severity, TouchedColumn,
 };
 
 use crate::tcp::protocol::QueryKind;
@@ -32,6 +33,9 @@ pub enum TcpDecision {
         rewritten_query: Option<String>,
         /// Every tagged column the query reads (VERICTO-085), for the audit trail.
         sensitive_columns: Vec<TouchedColumn>,
+        /// Every reference the session user's allowlist denied (VERICTO-087),
+        /// for the audit trail. Non-empty on a forward under `mode = observe`.
+        access_denied: Vec<DeniedRef>,
     },
     /// Reject the query with SQLSTATE 42501.
     Block {
@@ -45,6 +49,8 @@ pub enum TcpDecision {
         violations: Vec<ReportedViolation>,
         /// Every tagged column the query would have read (VERICTO-085).
         sensitive_columns: Vec<TouchedColumn>,
+        /// Every reference the session user's allowlist denied (VERICTO-087).
+        access_denied: Vec<DeniedRef>,
     },
 }
 
@@ -56,6 +62,7 @@ impl TcpDecision {
         reason: &str,
         violations: Vec<ReportedViolation>,
         sensitive_columns: Vec<TouchedColumn>,
+        access_denied: Vec<DeniedRef>,
     ) -> Self {
         TcpDecision::Block {
             rule_code: SENSITIVE_RULE_CODE.to_string(),
@@ -65,6 +72,62 @@ impl TcpDecision {
             severity: Severity::High,
             violations,
             sensitive_columns,
+            access_denied,
+        }
+    }
+}
+
+/// The VERICTO-087 outcome of a protocol command refused under an allowlist
+/// ([`crate::tcp::protocol::AccessControl`]): the same shape the engine gives a
+/// denied statement (`AccessPolicy > <label> (ddl): denied for this identity`,
+/// High, one `ddl` reference). Blocks under `enforce`; flags (and forwards)
+/// under `observe` and under `monitor_mode`, as the engine does.
+pub fn access_command_decision(label: &str, mode: AccessMode, monitor_mode: bool) -> TcpDecision {
+    let ast_node_path = format!("AccessPolicy > {label} (ddl): denied for this identity");
+    let block = mode == AccessMode::Enforce && !monitor_mode;
+    let action = if block {
+        EnforcementAction::Block
+    } else {
+        EnforcementAction::Flag
+    };
+    let violations = vec![ReportedViolation {
+        rule_id: ACCESS_RULE_CODE.to_string(),
+        rule_code: ACCESS_RULE_CODE.to_string(),
+        severity: Severity::High,
+        action,
+        ast_node_path: ast_node_path.clone(),
+        estimated_rows_affected: None,
+        suggested_safe_query: None,
+    }];
+    let access_denied = vec![DeniedRef {
+        schema: None,
+        table: label.to_string(),
+        column: None,
+        needed: Needed::Ddl,
+    }];
+    if block {
+        TcpDecision::Block {
+            rule_code: ACCESS_RULE_CODE.to_string(),
+            ast_node_path,
+            suggested_safe_query: None,
+            severity: Severity::High,
+            violations,
+            sensitive_columns: Vec::new(),
+            access_denied,
+        }
+    } else {
+        TcpDecision::Forward {
+            observation: Some(Observation {
+                rule_code: ACCESS_RULE_CODE.to_string(),
+                ast_node_path,
+                severity: Severity::High,
+                action,
+                parse_error: None,
+            }),
+            violations,
+            rewritten_query: None,
+            sensitive_columns: Vec::new(),
+            access_denied,
         }
     }
 }
@@ -89,7 +152,7 @@ pub struct Observation {
 ///   A `Forward` carries the engine's `rewritten_query` when a mask applied;
 ///   if the outcome does not hold together (see [`rewrite_inconsistency`]) the
 ///   query is blocked instead.
-/// - Parse error → resolved from `policy.effective_parse_error()`:
+/// - Parse error → resolved from `policy.effective_parse_error_for(sql, dialect)`:
 ///   `AllowReport` (fail-open default) forwards with a parse-error
 ///   `Observation`; `Block` (fail-closed opt-in, and forced by any `block` or
 ///   `mask` sensitive column) rejects with `VERICTO-PARSE-ERROR`.
@@ -114,6 +177,7 @@ pub fn evaluate(
                     reason,
                     outcome.violations,
                     outcome.sensitive_columns,
+                    outcome.access_denied,
                 );
             }
             match outcome.decision {
@@ -124,6 +188,7 @@ pub fn evaluate(
                     severity: outcome.severity.unwrap_or(Severity::Critical),
                     violations: outcome.violations,
                     sensitive_columns: outcome.sensitive_columns,
+                    access_denied: outcome.access_denied,
                 },
                 Decision::Flag | Decision::Allow => TcpDecision::Forward {
                     observation: outcome.action.map(|action| Observation {
@@ -139,6 +204,7 @@ pub fn evaluate(
                     violations: outcome.violations,
                     rewritten_query: outcome.rewritten_query,
                     sensitive_columns: outcome.sensitive_columns,
+                    access_denied: outcome.access_denied,
                 },
             }
         }
@@ -146,7 +212,10 @@ pub fn evaluate(
         // `mask` tag configured a query the engine cannot read cannot be shown not
         // to read the column, so it blocks whatever the workspace chose (engine
         // contract §3.2). Without such tags the two are identical.
-        Err(e) => match policy.effective_parse_error() {
+        // `_for(sql, dialect)`: an enforced agent allowlist also forces a block,
+        // except for the session statements drivers send on connect that the
+        // parser cannot read (engine contract §8, v3).
+        Err(e) => match policy.effective_parse_error_for(sql, dialect) {
             // Fail-open default (R5.5): forward + report.
             ParseErrorAction::AllowReport => TcpDecision::Forward {
                 // A query that did not parse violated no rule: there is nothing to
@@ -162,6 +231,7 @@ pub fn evaluate(
                 }),
                 rewritten_query: None,
                 sensitive_columns: Vec::new(),
+                access_denied: Vec::new(),
             },
             // Fail-closed (R5.6): reject with 42501.
             ParseErrorAction::Block => TcpDecision::Block {
@@ -171,6 +241,7 @@ pub fn evaluate(
                 severity: Severity::Medium,
                 violations: Vec::new(),
                 sensitive_columns: Vec::new(),
+                access_denied: Vec::new(),
             },
         },
     }
@@ -214,12 +285,13 @@ fn checked_for_kind(
                 let TcpDecision::Forward {
                     violations,
                     sensitive_columns,
+                    access_denied,
                     ..
                 } = decision
                 else {
                     unreachable!()
                 };
-                TcpDecision::sensitive_block(&reason, violations, sensitive_columns)
+                TcpDecision::sensitive_block(&reason, violations, sensitive_columns, access_denied)
             }
         },
         other => other,
@@ -388,6 +460,10 @@ pub fn default_ruleset() -> Vec<Rule> {
         // Read of a sensitive column. Engine-driven: it only acts on the policy's
         // column tags (High for block/mask, Medium for flag), never through this list.
         ("VERICTO-085", Severity::High, EnforcementAction::Block),
+        // Access outside the agent's allowlist. Engine-driven: it only acts on the
+        // session user's `access_policy` (block under enforce, flag under observe),
+        // never through this list.
+        ("VERICTO-087", Severity::High, EnforcementAction::Block),
         // Medium / FLAG.
         ("VERICTO-050", Severity::Medium, EnforcementAction::Flag), // SELECT without LIMIT
         ("VERICTO-051", Severity::Medium, EnforcementAction::Flag), // SELECT * without WHERE
@@ -442,6 +518,7 @@ mod tests {
         ("VERICTO-083", Severity::High, EnforcementAction::Block),
         ("VERICTO-084", Severity::High, EnforcementAction::Block),
         ("VERICTO-085", Severity::High, EnforcementAction::Block),
+        ("VERICTO-087", Severity::High, EnforcementAction::Block),
         ("VERICTO-050", Severity::Medium, EnforcementAction::Flag),
         ("VERICTO-051", Severity::Medium, EnforcementAction::Flag),
         ("VERICTO-061", Severity::Medium, EnforcementAction::Flag),
@@ -477,23 +554,26 @@ mod tests {
         let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let lock =
             std::fs::read_to_string(manifest_dir.join("Cargo.lock")).expect("read Cargo.lock");
+        // `None` when the engine is not a git source, e.g. a local `[patch]` to a
+        // path checkout: `cargo metadata` below then names that directory.
         let rev = lock
             .split("[[package]]")
             .find(|p| p.contains("name = \"vericto-engine\""))
-            .and_then(|p| p.lines().find(|l| l.starts_with("source = ")))
+            .and_then(|p| p.lines().find(|l| l.starts_with("source = \"git+")))
             .and_then(|l| {
                 l.trim_end_matches('"')
                     .rsplit('#')
                     .next()
                     .map(str::to_owned)
-            })
-            .expect("vericto-engine git source in Cargo.lock");
+            });
         let cargo_home = std::env::var_os("CARGO_HOME")
             .map(std::path::PathBuf::from)
             .or_else(|| std::env::var_os("HOME").map(|h| std::path::Path::new(&h).join(".cargo")))
             .expect("CARGO_HOME or HOME");
         let checkouts = cargo_home.join("git").join("checkouts");
-        if let Ok(entries) = std::fs::read_dir(&checkouts) {
+        if let Some(rev) = rev
+            && let Ok(entries) = std::fs::read_dir(&checkouts)
+        {
             for e in entries.flatten() {
                 if !e
                     .file_name()
@@ -1020,6 +1100,7 @@ mod tests {
             violations: Vec::new(),
             rewritten_query: Some("SELECT '[redacted]' AS c FROM t".to_string()),
             sensitive_columns: vec![touched(SensitivePolicy::Mask)],
+            access_denied: Vec::new(),
         };
         let sql = "SELECT SUBSTRING(card, ?, 4) AS c FROM t";
         match checked_for_kind(forward(), sql, Dialect::Mysql, QueryKind::Prepared) {

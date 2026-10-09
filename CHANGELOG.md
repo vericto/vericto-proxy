@@ -7,6 +7,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [4.8.0] — 2026-10-09
+
+Agent access allowlists (`VERICTO-087`), enforced per database user. Requires
+vericto-engine v3.8.0. A database without policies is evaluated exactly as before.
+
+### Added
+
+- **`agent_access` in `/sync/rules`**: one allowlist per database user, `"*"`
+  optionally the default for users not listed (engine contract §2). Parsed with
+  the engine's own types into a hot-swapped map, and kept in the rules cache with
+  the rest of the bundle, so a restart during an outage keeps restricting the
+  agents. Absent, `null` or `{}` = no user restricted.
+- **Per-session identity.** The session's user is the Postgres StartupMessage
+  `user` or the MySQL HandshakeResponse username. Each statement is evaluated with
+  that user's policy (`AccessPolicyMap::for_user`), selected again per statement:
+  a sync that changes it applies to open sessions on their next statement. Two
+  sessions of different users on one proxy get their own policies. A session
+  whose user cannot be read gets a deny-everything policy while any user has one.
+- **Enforcement on both protocols.** A denial under `enforce` is the native
+  error (42501 / ERROR 1142) with `[VERICTO-087]` and what was denied, on the
+  simple and the extended / prepared paths; under `observe` the query is
+  forwarded and flagged. An allowed column tagged `mask` comes back masked.
+- **Nothing the client sends mid-session changes the identity.** Besides the SQL
+  the engine denies under a policy (`SET ROLE`, `SET SESSION AUTHORIZATION`,
+  `USE`, …), the proxy refuses the protocol commands that do the same outside
+  SQL: Postgres `FunctionCall`, MySQL `COM_INIT_DB`, `COM_FIELD_LIST`, the
+  replication / process commands and any unknown command; a query message whose
+  SQL cannot be read. MySQL `COM_CHANGE_USER` is refused when the current or the
+  target user has a policy.
+- **Telemetry**: `db_user` on every event (when known), `access_policy_mode` and
+  `access_denied` (`[{schema, table, column, needed}]`) under a policy. Names are
+  cut to 63 bytes and the list to 64 entries, the ingest schema's bounds. In
+  sanitized mode a MySQL name the query did not spell as an identifier (a `"…"`
+  string the engine also reads as a column) is reported as `?`.
+- `VERICTO-087` is in the built-in ruleset (31 rules), like `VERICTO-085`; it
+  only acts on a policy.
+
+### Changed
+
+- Parse errors resolve with `effective_parse_error_for(sql, dialect)`: under an
+  enforced allowlist they block, except the session statements drivers send on
+  connect.
+- `ast_node_path` (flat and per violation) is cut to 512 bytes, the ingest
+  schema's bound: a long parser message or name no longer rejects the batch.
+- The catalogue test finds the engine's README through `cargo metadata` when the
+  engine is not a git checkout (a local `[patch]`).
+
 ## [4.7.1] — 2026-10-08
 
 ### Fixed
