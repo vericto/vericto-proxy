@@ -468,13 +468,50 @@ mod tests {
         }
     }
 
-    /// Source directory of the `vericto-engine` this crate is built against, as
-    /// Cargo resolved it (the locked git tag).
+    /// Source directory of the `vericto-engine` this crate is built against: the
+    /// git checkout of the commit `Cargo.lock` pins. Found without `cargo metadata`
+    /// first, because `cargo metadata --offline` needs every package of the graph
+    /// downloaded, including other platforms' (CI only fetches the host's), and
+    /// fails there. Falls back to `cargo metadata` for a non-default CARGO_HOME layout.
     fn engine_source_dir() -> std::path::PathBuf {
+        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let lock =
+            std::fs::read_to_string(manifest_dir.join("Cargo.lock")).expect("read Cargo.lock");
+        let rev = lock
+            .split("[[package]]")
+            .find(|p| p.contains("name = \"vericto-engine\""))
+            .and_then(|p| p.lines().find(|l| l.starts_with("source = ")))
+            .and_then(|l| {
+                l.trim_end_matches('"')
+                    .rsplit('#')
+                    .next()
+                    .map(str::to_owned)
+            })
+            .expect("vericto-engine git source in Cargo.lock");
+        let cargo_home = std::env::var_os("CARGO_HOME")
+            .map(std::path::PathBuf::from)
+            .or_else(|| std::env::var_os("HOME").map(|h| std::path::Path::new(&h).join(".cargo")))
+            .expect("CARGO_HOME or HOME");
+        let checkouts = cargo_home.join("git").join("checkouts");
+        if let Ok(entries) = std::fs::read_dir(&checkouts) {
+            for e in entries.flatten() {
+                if !e
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("vericto-engine-")
+                {
+                    continue;
+                }
+                let dir = e.path().join(&rev[..7.min(rev.len())]);
+                if dir.join("Cargo.toml").is_file() {
+                    return dir;
+                }
+            }
+        }
         let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
         let out = std::process::Command::new(cargo)
-            .args(["metadata", "--format-version", "1", "--offline", "--locked"])
-            .current_dir(env!("CARGO_MANIFEST_DIR"))
+            .args(["metadata", "--format-version", "1", "--locked"])
+            .current_dir(manifest_dir)
             .output()
             .expect("run cargo metadata");
         assert!(
