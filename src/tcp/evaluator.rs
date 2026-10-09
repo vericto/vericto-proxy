@@ -347,7 +347,8 @@ fn postgres_parameter_mismatch(original: &str, rewritten: &str) -> Option<String
 }
 
 /// Default ruleset: the built-in rules with their canonical severity and
-/// recommended `default_action` (verbatim from the R13 table).
+/// recommended `default_action` (verbatim from the R13 table). It is the
+/// engine's whole catalogue (pinned by `default_ruleset_has_the_engine_catalogue`).
 ///
 /// In production this ruleset would be resolved per workspace (querying the
 /// API or database based on the `database` from the StartupMessage). For
@@ -366,6 +367,9 @@ pub fn default_ruleset() -> Vec<Rule> {
         ("VERICTO-090", Severity::Critical, EnforcementAction::Block), // OR tautology in WHERE (SQL injection)
         ("VERICTO-080", Severity::Critical, EnforcementAction::Block), // COPY … TO/FROM PROGRAM (server-side RCE)
         ("VERICTO-081", Severity::Critical, EnforcementAction::Block), // DO $$ … $$ anonymous code block
+        // MySQL text the engine and MySQL would read differently. Engine-driven: the
+        // engine blocks it whatever this list holds; listed so the catalogue is whole.
+        ("VERICTO-086", Severity::Critical, EnforcementAction::Block),
         // High / BLOCK.
         ("VERICTO-002", Severity::High, EnforcementAction::Block), // DELETE with LIMIT 0 (MySQL)
         ("VERICTO-013", Severity::High, EnforcementAction::Block), // DROP INDEX without IF EXISTS
@@ -381,6 +385,9 @@ pub fn default_ruleset() -> Vec<Rule> {
         ("VERICTO-082", Severity::High, EnforcementAction::Block), // GRANT / REVOKE
         ("VERICTO-083", Severity::High, EnforcementAction::Block), // MERGE (mass mutation)
         ("VERICTO-084", Severity::High, EnforcementAction::Block), // CREATE TABLE AS SELECT (bulk copy)
+        // Read of a sensitive column. Engine-driven: it only acts on the policy's
+        // column tags (High for block/mask, Medium for flag), never through this list.
+        ("VERICTO-085", Severity::High, EnforcementAction::Block),
         // Medium / FLAG.
         ("VERICTO-050", Severity::Medium, EnforcementAction::Flag), // SELECT without LIMIT
         ("VERICTO-051", Severity::Medium, EnforcementAction::Flag), // SELECT * without WHERE
@@ -419,6 +426,7 @@ mod tests {
         ("VERICTO-090", Severity::Critical, EnforcementAction::Block),
         ("VERICTO-080", Severity::Critical, EnforcementAction::Block),
         ("VERICTO-081", Severity::Critical, EnforcementAction::Block),
+        ("VERICTO-086", Severity::Critical, EnforcementAction::Block),
         ("VERICTO-002", Severity::High, EnforcementAction::Block),
         ("VERICTO-013", Severity::High, EnforcementAction::Block),
         ("VERICTO-015", Severity::High, EnforcementAction::Block),
@@ -433,6 +441,7 @@ mod tests {
         ("VERICTO-082", Severity::High, EnforcementAction::Block),
         ("VERICTO-083", Severity::High, EnforcementAction::Block),
         ("VERICTO-084", Severity::High, EnforcementAction::Block),
+        ("VERICTO-085", Severity::High, EnforcementAction::Block),
         ("VERICTO-050", Severity::Medium, EnforcementAction::Flag),
         ("VERICTO-051", Severity::Medium, EnforcementAction::Flag),
         ("VERICTO-061", Severity::Medium, EnforcementAction::Flag),
@@ -457,6 +466,143 @@ mod tests {
                 "default_action mismatch for {code}"
             );
         }
+    }
+
+    /// Source directory of the `vericto-engine` this crate is built against: the
+    /// git checkout of the commit `Cargo.lock` pins. Found without `cargo metadata`
+    /// first, because `cargo metadata --offline` needs every package of the graph
+    /// downloaded, including other platforms' (CI only fetches the host's), and
+    /// fails there. Falls back to `cargo metadata` for a non-default CARGO_HOME layout.
+    fn engine_source_dir() -> std::path::PathBuf {
+        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let lock =
+            std::fs::read_to_string(manifest_dir.join("Cargo.lock")).expect("read Cargo.lock");
+        let rev = lock
+            .split("[[package]]")
+            .find(|p| p.contains("name = \"vericto-engine\""))
+            .and_then(|p| p.lines().find(|l| l.starts_with("source = ")))
+            .and_then(|l| {
+                l.trim_end_matches('"')
+                    .rsplit('#')
+                    .next()
+                    .map(str::to_owned)
+            })
+            .expect("vericto-engine git source in Cargo.lock");
+        let cargo_home = std::env::var_os("CARGO_HOME")
+            .map(std::path::PathBuf::from)
+            .or_else(|| std::env::var_os("HOME").map(|h| std::path::Path::new(&h).join(".cargo")))
+            .expect("CARGO_HOME or HOME");
+        let checkouts = cargo_home.join("git").join("checkouts");
+        if let Ok(entries) = std::fs::read_dir(&checkouts) {
+            for e in entries.flatten() {
+                if !e
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("vericto-engine-")
+                {
+                    continue;
+                }
+                let dir = e.path().join(&rev[..7.min(rev.len())]);
+                if dir.join("Cargo.toml").is_file() {
+                    return dir;
+                }
+            }
+        }
+        let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
+        let out = std::process::Command::new(cargo)
+            .args(["metadata", "--format-version", "1", "--locked"])
+            .current_dir(manifest_dir)
+            .output()
+            .expect("run cargo metadata");
+        assert!(
+            out.status.success(),
+            "cargo metadata failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let meta: serde_json::Value = serde_json::from_slice(&out.stdout).expect("metadata JSON");
+        let manifest = meta["packages"]
+            .as_array()
+            .expect("packages")
+            .iter()
+            .find(|p| p["name"] == "vericto-engine")
+            .and_then(|p| p["manifest_path"].as_str())
+            .expect("vericto-engine in the dependency graph");
+        std::path::Path::new(manifest)
+            .parent()
+            .expect("manifest dir")
+            .to_path_buf()
+    }
+
+    /// The engine's rule catalogue: every `VERICTO-NNN` row of its README, with the
+    /// severity of the `### <Severity>` section it is listed under. The engine's own
+    /// `rule_catalogue_sync` test keeps that table equal to its evaluator.
+    fn engine_catalogue() -> std::collections::BTreeMap<String, Severity> {
+        let readme = std::fs::read_to_string(engine_source_dir().join("README.md"))
+            .expect("read the engine README");
+        let mut severity = None;
+        let mut out = std::collections::BTreeMap::new();
+        for line in readme.lines() {
+            if let Some(h) = line.strip_prefix("### ") {
+                severity = match h.trim() {
+                    "Critical" => Some(Severity::Critical),
+                    "High" => Some(Severity::High),
+                    "Medium" => Some(Severity::Medium),
+                    "Low" => Some(Severity::Low),
+                    "Informational" => Some(Severity::Informational),
+                    _ => None,
+                };
+                continue;
+            }
+            let Some(row) = line.trim_start().strip_prefix("| VERICTO-") else {
+                continue;
+            };
+            let digits: String = row.chars().take_while(|c| c.is_ascii_digit()).collect();
+            if digits.is_empty() || !row[digits.len()..].trim_start().starts_with('|') {
+                continue;
+            }
+            let code = format!("VERICTO-{digits}");
+            let sev = severity.unwrap_or_else(|| panic!("{code} is outside a severity section"));
+            assert!(
+                out.insert(code.clone(), sev).is_none(),
+                "{code} listed twice"
+            );
+        }
+        assert!(
+            !out.is_empty(),
+            "no catalogue rows found in the engine README"
+        );
+        out
+    }
+
+    /// The built-in ruleset is the engine's catalogue: same codes, same
+    /// severities, nothing missing and nothing extra. A new engine rule fails
+    /// this test until it is added here.
+    #[test]
+    fn default_ruleset_has_the_engine_catalogue() {
+        let engine = engine_catalogue();
+        let builtin: std::collections::BTreeMap<String, Severity> = default_ruleset()
+            .into_iter()
+            .map(|r| (r.code, r.severity))
+            .collect();
+        let missing: Vec<&String> = engine
+            .keys()
+            .filter(|c| !builtin.contains_key(*c))
+            .collect();
+        let extra: Vec<&String> = builtin
+            .keys()
+            .filter(|c| !engine.contains_key(*c))
+            .collect();
+        assert!(
+            missing.is_empty() && extra.is_empty(),
+            "built-in ruleset ({}) differs from the engine catalogue ({}): missing {missing:?}, extra {extra:?}",
+            builtin.len(),
+            engine.len()
+        );
+        assert_eq!(
+            builtin, engine,
+            "severities differ from the engine catalogue"
+        );
+        assert_eq!(default_ruleset().len(), engine.len(), "no duplicate codes");
     }
 
     #[test]

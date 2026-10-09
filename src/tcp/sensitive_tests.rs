@@ -109,9 +109,17 @@ struct Wire {
 }
 
 fn wire(proto: Box<dyn WireProtocol>, policy: EnforcementPolicy, mode: TelemetryQueryMode) -> Wire {
+    let (cfg, queue) = config(("unused", 0), policy, mode);
+    wire_with(proto, cfg, queue)
+}
+
+fn wire_with(
+    proto: Box<dyn WireProtocol>,
+    cfg: Arc<PgProxyConfig>,
+    queue: Arc<MemoryQueue>,
+) -> Wire {
     let (client, proxy_client_side) = tokio::io::duplex(1 << 20);
     let (proxy_db_side, db) = tokio::io::duplex(1 << 20);
-    let (cfg, queue) = config(("unused", 0), policy, mode);
     let (cr, cw) = tokio::io::split(proxy_client_side);
     let mut client_read: ClientRead = Box::new(cr);
     let client_write: Arc<Mutex<ClientWrite>> = Arc::new(Mutex::new(Box::new(cw)));
@@ -793,6 +801,33 @@ async fn mysql_text_divergence_is_blocked_with_err_1142() {
         assert_eq!(e["query_text"], DIVERGENT);
         assert!(e.get("parse_error").is_none(), "not a parse error");
     }
+}
+
+/// A proxy started with no control plane and no rules cache runs on exactly
+/// what `main` seeds: the built-in ruleset and the default policy, never
+/// replaced by a sync. VERICTO-086 must still block divergent MySQL text there.
+#[tokio::test]
+async fn mysql_text_divergence_is_blocked_by_the_built_in_ruleset_alone() {
+    let (cfg, queue) = config_with(
+        ("unused", 0),
+        EnforcementPolicy::default(),
+        TelemetryQueryMode::default(),
+        crate::tcp::evaluator::default_ruleset(),
+        crate::tcp::upstream::UpstreamTlsMode::Disable,
+    );
+    let mut w = wire_with(Box::new(MysqlProtocol), cfg, queue);
+    w.client
+        .write_all(&my_cmd(COM_QUERY, DIVERGENT))
+        .await
+        .unwrap();
+    let (code, msg) = my_err(&read_my(&mut w.client).await);
+    assert_eq!(code, 1142);
+    assert!(msg.contains("[VERICTO-086]"), "{msg}");
+    assert_eq!(
+        my_first_query_reaching_db(&mut w).await,
+        "SELECT 1",
+        "the divergent text never reached the database"
+    );
 }
 
 /// In sanitized mode the text does not tokenize, so it is redacted; the
