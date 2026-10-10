@@ -41,6 +41,17 @@ impl WireProtocol for MysqlProtocol {
             // A protocol mismatch is a programming error; forward defensively.
             return Classified::PassThrough;
         };
+        // Only a packet with sequence id 0 starts a command. The others belong to
+        // the command in progress — the auth exchange of a COM_CHANGE_USER, the
+        // file of a LOAD DATA LOCAL INFILE — and their first byte is data, not a
+        // command tag: read as one, a 0x01 there was a COM_QUIT that ended the
+        // session, and a 0x03 was "SQL" to evaluate. Forwarding them as they are
+        // is safe because the server never runs one as a command: MySQL answers a
+        // command whose sequence id is not 0 with ERROR 1156 ("Got packets out of
+        // order") and does not execute it. `access_control` draws the same line.
+        if pkt.seq != 0 {
+            return Classified::PassThrough;
+        }
         match pkt.command_tag() {
             Some(COM_QUIT) => Classified::Terminate,
             _ => match pkt.extract_sql() {
@@ -188,6 +199,40 @@ mod tests {
             }
             _ => panic!("expected Query"),
         }
+    }
+
+    /// A packet inside a command (sequence id != 0) is data, whatever its first
+    /// byte: not a COM_QUIT, not SQL to evaluate.
+    #[test]
+    fn a_packet_inside_a_command_is_passed_through() {
+        let p = MysqlProtocol;
+        let inside = |seq: u8, payload: &[u8]| {
+            RawClientMessage::Mysql(MySqlPacket {
+                seq,
+                payload: payload.to_vec(),
+            })
+        };
+        for (seq, payload) in [
+            (2u8, &b"\x014,starts-with-0x01\n"[..]), // LOCAL INFILE data
+            (2, &[0x01; 32][..]),                    // COM_CHANGE_USER scramble
+            (2, &b"\x03DROP TABLE t"[..]),           // looks like a COM_QUERY
+            (3, &b"\x16DELETE FROM t"[..]),          // looks like a COM_STMT_PREPARE
+            (255, &[][..]),                          // end of a LOCAL INFILE file
+        ] {
+            assert!(
+                matches!(p.classify(&inside(seq, payload)), Classified::PassThrough),
+                "seq {seq}, {payload:?}"
+            );
+        }
+        // The same bytes with sequence id 0 are commands.
+        assert!(matches!(
+            p.classify(&inside(0, b"\x01")),
+            Classified::Terminate
+        ));
+        assert!(matches!(
+            p.classify(&inside(0, b"\x03DROP TABLE t")),
+            Classified::Query { .. }
+        ));
     }
 
     #[test]

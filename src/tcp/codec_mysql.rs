@@ -60,11 +60,33 @@ fn nul_terminated(bytes: &[u8]) -> Option<String> {
 /// flags at the start of both the SSL Request packet and the HandshakeResponse.
 pub const CLIENT_SSL: u32 = 0x0000_0800;
 
+/// CLIENT_COMPRESS (bit 5) and CLIENT_ZSTD_COMPRESSION_ALGORITHM (bit 26): after
+/// the OK, both ends switch to compressed framing. The proxy reads commands as
+/// plain packets, so it never lets a session negotiate either: it clears them in
+/// the greeting it relays to the client and in the response it relays to the
+/// server.
+pub const CLIENT_COMPRESS: u32 = 0x0000_0020;
+pub const CLIENT_ZSTD_COMPRESSION_ALGORITHM: u32 = 0x0400_0000;
+pub const COMPRESSION_CAPABILITIES: u32 = CLIENT_COMPRESS | CLIENT_ZSTD_COMPRESSION_ALGORITHM;
+
+/// ER_SECURE_TRANSPORT_REQUIRED: what MySQL itself answers, with SQLSTATE HY000,
+/// to a plaintext login when `require_secure_transport` is on.
+pub const ER_SECURE_TRANSPORT_REQUIRED: u16 = 3159;
+
 /// Generic-response header bytes for a server→client packet during the
 /// connection (auth) phase. (EOF 0xFE is treated as "more" by classification,
 /// not called out separately.)
 pub const OK_HEADER: u8 = 0x00;
 pub const ERR_HEADER: u8 = 0xFF;
+
+/// First payload byte of an AuthMoreData packet (connection phase).
+pub const AUTH_MORE_DATA: u8 = 0x01;
+/// caching_sha2_password's "fast auth success", the byte after AUTH_MORE_DATA:
+/// the server found the account's hash in its cache and accepted the scramble.
+/// It sends the OK_Packet right after, with nothing from the client in between;
+/// MySQL's own client returns as soon as it reads this byte and waits for the OK
+/// (`sql-common/client_authentication.cc`).
+pub const CACHING_SHA2_FAST_AUTH_SUCCESS: u8 = 0x03;
 
 /// Outcome of a server→client packet during the auth exchange, classified by
 /// its first payload byte. The proxy transports auth packets in order without
@@ -75,6 +97,11 @@ pub enum AuthPhase {
     Ok,
     /// ERR_Packet — authentication failed; forward to the client and close.
     Err,
+    /// The server sends the next packet itself, so the client has nothing to
+    /// answer: caching_sha2_password's fast-auth success, followed by the OK.
+    /// Waiting for the client here deadlocks the login, since the client is
+    /// waiting for that OK.
+    ServerContinues,
     /// AuthSwitchRequest / AuthMoreData (or an OK/EOF-lookalike escaped by the
     /// plugin) — more exchanges follow; keep pumping.
     More,
@@ -83,12 +110,14 @@ pub enum AuthPhase {
 /// Classifies a server→client connection-phase packet by its first byte.
 /// Note: a real OK_Packet begins with 0x00, but auth plugins may send 0x01
 /// (AuthMoreData) or 0xFE (AuthSwitchRequest); we treat only 0x00 as OK and
-/// 0xFF as ERR, everything else as "more". An empty payload is treated as More
-/// (defensive — never end the loop on a malformed packet).
+/// 0xFF as ERR, everything else as "more". The one "more" the client does not
+/// answer is the exact two-byte fast-auth success. An empty payload is treated
+/// as More (defensive — never end the loop on a malformed packet).
 pub fn classify_auth_packet(payload: &[u8]) -> AuthPhase {
-    match payload.first().copied() {
-        Some(OK_HEADER) => AuthPhase::Ok,
-        Some(ERR_HEADER) => AuthPhase::Err,
+    match payload {
+        [OK_HEADER, ..] => AuthPhase::Ok,
+        [ERR_HEADER, ..] => AuthPhase::Err,
+        [AUTH_MORE_DATA, CACHING_SHA2_FAST_AUTH_SUCCESS] => AuthPhase::ServerContinues,
         _ => AuthPhase::More,
     }
 }
@@ -110,6 +139,18 @@ pub fn read_client_capabilities(payload: &[u8]) -> Option<u32> {
 /// capability_flags_lower(2) + [ character_set(1) + status_flags(2) +
 /// capability_flags_upper(2) + ... ].
 pub fn read_server_capabilities(payload: &[u8]) -> Option<u32> {
+    let (lower_at, upper_at) = server_capability_offsets(payload)?;
+    let lower = u16::from_le_bytes([payload[lower_at], payload[lower_at + 1]]) as u32;
+    let upper = upper_at
+        .map(|at| u16::from_le_bytes([payload[at], payload[at + 1]]) as u32)
+        .unwrap_or(0);
+    Some((upper << 16) | lower)
+}
+
+/// Offsets of the two capability halves in an Initial Handshake (v10) payload:
+/// the lower 2 bytes, and the upper 2 bytes when the packet carries them (very old
+/// servers end right after the lower half). None if the packet is malformed.
+fn server_capability_offsets(payload: &[u8]) -> Option<(usize, Option<usize>)> {
     let mut i = 0usize;
     // protocol_version
     let _proto = *payload.get(i)?;
@@ -120,16 +161,37 @@ pub fn read_server_capabilities(payload: &[u8]) -> Option<u32> {
     // thread_id(4) + auth_plugin_data_part_1(8) + filler(1) = 13
     i += 13;
     // capability_flags_lower (2 bytes)
-    let lo = payload.get(i..i + 2)?;
-    let lower = u16::from_le_bytes([lo[0], lo[1]]) as u32;
-    i += 2;
-    // If the packet ends here (very old servers), only the lower half exists.
-    // Otherwise: character_set(1) + status_flags(2) = 3, then upper caps (2).
-    let upper = match payload.get(i + 3..i + 5) {
-        Some(hi) => u16::from_le_bytes([hi[0], hi[1]]) as u32,
-        None => 0,
-    };
-    Some((upper << 16) | lower)
+    payload.get(i..i + 2)?;
+    let lower_at = i;
+    // character_set(1) + status_flags(2) = 3, then the upper half (2).
+    let upper_at = payload.get(i + 5..i + 7).map(|_| i + 5);
+    Some((lower_at, upper_at))
+}
+
+/// A copy of an Initial Handshake payload with the capability bits in `mask`
+/// cleared, so the client does not negotiate them. Unchanged if the packet is
+/// malformed (the client then fails against the real server's bytes, as before).
+pub fn clear_server_capabilities(payload: &[u8], mask: u32) -> Vec<u8> {
+    let mut out = payload.to_vec();
+    if let Some((lower_at, upper_at)) = server_capability_offsets(payload) {
+        let lower = u16::from_le_bytes([out[lower_at], out[lower_at + 1]]) & !(mask as u16);
+        out[lower_at..lower_at + 2].copy_from_slice(&lower.to_le_bytes());
+        if let Some(at) = upper_at {
+            let upper = u16::from_le_bytes([out[at], out[at + 1]]) & !((mask >> 16) as u16);
+            out[at..at + 2].copy_from_slice(&upper.to_le_bytes());
+        }
+    }
+    out
+}
+
+/// A copy of a HandshakeResponse / SSLRequest payload with the capability bits
+/// in `mask` cleared. No-op if the payload is too short to hold the flags.
+pub fn clear_client_capabilities(payload: &[u8], mask: u32) -> Vec<u8> {
+    let mut out = payload.to_vec();
+    if let Some(caps) = read_client_capabilities(payload) {
+        out[0..4].copy_from_slice(&(caps & !mask).to_le_bytes());
+    }
+    out
 }
 
 /// Builds the SSL Request packet the proxy sends to the upstream to initiate
@@ -615,9 +677,21 @@ mod tests {
             classify_auth_packet(&[ERR_HEADER, 0x15, 0x04]),
             AuthPhase::Err
         );
-        // AuthSwitchRequest (0xFE) and AuthMoreData (0x01) → More
+        // AuthSwitchRequest (0xFE) and AuthMoreData (0x01) the client answers
+        // → More: caching_sha2's "perform full authentication" and its RSA key.
         assert_eq!(classify_auth_packet(&[0xFE]), AuthPhase::More);
-        assert_eq!(classify_auth_packet(&[0x01, 0x03]), AuthPhase::More);
+        assert_eq!(classify_auth_packet(&[0x01, 0x04]), AuthPhase::More);
+        assert_eq!(
+            classify_auth_packet(b"\x01-----BEGIN PUBLIC KEY-----\n"),
+            AuthPhase::More
+        );
+        // caching_sha2's fast-auth success: the server's OK follows, the client
+        // sends nothing. Only the exact two bytes; longer plugin data is More.
+        assert_eq!(
+            classify_auth_packet(&[0x01, 0x03]),
+            AuthPhase::ServerContinues
+        );
+        assert_eq!(classify_auth_packet(&[0x01, 0x03, 0x00]), AuthPhase::More);
         // Empty payload is defensively treated as More (never end on malformed).
         assert_eq!(classify_auth_packet(&[]), AuthPhase::More);
     }
@@ -640,6 +714,72 @@ mod tests {
         let caps = read_server_capabilities(&p).unwrap();
         assert_eq!(caps, (0x000F << 16) | 0xAE85);
         assert!(caps & CLIENT_SSL != 0); // 0xAE85 has bit 11 (0x800) set
+    }
+
+    /// v10 handshake with the given capability halves (upper omitted = an old
+    /// server whose packet ends after the lower half).
+    fn greeting(lower: u16, upper: Option<u16>) -> Vec<u8> {
+        let mut p = vec![10u8];
+        p.extend_from_slice(b"8.4.0\0");
+        p.extend_from_slice(&[0u8; 13]); // thread id, auth data 1, filler
+        p.extend_from_slice(&lower.to_le_bytes());
+        if let Some(upper) = upper {
+            p.push(0xff); // charset
+            p.extend_from_slice(&[0x02, 0x00]); // status
+            p.extend_from_slice(&upper.to_le_bytes());
+            p.extend_from_slice(b"\x15\0\0\0\0\0\0\0\0\0\0rest-of-the-greeting\0");
+        }
+        p
+    }
+
+    #[test]
+    fn clear_server_capabilities_edits_only_the_capability_bits() {
+        let original = greeting(0xffff, Some(0xdfff));
+        let mask = COMPRESSION_CAPABILITIES | CLIENT_SSL;
+        let cleared = clear_server_capabilities(&original, mask);
+        assert_eq!(
+            read_server_capabilities(&cleared),
+            Some(0xdfff_ffff & !mask)
+        );
+        // Every byte outside the four capability bytes is untouched.
+        let lower_at = 1 + b"8.4.0\0".len() + 13;
+        let differs: Vec<usize> = (0..original.len())
+            .filter(|&i| original[i] != cleared[i])
+            .collect();
+        assert!(
+            differs.iter().all(|&i| i == lower_at
+                || i == lower_at + 1
+                || i == lower_at + 5
+                || i == lower_at + 6),
+            "{differs:?}"
+        );
+        // An old server with only the lower half: only that half changes.
+        let old = clear_server_capabilities(&greeting(0xffff, None), mask);
+        assert_eq!(
+            read_server_capabilities(&old),
+            Some(0xffff & !mask & 0xffff)
+        );
+        // A malformed greeting is returned as is.
+        assert_eq!(clear_server_capabilities(b"\x0a8.4", mask), b"\x0a8.4");
+    }
+
+    #[test]
+    fn clear_client_capabilities_clears_the_mask_only() {
+        let mut resp =
+            (CLIENT_PROTOCOL_41 | CLIENT_COMPRESS | CLIENT_ZSTD_COMPRESSION_ALGORITHM | CLIENT_SSL)
+                .to_le_bytes()
+                .to_vec();
+        resp.extend_from_slice(b"rest");
+        let cleared = clear_client_capabilities(&resp, COMPRESSION_CAPABILITIES);
+        assert_eq!(
+            read_client_capabilities(&cleared),
+            Some(CLIENT_PROTOCOL_41 | CLIENT_SSL)
+        );
+        assert_eq!(&cleared[4..], b"rest");
+        assert_eq!(
+            clear_client_capabilities(b"\x01\x02", COMPRESSION_CAPABILITIES),
+            b"\x01\x02"
+        );
     }
 
     /// The session identity for agent access is the HandshakeResponse username.

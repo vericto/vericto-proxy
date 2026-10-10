@@ -377,8 +377,19 @@ Only two things differ per engine; everything above is shared.
   and `COM_STMT_PREPARE` (including the `CLIENT_QUERY_ATTRIBUTES` prefix MySQL
   8.0.23+ prepends) and evaluates it with the engine's `Mysql` dialect.
 - **TLS is both-hops-or-neither** (see the TLS caveat above). For a trusted
-  network (sidecar / private subnet) leave both plaintext — the default. When
-  running the client plaintext, connect it with `--ssl-mode=DISABLED`.
+  network (sidecar / private subnet) leave both plaintext — the default. A
+  plaintext proxy does not offer TLS in its greeting, so a client in the default
+  `ssl-mode=PREFERRED` connects in plaintext, as it would to a server without
+  TLS; one that requires TLS is refused by the client itself. With
+  `PROXY_TLS_MODE=require`, a client that does not ask for TLS gets
+  `ERROR 3159 (HY000)`, as from a server with `require_secure_transport`.
+- **No protocol compression.** The proxy reads each command as a plain packet,
+  so it clears `CLIENT_COMPRESS` and zstd from the greeting and from the
+  client's response, and clients see what a server with
+  `protocol_compression_algorithms=uncompressed` offers: one that prefers
+  compression (`--compress`, a list that includes `uncompressed`, mysql2
+  `compress: true`) runs uncompressed; one that allows only `zlib` or `zstd` is
+  refused at connect with `ERROR 2066`.
 
 ---
 

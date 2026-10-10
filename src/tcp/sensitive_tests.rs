@@ -1187,7 +1187,7 @@ pub(super) fn mysql_client_tls(
 /// through a second proxy with no tags and no rules (the upstream may require
 /// TLS, which the test driver does not speak). The database is dropped
 /// afterwards, also when `body` panics.
-async fn with_real_mysql<F, Fut>(body: F)
+pub(super) async fn with_real_mysql<F, Fut>(body: F)
 where
     F: FnOnce(mysql_async::Opts) -> Fut + Send + 'static,
     Fut: std::future::Future<Output = ()> + Send + 'static,

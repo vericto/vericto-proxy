@@ -7,6 +7,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **MySQL logins no longer hang after the first one for a `caching_sha2_password`
+  account**, the default on MySQL 8.0 and 8.4, with or without TLS. Once the
+  server has the account's hash cached it answers with fast auth: AuthMoreData
+  `0x03`, then the OK, with nothing from the client in between. The proxy waited
+  for a client packet after every AuthMoreData, so the client waited for an OK the
+  proxy never relayed and the login hung until the client gave up. Not affected:
+  the first login after a server restart or `FLUSH PRIVILEGES` (full auth), and
+  `mysql_native_password` accounts.
+- Tests for the connection phase: a fake MySQL server plays the fast-auth,
+  full-auth (with and without the RSA key exchange), AuthSwitchRequest,
+  multi-factor (AuthNextFactor after fast auth), empty-password and failed-login
+  exchanges through the proxy, with every read bounded so a wrong
+  turn fails instead of hanging. Against a real MySQL (`VERICTO_TEST_MYSQL_URL`),
+  many logins as one user, in a row and at once.
+- **MySQL clients in the default `ssl-mode=PREFERRED` connect to a plaintext
+  proxy.** The proxy relayed the server's greeting as is, so it offered TLS it
+  cannot provide without `PROXY_TLS_MODE`: the client sent an SSL Request and a
+  TLS handshake, and failed with `SSL connection error: wrong version number`.
+  The greeting now offers TLS only when the proxy terminates it, and a client
+  then falls back to plaintext as it does against a server without TLS.
+- **MySQL protocol compression is never negotiated.** After the OK, a client that
+  asked for zlib or zstd switched to compressed framing, which the proxy does
+  not decode: every command hung, and none was evaluated. The proxy clears
+  `CLIENT_COMPRESS` and `CLIENT_ZSTD_COMPRESSION_ALGORITHM` from the greeting
+  and from the client's response, so clients get what a server with
+  `protocol_compression_algorithms=uncompressed` offers: one that prefers
+  compression runs uncompressed, one that allows only `zlib` or `zstd` is refused
+  at connect (`ERROR 2066`) instead of hanging.
+- **`PROXY_TLS_MODE=require` refuses a plaintext MySQL login with an error**:
+  `ERROR 3159 (HY000)`, as MySQL does under `require_secure_transport`, instead
+  of closing the connection ("Lost connection to MySQL server").
+- **A MySQL packet inside a command is no longer read as a new command.** Only a
+  packet with sequence id 0 starts one; the packets that continue it carry data.
+  The proxy read their first byte as a command tag, so a LOAD DATA LOCAL INFILE
+  file starting with `0x01` ended the session as a `COM_QUIT`, and so did about
+  one COM_CHANGE_USER in 256 to a `caching_sha2_password` account (its scramble
+  starting with `0x01`); file data starting with `0x03` was evaluated as SQL.
+  They are forwarded as they are now, which is safe: MySQL answers a command
+  whose sequence id is not 0 with `ERROR 1156` and does not run it.
+
 ## [4.8.0] — 2026-10-09
 
 Agent access allowlists (`VERICTO-087`), enforced per database user. Requires
