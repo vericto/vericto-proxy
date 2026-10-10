@@ -7,9 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-Adopts vericto-engine v3.8.1: dialect-aware name semantics for the agent access
-allowlists, table-level `DELETE`, row locks that need write, and
-`AccessPolicy::default_schema`.
+## [4.8.1] — 2026-10-10
+
+Requires vericto-engine v3.8.1. Adopts its dialect-aware name semantics for the
+agent access allowlists, table-level `DELETE`, row locks that need write, and
+`AccessPolicy::default_schema`; closes the StartupMessage `search_path` gap; and
+the MySQL connection fixes below.
 
 ### Added
 
