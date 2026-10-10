@@ -863,6 +863,34 @@ mod tests {
         );
     }
 
+    /// fmw's `/sync/rules` since engine 3.8.1 (`toEnginePolicy`): Postgres names
+    /// that are not plain lower case arrive double-quoted (embedded `"` doubled),
+    /// and the database's `default_schema` rides on each policy, absent when the
+    /// database has none. Both reach the engine as sent.
+    #[test]
+    fn sync_payload_carries_default_schema_and_quoted_names() {
+        let (_, access) = applied(
+            r#"{"version": "v11", "rules": [],
+            "policy": {"severity_actions": {}},
+            "agent_access": {
+                "support_agent": {"mode": "enforce", "ddl": "deny", "entries": [
+                    {"schema": "\"Sales\"", "table": "\"Customers\"", "columns": ["id", "\"Email\""], "access": "read"},
+                    {"schema": null, "table": "orders", "columns": "*", "access": "read_write"}
+                ], "default_schema": "app"},
+                "reporting_bot": {"mode": "observe", "ddl": "deny", "entries": []}
+            }}"#,
+        );
+        let agent = access.for_user("support_agent").unwrap();
+        assert_eq!(agent.default_schema.as_deref(), Some("app"));
+        assert_eq!(agent.entries[0].schema.as_deref(), Some("\"Sales\""));
+        assert_eq!(agent.entries[0].table, "\"Customers\"");
+        assert_eq!(agent.entries[1].schema, None);
+        assert_eq!(
+            access.for_user("reporting_bot").unwrap().default_schema,
+            None
+        );
+    }
+
     /// Absent, `null` or `{}`: no user has a policy, as before the field existed.
     #[test]
     fn sync_payload_without_agent_access_is_unchanged() {

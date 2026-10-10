@@ -74,15 +74,20 @@ pub enum AccessControl {
     /// continuation…): forwarded under any policy.
     Allowed,
     /// A command the statement analysis cannot see into and that reaches
-    /// identity, name resolution or data (MySQL COM_INIT_DB, COM_FIELD_LIST;
+    /// identity, name resolution or data (MySQL COM_FIELD_LIST;
     /// Postgres FunctionCall; a query message whose SQL cannot be read; any
     /// command not known to be plumbing). Refused under a policy, like the SQL
-    /// it stands for (`USE`, `SHOW COLUMNS`, `set_config(…)`); deny by default.
+    /// it stands for (`SHOW COLUMNS`, `set_config(…)`); deny by default.
     Restricted { label: String, kind: QueryKind },
     /// MySQL COM_CHANGE_USER: the session re-authenticates as `user` (None when
     /// it cannot be read). Refused when the current or the target user has a
     /// policy; otherwise the session becomes that user.
     ChangeUser { user: Option<String> },
+    /// MySQL COM_INIT_DB, the protocol form of `USE <db>`: refused under a
+    /// policy as `USE` is (labelled `COM_INIT_DB`); when it is forwarded, the
+    /// session's current database becomes `database` (None when the name
+    /// cannot be read), which unqualified names resolve to from then on.
+    ChangeDatabase { database: Option<String> },
 }
 
 /// Context for building a native block response.

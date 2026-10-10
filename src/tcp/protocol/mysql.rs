@@ -10,7 +10,7 @@ use vericto_engine::parser::Dialect;
 
 use crate::tcp::codec_mysql::{
     COM_QUIT, MySqlPacket, VERICTO_BLOCK_ERR_CODE, VERICTO_BLOCK_SQLSTATE, build_err_packet,
-    read_change_user_name, read_packet,
+    read_change_user_name, read_init_db_name, read_packet,
 };
 use crate::tcp::protocol::{
     AccessControl, BlockContext, BlockResponse, Classified, QueryKind, RawClientMessage,
@@ -96,8 +96,8 @@ impl WireProtocol for MysqlProtocol {
     /// Under an allowlist, only commands known to be plumbing pass: ping,
     /// statistics, the COM_STMT_* follow-ups of a statement evaluated at its
     /// COM_STMT_PREPARE, COM_SET_OPTION and COM_RESET_CONNECTION (the user
-    /// stays). COM_INIT_DB is `USE` (it moves where unqualified names resolve),
-    /// COM_FIELD_LIST is `SHOW COLUMNS`, the replication and process commands
+    /// stays). COM_INIT_DB is `USE` (it moves where unqualified names resolve:
+    /// refused like `USE`, and tracked when forwarded), COM_FIELD_LIST is `SHOW COLUMNS`, the replication and process commands
     /// reach server state; they and any unknown command are refused, deny by
     /// default. Only command packets (sequence id 0) are commands: packets
     /// inside a command (auth continuation, LOCAL INFILE data) pass.
@@ -119,7 +119,11 @@ impl WireProtocol for MysqlProtocol {
                     user: read_change_user_name(&p.payload),
                 };
             }
-            Some(0x02) => ("COM_INIT_DB", QueryKind::Simple),
+            Some(0x02) => {
+                return AccessControl::ChangeDatabase {
+                    database: read_init_db_name(&p.payload),
+                };
+            }
             Some(0x04) => ("COM_FIELD_LIST", QueryKind::Simple),
             Some(0x03) => ("COM_QUERY (unreadable SQL)", QueryKind::Simple),
             Some(0x16) => ("COM_STMT_PREPARE (unreadable SQL)", QueryKind::Prepared),
@@ -300,5 +304,87 @@ mod tests {
         // reply seq must be command_seq + 1 = 1
         assert_eq!(resp.bytes[3], 1);
         assert_eq!(resp.bytes[4], 0xFF); // ERR packet
+    }
+}
+
+/// Where a `USE` in a COM_QUERY moves the session's current database.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum UseTarget {
+    /// `USE db` (backticks or not): the session's current database is `db`.
+    Database(String),
+    /// A `USE` the proxy cannot read for certain (a versioned comment that may
+    /// hold one, an unusual form, text the tokenizer rejects): the current
+    /// database is unknown from here on.
+    Unknown,
+}
+
+/// The current database after the statements of a forwarded COM_QUERY: the
+/// last `USE` in it, or `None` when it has none. Only the statement start
+/// counts (`USE INDEX` in a `SELECT` is not a `USE`). Conservative where it
+/// cannot be sure: a `/*! … */` comment mentioning `use`, or text the
+/// tokenizer rejects that does, makes the database unknown.
+pub(crate) fn sql_use_target(sql: &str) -> Option<UseTarget> {
+    use sqlparser::dialect::MySqlDialect;
+    use sqlparser::keywords::Keyword;
+    use sqlparser::tokenizer::{Token, Tokenizer, Whitespace};
+
+    let mentions_use = |s: &str| s.to_ascii_lowercase().contains("use");
+    let Ok(tokens) = Tokenizer::new(&MySqlDialect {}, sql).tokenize() else {
+        return mentions_use(sql).then_some(UseTarget::Unknown);
+    };
+    let mut target = None;
+    let mut statement: Vec<&Token> = Vec::new();
+    let close = |statement: &mut Vec<&Token>, target: &mut Option<UseTarget>| {
+        if let Some(Token::Word(w)) = statement.first()
+            && w.keyword == Keyword::USE
+            && w.quote_style.is_none()
+        {
+            *target = Some(match statement.as_slice() {
+                [_, Token::Word(db)] if db.quote_style.is_none_or(|q| q == '`') => {
+                    UseTarget::Database(db.value.clone())
+                }
+                _ => UseTarget::Unknown,
+            });
+        }
+        statement.clear();
+    };
+    for t in &tokens {
+        match t {
+            Token::Whitespace(Whitespace::MultiLineComment(c))
+                if c.starts_with('!') && mentions_use(c) =>
+            {
+                target = Some(UseTarget::Unknown);
+            }
+            Token::Whitespace(_) | Token::EOF => {}
+            Token::SemiColon => close(&mut statement, &mut target),
+            t => statement.push(t),
+        }
+    }
+    close(&mut statement, &mut target);
+    target
+}
+
+#[cfg(test)]
+mod use_tests {
+    use super::{UseTarget, sql_use_target};
+
+    #[test]
+    fn use_statements_move_the_current_database() {
+        let db = |s: &str| Some(UseTarget::Database(s.to_string()));
+        assert_eq!(sql_use_target("USE shop"), db("shop"));
+        assert_eq!(sql_use_target("use `Shop` ;"), db("Shop"));
+        assert_eq!(sql_use_target("/* hi */ USE a; SELECT 1; USE b"), db("b"));
+        assert_eq!(sql_use_target("SELECT * FROM t USE INDEX (i)"), None);
+        assert_eq!(sql_use_target("SELECT 'use x'"), None);
+        assert_eq!(sql_use_target("SELECT 1"), None);
+        assert_eq!(sql_use_target("USE a.b"), Some(UseTarget::Unknown));
+        assert_eq!(
+            sql_use_target("/*!50000 USE x */"),
+            Some(UseTarget::Unknown)
+        );
+        assert_eq!(
+            sql_use_target("USE 'unterminated"),
+            Some(UseTarget::Unknown)
+        );
     }
 }

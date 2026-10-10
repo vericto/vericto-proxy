@@ -27,6 +27,7 @@ use crate::tcp::evaluator::{
     SENSITIVE_RULE_CODE, TcpDecision, access_command_decision, evaluate_message,
 };
 use crate::tcp::postgres::{EventIdentity, PgProxyConfig};
+use crate::tcp::protocol::mysql::UseTarget;
 use crate::tcp::protocol::{
     AccessControl, BlockContext, Classified, QueryKind, RawClientMessage, WireProtocol,
 };
@@ -38,7 +39,16 @@ use crate::tcp::protocol::{
 /// `user`, the MySQL HandshakeResponse username. Nothing the client sends later
 /// changes it: `SET ROLE` / `SET SESSION AUTHORIZATION` are SQL, which the engine
 /// denies under a policy, and the protocol commands that change the user or the
-/// default database are refused here (see [`AccessControl`]).
+/// default database are refused here under a policy (see [`AccessControl`]).
+///
+/// On MySQL the session also tracks its current database, the schema
+/// unqualified names resolve to (`AccessPolicy::default_schema`, engine 3.8.1):
+/// the one named in the HandshakeResponse, then each forwarded COM_INIT_DB,
+/// `USE` or COM_CHANGE_USER. It wins over the synced policy's `default_schema`
+/// (the dashboard's setting), which applies only while the session names none.
+/// On Postgres the policy's `default_schema` is used as synced (absent: the
+/// engine's `public`); `search_path` cannot move it, as `SET search_path` and
+/// the StartupMessage's `search_path` are denied under a policy.
 ///
 /// The policy is resolved again for every statement from the live sync state, so
 /// a rules sync that adds, changes or removes this user's policy applies from the
@@ -48,6 +58,7 @@ use crate::tcp::protocol::{
 /// itself, exactly as before.
 pub(crate) struct SessionAccess {
     user: Option<String>,
+    database: CurrentDatabase,
     cached: Option<(
         Arc<EnforcementPolicy>,
         Arc<AccessPolicyMap>,
@@ -56,8 +67,12 @@ pub(crate) struct SessionAccess {
 }
 
 impl SessionAccess {
-    pub(crate) fn new(user: Option<String>) -> Self {
-        Self { user, cached: None }
+    pub(crate) fn new(user: Option<String>, database: CurrentDatabase) -> Self {
+        Self {
+            user,
+            database,
+            cached: None,
+        }
     }
 
     /// The policy for this session's next evaluation.
@@ -72,8 +87,11 @@ impl SessionAccess {
         }
         let effective = match select_policy(&map, self.user.as_deref()) {
             None => Arc::clone(&base),
-            Some(access) => Arc::new(EnforcementPolicy {
-                access_policy: Some(access),
+            Some(mut access) => Arc::new(EnforcementPolicy {
+                access_policy: Some({
+                    self.database.apply(&mut access);
+                    access
+                }),
                 ..(*base).clone()
             }),
         };
@@ -92,6 +110,15 @@ impl SessionAccess {
         self.cached = None;
     }
 
+    /// The session's current database moved (MySQL: a forwarded COM_INIT_DB,
+    /// `USE` or COM_CHANGE_USER).
+    fn set_database(&mut self, database: CurrentDatabase) {
+        if self.database != database {
+            self.database = database;
+            self.cached = None;
+        }
+    }
+
     /// Identity fields of a telemetry event evaluated under `policy`.
     fn identity(&self, policy: &EnforcementPolicy) -> EventIdentity {
         EventIdentity {
@@ -99,6 +126,115 @@ impl SessionAccess {
             access_mode: policy.access_policy.as_ref().map(|p| p.mode),
         }
     }
+}
+
+/// What the session's entrypoint learnt at the handshake, before the
+/// interception loop starts.
+#[derive(Debug, Clone, Default)]
+pub struct SessionStart {
+    /// The database user the session authenticated as (None when it could not
+    /// be read). Selects the session's agent-access policy.
+    pub user: Option<String>,
+    /// MySQL: the session's current database from the HandshakeResponse.
+    /// Always [`CurrentDatabase::FromPolicy`] on Postgres, whose `database` is
+    /// not a schema.
+    pub database: CurrentDatabase,
+    /// MySQL: the client capability flags of the HandshakeResponse (the layout
+    /// of a later COM_CHANGE_USER depends on them). 0 on Postgres.
+    pub client_caps: u32,
+}
+
+/// The schema unqualified names resolve to in a session, as the proxy knows it.
+/// Only MySQL sessions move it; it is the engine's `default_schema`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum CurrentDatabase {
+    /// The session named none (or Postgres): the synced policy's
+    /// `default_schema` applies, absent = the engine default.
+    #[default]
+    FromPolicy,
+    /// The session's current database, named in the handshake or by a later
+    /// COM_INIT_DB / `USE` / COM_CHANGE_USER. Wins over the policy's value.
+    Named(String),
+    /// The session moved to a database the proxy could not read: no default
+    /// schema, so only unqualified names match entries without a schema (the
+    /// engine's stricter reading), never the policy's value.
+    Unknown,
+}
+
+impl CurrentDatabase {
+    /// From a database read off the wire: `Some(None)` names none, `None` is
+    /// unreadable.
+    pub(crate) fn from_wire(database: Option<Option<String>>) -> Self {
+        match database {
+            Some(Some(db)) => CurrentDatabase::Named(db),
+            Some(None) => CurrentDatabase::FromPolicy,
+            None => CurrentDatabase::Unknown,
+        }
+    }
+
+    /// Sets `policy.default_schema` for this session.
+    fn apply(&self, policy: &mut AccessPolicy) {
+        match self {
+            CurrentDatabase::FromPolicy => {}
+            CurrentDatabase::Named(db) => policy.default_schema = Some(db.clone()),
+            CurrentDatabase::Unknown => policy.default_schema = None,
+        }
+    }
+}
+
+/// Postgres: the startup settings that change who the session is or where
+/// names resolve (`search_path`, `role`, `session_authorization`, sent as
+/// StartupMessage parameters or in `options`), evaluated exactly as the `SET`
+/// the client could send after connecting, under the session user's policy:
+/// denied under an enforced allowlist, flagged under observe or monitor mode
+/// (and forwarded). Evaluated only when the session has an allowlist or the
+/// database has sensitive-column tags; otherwise nothing changes. Each one is
+/// reported like the statement it stands for. Returns the block message of
+/// the first one blocked: the connection is then refused before it reaches
+/// the database. Runs on the blocking pool (it evaluates).
+pub(crate) fn startup_settings_block(
+    config: &PgProxyConfig,
+    user: Option<&str>,
+    settings: &[(String, String)],
+) -> Option<String> {
+    if settings.is_empty() {
+        return None;
+    }
+    let mut access = SessionAccess::new(user.map(str::to_string), CurrentDatabase::FromPolicy);
+    let policy = access.policy(config);
+    if policy.access_policy.is_none() && policy.sensitive_columns.is_empty() {
+        return None;
+    }
+    let rules = config.ruleset.load_full();
+    let identity = access.identity(&policy);
+    let dialect = vericto_engine::Dialect::Postgres;
+    for (name, value) in settings {
+        let sql = format!("SET {name} = '{}'", value.replace('\'', "''"));
+        let start = Instant::now();
+        let decision = evaluate_message(&sql, dialect, QueryKind::Simple, &rules, &policy);
+        crate::tcp::postgres::report_telemetry(
+            config,
+            &sql,
+            dialect,
+            &decision,
+            start.elapsed().as_micros(),
+            &identity,
+        );
+        if let TcpDecision::Block {
+            rule_code,
+            ast_node_path,
+            ..
+        } = &decision
+        {
+            crate::tcp::postgres::log_block(&sql, rule_code, ast_node_path);
+            return Some(crate::tcp::protocol::postgres::block_message(
+                rule_code,
+                &format!("{ast_node_path} (StartupMessage {name})"),
+                None,
+            ));
+        }
+    }
+    None
 }
 
 /// The policy of a session of `user`: `AccessPolicyMap::for_user` (exact key,
@@ -138,11 +274,11 @@ pub async fn intercept_client_to_server(
     // `Arc` rather than `&PgProxyConfig`: evaluation and telemetry run on the
     // blocking pool, which needs an owned handle.
     config: &Arc<PgProxyConfig>,
-    // The database user the session authenticated as (None when it could not
-    // be read). Selects the session's agent-access policy.
-    session_user: Option<String>,
+    // Who the session is and, on MySQL, its current database.
+    start: SessionStart,
 ) -> std::io::Result<()> {
-    let mut access = SessionAccess::new(session_user);
+    let client_caps = start.client_caps;
+    let mut access = SessionAccess::new(start.user, start.database);
 
     // When we block in an extended/prepared sequence, swallow follow-ups until
     // the end-of-sequence marker (Postgres: Sync 'S'). Only the Postgres path
@@ -216,6 +352,38 @@ pub async fn intercept_client_to_server(
                         // is now the target user, for every later statement.
                         if !matches!(refused, Some((_, _, TcpDecision::Block { .. }, _))) {
                             access.set_user(user);
+                        }
+                        // MySQL changes the database with the user: the
+                        // packet's, under the session's capability flags.
+                        if !matches!(refused, Some((_, _, TcpDecision::Block { .. }, _)))
+                            && let RawClientMessage::Mysql(p) = &msg
+                        {
+                            access.set_database(CurrentDatabase::from_wire(
+                                crate::tcp::codec_mysql::read_change_user_database(
+                                    &p.payload,
+                                    client_caps,
+                                ),
+                            ));
+                        }
+                        refused
+                    }
+                    AccessControl::ChangeDatabase { database } => {
+                        // `USE` in protocol form: refused as `USE` is (the engine
+                        // denies it under a policy), labelled COM_INIT_DB.
+                        let policy = access.policy(config);
+                        let label = "COM_INIT_DB".to_string();
+                        let refused = policy.access_policy.as_ref().map(|p| {
+                            let decision =
+                                access_command_decision(&label, p.mode, policy.monitor_mode);
+                            (label, QueryKind::Simple, decision, access.identity(&policy))
+                        });
+                        // Forwarded (no policy, observe, monitor_mode): unqualified
+                        // names resolve to the new database from the next statement.
+                        if !matches!(refused, Some((_, _, TcpDecision::Block { .. }, _))) {
+                            access.set_database(match database {
+                                Some(db) => CurrentDatabase::Named(db),
+                                None => CurrentDatabase::Unknown,
+                            });
                         }
                         refused
                     }
@@ -364,6 +532,18 @@ pub async fn intercept_client_to_server(
                         skip_until_sync = true;
                     }
                     continue; // query NOT forwarded upstream
+                }
+
+                // Not blocked: a MySQL `USE` in it moves the session's current
+                // database for the next statements, as COM_INIT_DB does.
+                if proto.dialect() == vericto_engine::Dialect::Mysql && kind == QueryKind::Simple {
+                    match crate::tcp::protocol::mysql::sql_use_target(&sql) {
+                        Some(UseTarget::Database(db)) => {
+                            access.set_database(CurrentDatabase::Named(db))
+                        }
+                        Some(UseTarget::Unknown) => access.set_database(CurrentDatabase::Unknown),
+                        None => {}
+                    }
                 }
 
                 // Masked → forward the rewritten SQL in the same message (same
@@ -552,8 +732,13 @@ async fn run_mysql_session(
         )
     })?;
     // The user the server authenticates: the session's identity for the
-    // agent-access allowlists.
-    let session_user = mc::read_handshake_username(&client_resp.payload);
+    // agent-access allowlists. The database it names is the session's first
+    // current database, which wins over the policy's `default_schema`.
+    let session = SessionStart {
+        user: mc::read_handshake_username(&client_resp.payload),
+        database: CurrentDatabase::from_wire(mc::read_handshake_database(&client_resp.payload)),
+        client_caps: mc::read_client_capabilities(&client_resp.payload).unwrap_or(0),
+    };
     // The server enables compression only if the response asks for it. A client
     // that ignored the greeting and asked anyway does not get it either: its
     // compressed commands then fail at the server instead of passing the proxy
@@ -641,7 +826,7 @@ async fn run_mysql_session(
         &mut server_write,
         &client_write,
         &config,
-        session_user,
+        session,
     )
     .await;
 

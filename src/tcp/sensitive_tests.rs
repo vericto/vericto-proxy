@@ -131,7 +131,25 @@ pub(super) fn wire_as(
     queue: Arc<MemoryQueue>,
     user: Option<&str>,
 ) -> Wire {
-    let user = user.map(str::to_string);
+    wire_start(
+        proto,
+        cfg,
+        queue,
+        crate::tcp::session::SessionStart {
+            user: user.map(str::to_string),
+            ..Default::default()
+        },
+    )
+}
+
+/// [`wire_with`] for a session that started as `start` says (user, MySQL
+/// handshake database and capabilities).
+pub(super) fn wire_start(
+    proto: Box<dyn WireProtocol>,
+    cfg: Arc<PgProxyConfig>,
+    queue: Arc<MemoryQueue>,
+    start: crate::tcp::session::SessionStart,
+) -> Wire {
     let (client, proxy_client_side) = tokio::io::duplex(1 << 20);
     let (proxy_db_side, db) = tokio::io::duplex(1 << 20);
     let (cr, cw) = tokio::io::split(proxy_client_side);
@@ -145,7 +163,7 @@ pub(super) fn wire_as(
             &mut server_write,
             &client_write,
             &cfg,
-            user,
+            start,
         )
         .await
     });
@@ -192,7 +210,7 @@ pub(super) fn pg_sync() -> Vec<u8> {
     .encode()
 }
 
-pub(super) async fn read_pg(s: &mut DuplexStream) -> PgMessage {
+pub(super) async fn read_pg<S: tokio::io::AsyncRead + Unpin>(s: &mut S) -> PgMessage {
     let mut tag = [0u8; 1];
     timeout(s.read_exact(&mut tag)).await.unwrap();
     let mut len = [0u8; 4];

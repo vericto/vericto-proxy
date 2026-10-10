@@ -19,7 +19,7 @@ use vericto_engine::{AccessPolicyMap, EnforcementPolicy};
 
 use super::sensitive_tests::{
     Wire, config_with, events, first_query_reaching_db, my_cmd, my_err, my_first_query_reaching_db,
-    my_sql, pg_error, pg_parse, pg_query, pg_sync, read_my, read_pg, wire_as,
+    my_sql, pg_error, pg_parse, pg_query, pg_sync, read_my, read_pg, timeout, wire_as, wire_start,
 };
 use crate::tcp::codec::PgMessage;
 use crate::tcp::codec_mysql::{COM_QUERY, COM_STMT_PREPARE, MySqlPacket};
@@ -28,6 +28,7 @@ use crate::tcp::protocol::WireProtocol;
 use crate::tcp::protocol::mysql::MysqlProtocol;
 use crate::tcp::protocol::postgres::PostgresProtocol;
 use crate::tcp::rules_sync::TelemetryQueryMode;
+use crate::tcp::session::{CurrentDatabase, SessionStart, startup_settings_block};
 use crate::telemetry::queue::MemoryQueue;
 
 const AGENT: &str = "support_agent";
@@ -178,14 +179,43 @@ async fn pg_denied_write_is_blocked_and_a_granted_write_passes() {
     let msg = pg_expect_087(&mut w, "UPDATE orders SET total = 0 WHERE id = 1").await;
     // A table granted `read` only: the table itself is named (contract §3.1).
     assert!(msg.contains("AccessPolicy > orders (write)"), "{msg}");
-    pg_expect_087(&mut w, "DELETE FROM tickets WHERE id = 1").await; // needs "*"
+    // DELETE is a table-level write (engine 3.8.1): it needs a `read_write`
+    // entry for the table, whatever its column list, and is reported as the
+    // table, column null.
+    let msg = pg_expect_087(&mut w, "DELETE FROM orders WHERE id = 1").await;
+    assert!(msg.contains("AccessPolicy > orders (write)"), "{msg}");
     pg_expect_087(&mut w, "CREATE TABLE x (id int)").await; // DDL
-    // tickets.status is granted `read_write`.
+    // tickets.status is granted `read_write`: its UPDATE and a DELETE of tickets.
     pg_expect_forwarded(&mut w, "UPDATE tickets SET status = 'closed' WHERE id = 1").await;
+    pg_expect_forwarded(&mut w, "DELETE FROM tickets WHERE id = 1").await;
 
     let ev = events(&w.queue);
     assert_eq!(ev[0]["access_denied"][0]["needed"], "write");
+    assert_eq!(
+        ev[1]["access_denied"],
+        serde_json::json!([{"schema": null, "table": "orders", "column": null, "needed": "write"}])
+    );
     assert_eq!(ev[2]["access_denied"][0]["needed"], "ddl");
+}
+
+/// A row lock stalls every other writer of those rows: `FOR UPDATE` / `FOR
+/// SHARE` need write on each locked table (engine 3.8.1), on both protocols.
+#[tokio::test]
+async fn row_locks_need_write() {
+    let mut w = session(Box::new(PostgresProtocol), AGENT);
+    let msg = pg_expect_087(&mut w, "SELECT id FROM orders WHERE id = 1 FOR UPDATE").await;
+    assert!(msg.contains("AccessPolicy > orders (write)"), "{msg}");
+    pg_expect_087(&mut w, "SELECT id FROM orders FOR SHARE").await;
+    pg_expect_forwarded(
+        &mut w,
+        "SELECT id, status FROM tickets WHERE id = 1 FOR UPDATE",
+    )
+    .await;
+
+    let mut m = session(Box::new(MysqlProtocol), AGENT);
+    let msg = my_expect_087(&mut m, COM_QUERY, "SELECT id FROM orders FOR UPDATE").await;
+    assert!(msg.contains("AccessPolicy > orders (write)"), "{msg}");
+    my_expect_forwarded(&mut m, COM_QUERY, "SELECT id FROM tickets FOR UPDATE").await;
 }
 
 #[tokio::test]
@@ -1209,4 +1239,281 @@ async fn agent_access_events_fit_the_ingest_schema() {
         let batch = serde_json::json!({ "source": "tcp", "events": all });
         std::fs::write(path, serde_json::to_vec_pretty(&batch).unwrap()).unwrap();
     }
+}
+
+// ── Default schema and current database (engine 3.8.1) ──────────────────────
+
+/// A proxy whose agent-access map is `map` (the `/sync/rules` shape).
+fn proxy_with(map: serde_json::Value) -> (Arc<PgProxyConfig>, Arc<MemoryQueue>) {
+    let (cfg, queue) = proxy(EnforcementPolicy::default(), TelemetryQueryMode::Raw);
+    cfg.agent_access
+        .store(Arc::new(serde_json::from_value(map).expect("policies")));
+    (cfg, queue)
+}
+
+/// A MySQL session as `user` whose HandshakeResponse named `database`.
+fn mysql_session(
+    cfg: &Arc<PgProxyConfig>,
+    queue: &Arc<MemoryQueue>,
+    user: &str,
+    database: CurrentDatabase,
+) -> Wire {
+    wire_start(
+        Box::new(MysqlProtocol),
+        cfg.clone(),
+        queue.clone(),
+        SessionStart {
+            user: Some(user.into()),
+            database,
+            client_caps: crate::tcp::codec_mysql::CLIENT_PROTOCOL_41
+                | crate::tcp::codec_mysql::CLIENT_SECURE_CONNECTION,
+        },
+    )
+}
+
+/// The `access_denied` of the last event for `sql`.
+fn denied_for(queue: &MemoryQueue, sql: &str) -> serde_json::Value {
+    let ev = events(queue);
+    let e = ev
+        .iter()
+        .rev()
+        .find(|e| e["query_text"] == sql)
+        .unwrap_or_else(|| panic!("no event for {sql}"));
+    e.get("access_denied")
+        .cloned()
+        .unwrap_or(serde_json::json!([]))
+}
+
+fn orders_only(mode: &str, default_schema: Option<&str>) -> serde_json::Value {
+    let mut p = serde_json::json!({ "mode": mode, "ddl": "deny", "entries": [
+        { "schema": null, "table": "orders", "columns": "*", "access": "read" }
+    ]});
+    if let Some(d) = default_schema {
+        p["default_schema"] = d.into();
+    }
+    p
+}
+
+/// MySQL: the policy's `default_schema` (the dashboard's setting) applies while
+/// the session names no database; the database named in the handshake wins over
+/// it; a database the proxy could not read leaves no default schema at all.
+#[tokio::test]
+async fn mysql_handshake_database_wins_over_the_policy_default_schema() {
+    let (cfg, queue) =
+        proxy_with(serde_json::json!({ AGENT: orders_only("enforce", Some("shop")) }));
+
+    let mut w = mysql_session(&cfg, &queue, AGENT, CurrentDatabase::FromPolicy);
+    my_expect_forwarded(&mut w, COM_QUERY, "SELECT id FROM orders").await;
+    my_expect_forwarded(&mut w, COM_QUERY, "SELECT id FROM `shop`.`orders`").await;
+    my_expect_087(&mut w, COM_QUERY, "SELECT id FROM other.orders").await;
+
+    let mut w = mysql_session(&cfg, &queue, AGENT, CurrentDatabase::Named("other".into()));
+    my_expect_forwarded(&mut w, COM_QUERY, "SELECT id FROM other.orders").await;
+    my_expect_forwarded(&mut w, COM_QUERY, "SELECT id FROM orders").await;
+    let msg = my_expect_087(&mut w, COM_QUERY, "SELECT id FROM shop.orders").await;
+    assert!(msg.contains("shop.orders"), "{msg}");
+    // MySQL database names compare exactly.
+    my_expect_087(&mut w, COM_QUERY, "SELECT id FROM Other.orders").await;
+
+    let mut w = mysql_session(&cfg, &queue, AGENT, CurrentDatabase::Unknown);
+    my_expect_forwarded(&mut w, COM_QUERY, "SELECT id FROM orders").await;
+    my_expect_087(&mut w, COM_QUERY, "SELECT id FROM shop.orders").await;
+}
+
+/// COM_INIT_DB is `USE <db>`: refused like `USE` under an enforced policy (the
+/// current database does not move), and when forwarded (observe, or no policy)
+/// it moves the current database the next statements are evaluated against,
+/// exactly as a forwarded SQL `USE` does.
+#[tokio::test]
+async fn init_db_and_use_move_the_current_database() {
+    let (cfg, queue) = proxy_with(serde_json::json!({
+        AGENT: orders_only("enforce", None),
+        BOT: orders_only("observe", None),
+    }));
+
+    // Enforced: COM_INIT_DB and USE are refused; still `shop`.
+    let mut w = mysql_session(&cfg, &queue, AGENT, CurrentDatabase::Named("shop".into()));
+    w.client
+        .write_all(&my_packet(b"\x02other".to_vec()))
+        .await
+        .unwrap();
+    let (code, msg) = my_err(&read_my(&mut w.client).await);
+    assert_eq!(code, 1142);
+    assert!(msg.contains("AccessPolicy > COM_INIT_DB (ddl)"), "{msg}");
+    let msg = my_expect_087(&mut w, COM_QUERY, "USE other").await;
+    assert!(msg.contains("USE (ddl)"), "{msg}");
+    my_expect_forwarded(&mut w, COM_QUERY, "SELECT id FROM shop.orders").await;
+    my_expect_087(&mut w, COM_QUERY, "SELECT id FROM other.orders").await;
+
+    // Observed: both are forwarded (and flagged) and move the database.
+    let mut w = mysql_session(&cfg, &queue, BOT, CurrentDatabase::Named("shop".into()));
+    my_expect_forwarded(&mut w, COM_QUERY, "SELECT id FROM shop.orders").await;
+    assert_eq!(
+        denied_for(&queue, "SELECT id FROM shop.orders"),
+        serde_json::json!([])
+    );
+    w.client
+        .write_all(&my_packet(b"\x02other".to_vec()))
+        .await
+        .unwrap();
+    assert_eq!(read_my(&mut w.db).await.payload, b"\x02other".to_vec());
+    my_expect_forwarded(&mut w, COM_QUERY, "SELECT id FROM shop.orders").await;
+    assert_eq!(
+        denied_for(&queue, "SELECT id FROM shop.orders")[0]["schema"],
+        "shop"
+    );
+    my_expect_forwarded(&mut w, COM_QUERY, "SELECT id FROM other.orders").await;
+    assert_eq!(
+        denied_for(&queue, "SELECT id FROM other.orders"),
+        serde_json::json!([])
+    );
+    my_expect_forwarded(&mut w, COM_QUERY, "USE `shop`").await;
+    my_expect_forwarded(&mut w, COM_QUERY, "SELECT id FROM shop.orders").await;
+    assert_eq!(
+        denied_for(&queue, "SELECT id FROM shop.orders"),
+        serde_json::json!([])
+    );
+
+    // No policy yet: COM_INIT_DB passes and is tracked, so a policy synced later
+    // applies to the database the session is really in.
+    let mut w = mysql_session(&cfg, &queue, "app", CurrentDatabase::Named("shop".into()));
+    w.client
+        .write_all(&my_packet(b"\x02other".to_vec()))
+        .await
+        .unwrap();
+    assert_eq!(read_my(&mut w.db).await.payload, b"\x02other".to_vec());
+    let synced = proxy_with(serde_json::json!({ "app": orders_only("enforce", Some("shop")) })).0;
+    cfg.agent_access.store(synced.agent_access.load_full());
+    my_expect_forwarded(&mut w, COM_QUERY, "SELECT id FROM other.orders").await;
+    my_expect_087(&mut w, COM_QUERY, "SELECT id FROM shop.orders").await;
+}
+
+/// COM_CHANGE_USER between two users without a policy also changes the
+/// database (the packet's schema field).
+#[tokio::test]
+async fn change_user_moves_the_current_database() {
+    let (cfg, queue) = proxy_with(serde_json::json!({ "app2": orders_only("observe", None) }));
+    let mut w = mysql_session(&cfg, &queue, "app", CurrentDatabase::Named("shop".into()));
+    // user\0, 1-byte auth length + auth, database\0, charset.
+    w.client
+        .write_all(&my_packet(b"\x11app3\0\x02xyother\0\x21\x00".to_vec()))
+        .await
+        .unwrap();
+    assert_eq!(read_my(&mut w.db).await.payload[0], 0x11);
+    // The session is app3 in `other`; give app3 a policy and check where it is.
+    let synced = proxy_with(serde_json::json!({ "app3": orders_only("enforce", None) })).0;
+    cfg.agent_access.store(synced.agent_access.load_full());
+    my_expect_forwarded(&mut w, COM_QUERY, "SELECT id FROM other.orders").await;
+    my_expect_087(&mut w, COM_QUERY, "SELECT id FROM shop.orders").await;
+}
+
+/// Postgres: the policy's `default_schema` replaces `public`; names fmw sends
+/// double-quoted are case-sensitive, unquoted ones fold to lower case.
+#[tokio::test]
+async fn pg_policy_default_schema_and_quoted_names() {
+    let (cfg, queue) = proxy_with(serde_json::json!({ AGENT: {
+        "mode": "enforce", "ddl": "deny", "default_schema": "app", "entries": [
+            { "schema": null, "table": "orders", "columns": "*", "access": "read" },
+            { "schema": null, "table": "\"Customers\"", "columns": ["id", "\"Email\""], "access": "read" }
+        ]
+    }}));
+    let mut w = wire_as(Box::new(PostgresProtocol), cfg, queue, Some(AGENT));
+    pg_expect_forwarded(&mut w, "SELECT id FROM orders").await;
+    pg_expect_forwarded(&mut w, "SELECT id FROM app.orders").await;
+    pg_expect_087(&mut w, "SELECT id FROM public.orders").await;
+    pg_expect_forwarded(&mut w, "SELECT id, \"Email\" FROM \"Customers\"").await;
+    pg_expect_087(&mut w, "SELECT id FROM customers").await;
+    pg_expect_087(&mut w, "SELECT email FROM \"Customers\"").await;
+}
+
+/// Without `default_schema` the Postgres default stays `public`, as before.
+#[tokio::test]
+async fn pg_without_default_schema_keeps_public() {
+    let (cfg, queue) = proxy_with(serde_json::json!({ AGENT: orders_only("enforce", None) }));
+    let mut w = wire_as(Box::new(PostgresProtocol), cfg, queue, Some(AGENT));
+    pg_expect_forwarded(&mut w, "SELECT id FROM public.orders").await;
+    pg_expect_087(&mut w, "SELECT id FROM app.orders").await;
+}
+
+/// `search_path` (and the identity settings) in the StartupMessage are the
+/// `SET` the engine denies: refused under an enforced allowlist, flagged under
+/// observe, untouched without a policy.
+#[test]
+fn startup_settings_are_evaluated_as_their_set() {
+    let (cfg, queue) = proxy(EnforcementPolicy::default(), TelemetryQueryMode::Raw);
+    let path = vec![("search_path".to_string(), "secret, public".to_string())];
+    let msg = startup_settings_block(&cfg, Some(AGENT), &path).expect("refused");
+    assert!(msg.contains("VERICTO-087"), "{msg}");
+    assert!(msg.contains("SET search_path (ddl)"), "{msg}");
+    assert!(msg.contains("StartupMessage search_path"), "{msg}");
+    let role = vec![("role".to_string(), "admin".to_string())];
+    let msg = startup_settings_block(&cfg, Some(AGENT), &role).expect("refused");
+    assert!(msg.contains("SET ROLE"), "{msg}");
+    // Observe: reported, not refused. A quote in the value stays in the literal.
+    let odd = vec![("search_path".to_string(), "x', y".to_string())];
+    assert_eq!(startup_settings_block(&cfg, Some(BOT), &odd), None);
+    // No policy for this user (and no tags): nothing evaluated.
+    assert_eq!(startup_settings_block(&cfg, Some("app"), &path), None);
+    let ev = events(&queue);
+    assert_eq!(ev.len(), 3, "{ev:?}");
+    assert_eq!(ev[2]["status"], "FLAGGED");
+    assert_eq!(ev[2]["query_text"], "SET search_path = 'x'', y'");
+}
+
+/// End to end: a StartupMessage with `options=-c search_path=…` from an agent
+/// gets 42501 and never reaches the database.
+#[tokio::test]
+async fn startup_search_path_is_refused_before_the_database() {
+    use tokio::io::AsyncReadExt;
+    let upstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = upstream.local_addr().unwrap().port();
+    let (cfg, _queue) = config_with(
+        ("127.0.0.1", port),
+        EnforcementPolicy::default(),
+        TelemetryQueryMode::Raw,
+        crate::tcp::evaluator::default_ruleset(),
+        crate::tcp::upstream::UpstreamTlsMode::Disable,
+    );
+    cfg.agent_access.store(Arc::new(policies()));
+    let proxy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = proxy.local_addr().unwrap();
+    let task = tokio::spawn(async move {
+        let (s, _) = proxy.accept().await.unwrap();
+        crate::tcp::postgres::handle_connection(s, cfg).await;
+    });
+
+    let mut body = 196608i32.to_be_bytes().to_vec();
+    for (k, v) in [
+        ("user", AGENT),
+        ("database", "shop"),
+        ("options", "-c search_path=secret"),
+    ] {
+        body.extend_from_slice(k.as_bytes());
+        body.push(0);
+        body.extend_from_slice(v.as_bytes());
+        body.push(0);
+    }
+    body.push(0);
+    let mut startup = ((body.len() + 4) as i32).to_be_bytes().to_vec();
+    startup.extend_from_slice(&body);
+    let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+    client.write_all(&startup).await.unwrap();
+    let e = read_pg(&mut client).await;
+    assert_eq!(e.tag, b'E');
+    let (code, msg) = pg_error(&e.body);
+    assert_eq!(code, "42501");
+    assert!(msg.contains("SET search_path"), "{msg}");
+    let mut rest = Vec::new();
+    timeout(client.read_to_end(&mut rest)).await.unwrap();
+    assert!(
+        rest.is_empty(),
+        "the connection is closed after the refusal"
+    );
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(200), upstream.accept())
+            .await
+            .is_err(),
+        "nothing reached the database"
+    );
+    task.await.unwrap();
 }
