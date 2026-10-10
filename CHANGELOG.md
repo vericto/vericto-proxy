@@ -7,7 +7,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+Adopts vericto-engine v3.8.1: dialect-aware name semantics for the agent access
+allowlists, table-level `DELETE`, row locks that need write, and
+`AccessPolicy::default_schema`.
+
+### Added
+
+- **`default_schema` from `/sync/rules` reaches the engine.** Each `agent_access`
+  policy may carry the database's `default_schema` (the dashboard's setting); the
+  proxy passes it to the engine with the policy, so an entry without a schema is
+  the table in that schema. Absent: the engine default (`public` on Postgres).
+  Entry names arrive in the form fmw sends them (Postgres names that are not
+  plain lower case double-quoted) and are compared by the engine.
+- **MySQL sessions track their current database.** The database named in the
+  HandshakeResponse is the session's default schema and wins over the policy's
+  `default_schema`; a forwarded `COM_INIT_DB`, SQL `USE` or `COM_CHANGE_USER`
+  moves it for the statements after it. `COM_INIT_DB` is `USE <db>` in protocol
+  form: refused under an enforced policy as `USE` is (the database then does not
+  move), forwarded and flagged under `observe`, forwarded without a policy, and
+  tracked whenever it is forwarded, so a policy synced later in the session
+  applies to the database the session is really in. A `USE` the proxy cannot read
+  for certain (a `/*! … */` comment, `USE a.b`) leaves no default schema, the
+  engine's stricter reading.
+
+### Changed
+
+- **Engine 3.8.1 semantics** under an allowlist: a schema-less entry no longer
+  matches the table in every schema; Postgres compares quoted names exactly and
+  folds unquoted ones; MySQL compares table and database names exactly; `DELETE`
+  needs a `read_write` entry for the table whatever its column list and is
+  reported as the table (`AccessPolicy > orders (write)`, column null);
+  `SELECT … FOR UPDATE` / `FOR SHARE` need `read_write` on each locked table;
+  SQL-level `PREPARE` / `EXECUTE` / `DEALLOCATE` are denied; the session
+  statements drivers send on connect are no longer blocked as parse errors on a
+  database with `block`/`mask` tags.
+
 ### Fixed
+
+- **A Postgres StartupMessage could set `search_path` (or `role`,
+  `session_authorization`) past an allowlist.** `SET search_path` is denied under
+  a policy, but the same setting sent at connect, as a startup parameter or in
+  `options` (`-c search_path=…`, `--search_path=…`, `PGOPTIONS`), reached the
+  server unevaluated and moved where unqualified names resolve. Each such setting
+  is now evaluated as the `SET` it is, under the session user's policy, when the
+  session has an allowlist or the database has sensitive-column tags: denied under
+  `enforce` (the connection is refused with 42501 and never reaches the
+  database), flagged under `observe` or `monitor_mode`, reported like the
+  statement. Without a policy nothing changes.
+- StartupMessage parameters with an empty value no longer shift the pairs after
+  them (the parser skipped empty strings, so `application_name=''` made the next
+  name read as a value).
 
 - **MySQL logins no longer hang after the first one for a `caching_sha2_password`
   account**, the default on MySQL 8.0 and 8.4, with or without TLS. Once the

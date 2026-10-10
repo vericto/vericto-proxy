@@ -221,7 +221,24 @@ and a policy for that user.
   same outside SQL: a Postgres `FunctionCall` message, MySQL `COM_INIT_DB`,
   `COM_FIELD_LIST` and the replication/process commands, and any command the proxy
   does not know (deny by default). MySQL `COM_CHANGE_USER` is refused when the
-  current or the target user has a policy.
+  current or the target user has a policy. On Postgres, `search_path`, `role` and
+  `session_authorization` set by the StartupMessage (as parameters or in
+  `options`, e.g. `PGOPTIONS='-c search_path=…'`) are evaluated as the `SET` they
+  are: under an enforced policy the connection is refused with 42501 before it
+  reaches the database; under `observe` it is flagged.
+- **Unqualified names resolve to the default schema** (vericto-engine 3.8.1). An
+  entry without a schema is the table in the default schema only; a table of the
+  same name in another schema needs an entry naming it. The default is the
+  database's setting in the dashboard (`default_schema` in `/sync/rules`), else
+  `public` on Postgres. On MySQL it is the session's current database: the one
+  named at login, then each forwarded `COM_INIT_DB` or `USE` (allowed without a
+  policy or under `observe`), which wins over the dashboard's setting; a name
+  qualified with it (Prisma's `` `db`.`User` ``) matches entries without a schema.
+  Postgres names compare as Postgres does (quoted names exactly, unquoted ones
+  folded to lower case); MySQL table and database names compare exactly.
+- **Writes and locks.** `DELETE` needs a `read_write` entry for the table, whatever
+  its column list, and is reported as the table. `SELECT … FOR UPDATE` /
+  `FOR SHARE` need `read_write` on each locked table.
 - **Policy changes apply to open sessions.** The policy is selected again for every
   statement, so a sync that adds, changes or removes it takes effect on each
   session's next statement, without reconnecting. The last-good policies are kept in

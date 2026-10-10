@@ -51,6 +51,103 @@ pub fn read_change_user_name(payload: &[u8]) -> Option<String> {
     nul_terminated(payload.get(1..)?)
 }
 
+/// CLIENT_CONNECT_WITH_DB (bit 3): the HandshakeResponse names a database.
+pub const CLIENT_CONNECT_WITH_DB: u32 = 0x0000_0008;
+/// CLIENT_SECURE_CONNECTION (bit 15): auth data is length-prefixed (1 byte).
+pub const CLIENT_SECURE_CONNECTION: u32 = 0x0000_8000;
+/// CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA (bit 21): auth data is length-encoded.
+pub const CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA: u32 = 0x0020_0000;
+
+/// The database a HandshakeResponse connects to: the session's first current
+/// database. `Some(None)` when the client names none (no CLIENT_CONNECT_WITH_DB,
+/// or an empty name); `None` when the packet says it names one but cannot be
+/// read (truncated, not UTF-8). HandshakeResponse41: after the username, the
+/// auth data (length-encoded with CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA,
+/// 1-byte length with CLIENT_SECURE_CONNECTION, else NUL-terminated), then the
+/// NUL-terminated database. HandshakeResponse320: username, NUL-terminated
+/// auth data, database.
+pub fn read_handshake_database(payload: &[u8]) -> Option<Option<String>> {
+    let caps41 = read_client_capabilities(payload);
+    let lower = u16::from_le_bytes([*payload.first()?, *payload.get(1)?]) as u32;
+    let protocol_41 = lower & CLIENT_PROTOCOL_41 != 0;
+    let caps = if protocol_41 { caps41? } else { lower };
+    if caps & CLIENT_CONNECT_WITH_DB == 0 {
+        return Some(None);
+    }
+    let user_at = if protocol_41 { 32 } else { 5 };
+    let rest = payload.get(user_at..)?;
+    let rest = rest.get(rest.iter().position(|&b| b == 0)? + 1..)?;
+    let rest = if protocol_41 {
+        skip_auth_data(rest, caps)?
+    } else {
+        rest.get(rest.iter().position(|&b| b == 0)? + 1..)?
+    };
+    named_database(rest)
+}
+
+/// The database a COM_CHANGE_USER switches to (the session's current database
+/// after it), read with the session's client capabilities: `0x11`, user\0,
+/// auth data (1-byte length with CLIENT_SECURE_CONNECTION, else
+/// NUL-terminated), then the NUL-terminated database. Same `Option`s as
+/// [`read_handshake_database`]; an empty name is no database.
+pub fn read_change_user_database(payload: &[u8], client_caps: u32) -> Option<Option<String>> {
+    let rest = payload.get(1..)?;
+    let rest = rest.get(rest.iter().position(|&b| b == 0)? + 1..)?;
+    let rest = if client_caps & CLIENT_SECURE_CONNECTION != 0 {
+        let len = *rest.first()? as usize;
+        rest.get(1 + len..)?
+    } else {
+        rest.get(rest.iter().position(|&b| b == 0)? + 1..)?
+    };
+    named_database(rest)
+}
+
+/// The database a COM_INIT_DB selects: the rest of the packet (not
+/// NUL-terminated). `None` when it is empty or not UTF-8 (MySQL refuses both).
+pub fn read_init_db_name(payload: &[u8]) -> Option<String> {
+    let name = std::str::from_utf8(payload.get(1..)?).ok()?;
+    (!name.is_empty()).then(|| name.to_string())
+}
+
+/// Skips the auth data of a HandshakeResponse41 (see [`read_handshake_database`]).
+fn skip_auth_data(rest: &[u8], caps: u32) -> Option<&[u8]> {
+    if caps & CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA != 0 {
+        let (len, used) = read_lenenc_int(rest)?;
+        rest.get(used.checked_add(usize::try_from(len).ok()?)?..)
+    } else if caps & CLIENT_SECURE_CONNECTION != 0 {
+        let len = *rest.first()? as usize;
+        rest.get(1 + len..)
+    } else {
+        rest.get(rest.iter().position(|&b| b == 0)? + 1..)
+    }
+}
+
+/// A length-encoded integer: its value and how many bytes it took.
+fn read_lenenc_int(b: &[u8]) -> Option<(u64, usize)> {
+    let width = match *b.first()? {
+        v @ 0..=0xfa => return Some((v as u64, 1)),
+        0xfc => 2,
+        0xfd => 3,
+        0xfe => 8,
+        _ => return None,
+    };
+    let bytes = b.get(1..1 + width)?;
+    let mut v = 0u64;
+    for (i, byte) in bytes.iter().enumerate() {
+        v |= (*byte as u64) << (8 * i);
+    }
+    Some((v, 1 + width))
+}
+
+/// A NUL-terminated database name at the start of `rest`; empty = none. A name
+/// without its terminator at the very end of the packet is accepted (some
+/// clients omit it when nothing follows).
+fn named_database(rest: &[u8]) -> Option<Option<String>> {
+    let end = rest.iter().position(|&b| b == 0).unwrap_or(rest.len());
+    let name = std::str::from_utf8(&rest[..end]).ok()?;
+    Some((!name.is_empty()).then(|| name.to_string()))
+}
+
 fn nul_terminated(bytes: &[u8]) -> Option<String> {
     let end = bytes.iter().position(|&b| b == 0)?;
     String::from_utf8(bytes[..end].to_vec()).ok()
@@ -809,5 +906,66 @@ mod tests {
             Some("root")
         );
         assert_eq!(read_change_user_name(b"\x11"), None);
+    }
+
+    /// The handshake database is the session's first current database.
+    #[test]
+    fn handshake_database_is_read_after_the_auth_data() {
+        let head = |caps: u32| {
+            let mut p = caps.to_le_bytes().to_vec();
+            p.extend_from_slice(&0x0100_0000u32.to_le_bytes());
+            p.push(0x21);
+            p.extend_from_slice(&[0u8; 23]);
+            p.extend_from_slice(b"app\0");
+            p
+        };
+        let base = CLIENT_PROTOCOL_41 | CLIENT_SECURE_CONNECTION;
+        // 1-byte length auth data, then the database.
+        let mut p = head(base | CLIENT_CONNECT_WITH_DB);
+        p.push(20);
+        p.extend_from_slice(&[0u8; 20]);
+        p.extend_from_slice(b"shop\0caching_sha2_password\0");
+        assert_eq!(read_handshake_database(&p), Some(Some("shop".into())));
+        // Length-encoded auth data (an auth byte that is 0 does not end it).
+        let mut p = head(base | CLIENT_CONNECT_WITH_DB | CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA);
+        p.push(3);
+        p.extend_from_slice(&[0, 0, 0]);
+        p.extend_from_slice(b"Shop\0");
+        assert_eq!(read_handshake_database(&p), Some(Some("Shop".into())));
+        // No CLIENT_CONNECT_WITH_DB, or an empty name: no database.
+        let mut p = head(base);
+        p.push(0);
+        assert_eq!(read_handshake_database(&p), Some(None));
+        let mut p = head(base | CLIENT_CONNECT_WITH_DB);
+        p.extend_from_slice(b"\0\0");
+        assert_eq!(read_handshake_database(&p), Some(None));
+        // Announced but truncated: unreadable.
+        let mut p = head(base | CLIENT_CONNECT_WITH_DB);
+        p.push(20);
+        assert_eq!(read_handshake_database(&p), None);
+        // HandshakeResponse320: user\0 auth\0 database.
+        let p320 = b"\x0d\x00\xff\xff\x00old\0pw\0legacy\0".to_vec();
+        assert_eq!(read_handshake_database(&p320), Some(Some("legacy".into())));
+    }
+
+    #[test]
+    fn change_user_and_init_db_name_the_new_database() {
+        let secure = CLIENT_PROTOCOL_41 | CLIENT_SECURE_CONNECTION;
+        assert_eq!(
+            read_change_user_database(b"\x11app\0\x02xyother\0", secure),
+            Some(Some("other".into()))
+        );
+        assert_eq!(
+            read_change_user_database(b"\x11app\0\0\0", secure),
+            Some(None)
+        );
+        assert_eq!(
+            read_change_user_database(b"\x11app\0pw\0other\0", CLIENT_PROTOCOL_41),
+            Some(Some("other".into()))
+        );
+        assert_eq!(read_change_user_database(b"\x11app\0\x09xy", secure), None);
+        assert_eq!(read_init_db_name(b"\x02shop").as_deref(), Some("shop"));
+        assert_eq!(read_init_db_name(b"\x02"), None);
+        assert_eq!(read_init_db_name(b"\x02\xff"), None);
     }
 }

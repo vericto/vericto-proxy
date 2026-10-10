@@ -48,7 +48,20 @@ pub enum StartupPacket {
 pub struct StartupParams {
     pub user: Option<String>,
     pub database: Option<String>,
+    /// The run-time settings the StartupMessage sets that an agent-access
+    /// allowlist depends on ([`ACCESS_STARTUP_SETTINGS`]), as `(name, value)`
+    /// in the order the server applies them: the `options` switches
+    /// (`-c name=value`, `--name=value`), then the parameters sent directly.
+    /// Names lower-cased, `-` read as `_`, as the server reads them.
+    pub access_settings: Vec<(String, String)>,
 }
+
+/// Settings a StartupMessage can set that change who the session is or where
+/// unqualified names resolve: the engine denies their `SET` form under an
+/// agent-access policy (`SET search_path`, `SET ROLE`,
+/// `SET SESSION AUTHORIZATION`), so the proxy evaluates them as that `SET`
+/// before the session starts (see `session::startup_settings_block`).
+pub const ACCESS_STARTUP_SETTINGS: &[&str] = &["search_path", "role", "session_authorization"];
 
 /// A regular-protocol message (with tag).
 #[derive(Debug, Clone)]
@@ -109,15 +122,81 @@ where
 /// Parses the StartupMessage key/value pairs (after the 4 version bytes).
 fn parse_startup_params(body: &[u8]) -> StartupParams {
     let mut params = StartupParams::default();
-    let mut parts = body.split(|&b| b == 0).filter(|s| !s.is_empty());
-    while let (Some(key), Some(val)) = (parts.next(), parts.next()) {
+    let mut direct = Vec::new();
+    let mut options = Vec::new();
+    // Pairs of NUL-terminated strings, ended by an empty name. An empty value
+    // is a value (not skipped), or every later pair would be read shifted.
+    let mut parts = body.split(|&b| b == 0);
+    while let Some(key) = parts.next() {
+        if key.is_empty() {
+            break;
+        }
+        let Some(val) = parts.next() else { break };
+        let val = String::from_utf8_lossy(val).into_owned();
         match std::str::from_utf8(key) {
-            Ok("user") => params.user = std::str::from_utf8(val).ok().map(String::from),
-            Ok("database") => params.database = std::str::from_utf8(val).ok().map(String::from),
-            _ => {}
+            Ok("user") => params.user = Some(val),
+            Ok("database") => params.database = Some(val),
+            Ok("options") => options.extend(options_settings(&val)),
+            _ => direct.push((guc_name(&String::from_utf8_lossy(key)), val)),
         }
     }
+    params.access_settings = options
+        .into_iter()
+        .chain(direct)
+        .filter(|(name, _)| ACCESS_STARTUP_SETTINGS.contains(&name.as_str()))
+        .collect();
     params
+}
+
+/// A setting name as the server reads it: case-insensitive, `-` as `_`.
+fn guc_name(name: &str) -> String {
+    name.to_ascii_lowercase().replace('-', "_")
+}
+
+/// The `name=value` settings of a StartupMessage `options` string: words split
+/// on unescaped whitespace (`\` escapes the next character), `-c name=value`,
+/// `-cname=value` and `--name=value`, as the server's `pg_split_opts` and
+/// command-line parser read them. Other switches carry no setting.
+fn options_settings(options: &str) -> Vec<(String, String)> {
+    let mut words = Vec::new();
+    let mut word = String::new();
+    let mut in_word = false;
+    let mut chars = options.chars();
+    while let Some(c) = chars.next() {
+        if c.is_ascii_whitespace() {
+            if in_word {
+                words.push(std::mem::take(&mut word));
+                in_word = false;
+            }
+            continue;
+        }
+        in_word = true;
+        if c == '\\' {
+            if let Some(next) = chars.next() {
+                word.push(next);
+            }
+        } else {
+            word.push(c);
+        }
+    }
+    if in_word {
+        words.push(word);
+    }
+    let mut out = Vec::new();
+    let mut words = words.into_iter();
+    while let Some(w) = words.next() {
+        let setting = if w == "-c" {
+            words.next()
+        } else if let Some(rest) = w.strip_prefix("--") {
+            Some(rest.to_string())
+        } else {
+            w.strip_prefix("-c").map(str::to_string)
+        };
+        if let Some((name, value)) = setting.as_deref().and_then(|s| s.split_once('=')) {
+            out.push((guc_name(name), value.to_string()));
+        }
+    }
+    out
 }
 
 /// Reads a regular-protocol message (with tag). Returns `None` on clean EOF.
@@ -238,6 +317,67 @@ pub fn build_ready_for_query() -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn startup_body(pairs: &[(&str, &str)]) -> Vec<u8> {
+        let mut b = Vec::new();
+        for (k, v) in pairs {
+            b.extend_from_slice(k.as_bytes());
+            b.push(0);
+            b.extend_from_slice(v.as_bytes());
+            b.push(0);
+        }
+        b.push(0);
+        b
+    }
+
+    /// `search_path`, `role` and `session_authorization` set at startup, sent
+    /// directly or through `options`, are what an allowlist must see.
+    #[test]
+    fn startup_settings_that_move_names_or_identity_are_collected() {
+        let p = parse_startup_params(&startup_body(&[
+            ("user", "agent"),
+            ("database", "shop"),
+            ("application_name", ""),
+            (
+                "options",
+                r"-c search_path=secret,public --ROLE=admin -cstatement_timeout=5 -c search\ path=x",
+            ),
+            ("Search_Path", "audit"),
+            ("session-authorization", "postgres"),
+            ("DateStyle", "ISO"),
+        ]));
+        assert_eq!(p.user.as_deref(), Some("agent"));
+        assert_eq!(p.database.as_deref(), Some("shop"));
+        let got: Vec<(&str, &str)> = p
+            .access_settings
+            .iter()
+            .map(|(n, v)| (n.as_str(), v.as_str()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("search_path", "secret,public"),
+                ("role", "admin"),
+                ("search_path", "audit"),
+                ("session_authorization", "postgres"),
+            ]
+        );
+        // An escaped space is part of the value.
+        let p = parse_startup_params(&startup_body(&[("options", r"-csearch_path=a\ b")]));
+        assert_eq!(
+            p.access_settings,
+            vec![("search_path".into(), "a b".into())]
+        );
+        // Nothing relevant: nothing collected (and an empty value does not shift
+        // the pairs after it).
+        let p = parse_startup_params(&startup_body(&[
+            ("application_name", ""),
+            ("user", "app"),
+            ("options", "-c statement_timeout=0"),
+        ]));
+        assert_eq!(p.user.as_deref(), Some("app"));
+        assert!(p.access_settings.is_empty());
+    }
 
     fn simple_query_msg(sql: &str) -> PgMessage {
         let mut body = sql.as_bytes().to_vec();

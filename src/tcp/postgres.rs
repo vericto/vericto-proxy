@@ -25,7 +25,7 @@ use tokio::net::TcpStream;
 use tokio::sync::Mutex;
 
 use crate::tcp::client_tls::{ClientRead, ClientWrite};
-use crate::tcp::codec::{StartupPacket, read_startup_packet};
+use crate::tcp::codec::{StartupPacket, StartupParams, read_startup_packet};
 use crate::tcp::evaluator::TcpDecision;
 use vericto_engine::EnforcementAction;
 use vericto_engine::parser::Dialect;
@@ -86,8 +86,36 @@ async fn run_session(client: TcpStream, config: Arc<PgProxyConfig>) -> std::io::
     // the StartupMessage. Returns the (possibly TLS) client halves.
     // The StartupMessage `user` is the session's identity for the agent-access
     // allowlists: the role the server authenticates, fixed for the session.
-    let (mut client_read, mut client_write, startup_raw, session_user) =
+    let (mut client_read, mut client_write, startup_raw, startup) =
         negotiate_startup(client, config.client_tls_acceptor.as_ref()).await?;
+    let session_user = startup.user;
+
+    // `search_path` (and the identity settings) set by the StartupMessage are
+    // the `SET` the engine denies under an allowlist: evaluated as that `SET`,
+    // and a blocked one refuses the connection before it reaches the database.
+    let refused = {
+        let config = Arc::clone(&config);
+        let user = session_user.clone();
+        let settings = startup.access_settings;
+        tokio::task::spawn_blocking(move || {
+            crate::tcp::session::startup_settings_block(&config, user.as_deref(), &settings)
+        })
+        .await
+        .expect("startup evaluation task panicked")
+    };
+    if let Some(message) = refused {
+        client_write
+            .write_all(&crate::tcp::codec::build_error_response(
+                crate::tcp::codec::SQLSTATE_INSUFFICIENT_PRIVILEGE,
+                &message,
+            ))
+            .await?;
+        client_write.flush().await?;
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "StartupMessage setting denied by the agent access policy",
+        ));
+    }
 
     // ── Phase 2: connect upstream (optionally over TLS) and forward the StartupMessage
     let (server_read, mut server_write) = match crate::tcp::upstream::connect_upstream(
@@ -183,7 +211,7 @@ async fn run_session(client: TcpStream, config: Arc<PgProxyConfig>) -> std::io::
 }
 
 /// Negotiates the startup phase and returns the client transport halves, the
-/// raw StartupMessage bytes and its `user` parameter.
+/// raw StartupMessage bytes and its parameters.
 ///
 /// When `acceptor` is `Some` and the client sends an `SSLRequest`, the proxy
 /// answers `'S'`, performs the server-side TLS handshake, and reads the
@@ -197,7 +225,7 @@ async fn run_session(client: TcpStream, config: Arc<PgProxyConfig>) -> std::io::
 async fn negotiate_startup(
     mut client: TcpStream,
     acceptor: Option<&tokio_rustls::TlsAcceptor>,
-) -> std::io::Result<(ClientRead, ClientWrite, Vec<u8>, Option<String>)> {
+) -> std::io::Result<(ClientRead, ClientWrite, Vec<u8>, StartupParams)> {
     loop {
         match read_startup_packet(&mut client).await? {
             StartupPacket::SslRequest => {
@@ -208,8 +236,8 @@ async fn negotiate_startup(
                     client.flush().await?;
                     let (mut read, write) =
                         crate::tcp::client_tls::accept_tls(acceptor, client).await?;
-                    let (raw, user) = read_startup_message(&mut read).await?;
-                    return Ok((read, write, raw, user));
+                    let (raw, params) = read_startup_message(&mut read).await?;
+                    return Ok((read, write, raw, params));
                 }
                 // TLS not enabled: decline ('N') and keep negotiating in plaintext.
                 client.write_all(b"N").await?;
@@ -245,7 +273,7 @@ async fn negotiate_startup(
                     "StartupMessage received"
                 );
                 let (read, write) = tokio::io::split(client);
-                return Ok((Box::new(read), Box::new(write), raw, params.user));
+                return Ok((Box::new(read), Box::new(write), raw, params));
             }
         }
     }
@@ -255,7 +283,7 @@ async fn negotiate_startup(
 /// handshake, where the next message must be the StartupMessage).
 async fn read_startup_message<R: AsyncRead + Unpin>(
     reader: &mut R,
-) -> std::io::Result<(Vec<u8>, Option<String>)> {
+) -> std::io::Result<(Vec<u8>, StartupParams)> {
     match read_startup_packet(reader).await? {
         StartupPacket::Startup { raw, params } => {
             tracing::debug!(
@@ -263,7 +291,7 @@ async fn read_startup_message<R: AsyncRead + Unpin>(
                 database = ?params.database,
                 "StartupMessage received (over TLS)"
             );
-            Ok((raw, params.user))
+            Ok((raw, params))
         }
         _ => Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -319,7 +347,10 @@ async fn intercept_client_to_server(
         server_write,
         client_write,
         config,
-        session_user,
+        crate::tcp::session::SessionStart {
+            user: session_user,
+            ..Default::default()
+        },
     )
     .await
 }
