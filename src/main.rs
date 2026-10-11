@@ -16,6 +16,9 @@
 //!   VERICTO_API_KEY    — workspace API key (vtro_...)
 //!   VERICTO_DATABASE_ID — UUID of the database record in the Vericto platform
 
+// No `unsafe` in the proxy itself; keep it that way without a reviewed opt-out.
+#![forbid(unsafe_code)]
+
 mod config;
 mod tcp;
 mod telemetry;
