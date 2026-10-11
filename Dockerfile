@@ -14,7 +14,9 @@
 # syntax=docker/dockerfile:1.7
 
 # ── Stage 1: install cargo-chef ──────────────────────────────────────────────
-FROM rust:1.88-slim-bookworm AS chef
+# Base images are pinned by digest (multi-arch index) as well as tag, so a
+# re-pushed tag cannot change what is built; Dependabot (docker) bumps them.
+FROM rust:1.88-slim-bookworm@sha256:38bc5a86d998772d4aec2348656ed21438d20fcdce2795b56ca434cf21430d89 AS chef
 WORKDIR /app
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -28,7 +30,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 ENV LIBCLANG_PATH=/usr/lib/llvm-14/lib
 
-RUN cargo install cargo-chef --locked
+RUN cargo install cargo-chef --version 0.1.78 --locked
 
 # Generates THIRD_PARTY_LICENSES in the builder stage. Pinned, so the notices only
 # change format when this line does.
@@ -44,7 +46,7 @@ FROM chef AS builder
 
 # Deps layer — only invalidated when Cargo.toml changes
 COPY --from=planner /app/recipe.json recipe.json
-RUN cargo chef cook --release --recipe-path recipe.json
+RUN cargo chef cook --release --locked --recipe-path recipe.json
 
 # Source layer — only recompiles your code (seconds on rebuilds). The manifest
 # and lockfile are required here: `cargo chef cook` builds only dependencies
@@ -52,14 +54,15 @@ RUN cargo chef cook --release --recipe-path recipe.json
 # this step. Without the manifest, `cargo build` would leave the chef stub.
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
-RUN cargo build --release
+# --locked: build exactly the reviewed Cargo.lock, never a re-resolved one.
+RUN cargo build --release --locked
 
 # Notices for everything compiled into the binary; see third-party/build-notices.sh.
 COPY third-party ./third-party
 RUN sh third-party/build-notices.sh THIRD_PARTY_LICENSES
 
 # ── Stage 4: minimal runtime ──────────────────────────────────────────────────
-FROM debian:bookworm-slim AS runner
+FROM debian:bookworm-slim@sha256:7c7b2c966bc9ee8cedfeef67e0e279108992c77681fa595db4a9d65c06ccc587 AS runner
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
