@@ -75,7 +75,14 @@ async fn main() {
     let readiness = crate::tcp::healthz::Readiness::new();
 
     // Control-plane link (telemetry + rule sync) — optional.
-    let telemetry_sink = match config::ControlPlaneConfig::from_env() {
+    let control_plane = match config::ControlPlaneConfig::from_env() {
+        Ok(cp) => cp,
+        Err(e) => {
+            tracing::error!("{e}");
+            std::process::exit(1);
+        }
+    };
+    let telemetry_sink = match control_plane {
         Some(cp) => {
             tracing::info!(
                 buffer = ?cp.buffer_mode,

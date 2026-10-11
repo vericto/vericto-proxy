@@ -17,6 +17,7 @@ impl Reporter {
     pub fn new(cfg: ControlPlaneConfig, queue: Arc<dyn EventQueue>) -> Self {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(10))
+            .redirect(crate::config::same_origin_redirects())
             .build()
             .expect("failed to build telemetry HTTP client");
         Self { cfg, queue, client }

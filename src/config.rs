@@ -47,13 +47,20 @@ pub struct ControlPlaneConfig {
 }
 
 impl ControlPlaneConfig {
-    /// Build from environment. Returns `None` when the link is not configured.
-    pub fn from_env() -> Option<Self> {
-        let api_url = std::env::var("VERICTO_API_URL").ok()?;
-        let api_key = std::env::var("VERICTO_API_KEY").ok()?;
+    /// Build from environment. `Ok(None)` when the link is not configured; `Err`
+    /// when it is, but `VERICTO_API_URL` would send the API key in clear text
+    /// (see [`check_api_url`]).
+    pub fn from_env() -> Result<Option<Self>, String> {
+        let (Ok(api_url), Ok(api_key)) = (
+            std::env::var("VERICTO_API_URL"),
+            std::env::var("VERICTO_API_KEY"),
+        ) else {
+            return Ok(None);
+        };
         if api_url.is_empty() || api_key.is_empty() {
-            return None;
+            return Ok(None);
         }
+        check_api_url(&api_url, env_flag("VERICTO_ALLOW_INSECURE_API_URL"))?;
 
         let rules_sync_interval = Duration::from_secs(
             // Minimum 30 seconds to avoid hammering the API.
@@ -91,7 +98,7 @@ impl ControlPlaneConfig {
             &disk_spool_path,
         );
 
-        Some(Self {
+        Ok(Some(Self {
             api_url: api_url.trim_end_matches('/').to_string(),
             api_key,
             database_id: std::env::var("VERICTO_DATABASE_ID").ok(),
@@ -104,8 +111,66 @@ impl ControlPlaneConfig {
             flush_interval: Duration::from_secs(
                 env_u64("VERICTO_TELEMETRY_FLUSH_SECS").unwrap_or(5),
             ),
-        })
+        }))
     }
+}
+
+/// Every request to the control plane carries the workspace API key, so the URL
+/// must be `https://`. Plain `http://` is accepted only for a loopback host (a
+/// local stand-in for the API) or when `VERICTO_ALLOW_INSECURE_API_URL` is set,
+/// for a development stack on a private network.
+pub fn check_api_url(api_url: &str, allow_insecure: bool) -> Result<(), String> {
+    let url = reqwest::Url::parse(api_url)
+        .map_err(|e| format!("VERICTO_API_URL is not a valid URL ({e})"))?;
+    match url.scheme() {
+        "https" => Ok(()),
+        "http" if allow_insecure || is_loopback(&url) => Ok(()),
+        "http" => Err(
+            "VERICTO_API_URL uses http://, which would send the API key in clear text. \
+             Use https://, or set VERICTO_ALLOW_INSECURE_API_URL=true for a development stack."
+                .to_string(),
+        ),
+        other => Err(format!(
+            "VERICTO_API_URL must be an https:// URL, not {other}://"
+        )),
+    }
+}
+
+fn is_loopback(url: &reqwest::Url) -> bool {
+    url.host_str().is_some_and(|host| {
+        host.eq_ignore_ascii_case("localhost")
+            || host
+                .trim_start_matches('[')
+                .trim_end_matches(']')
+                .parse::<std::net::IpAddr>()
+                .is_ok_and(|ip| ip.is_loopback())
+    })
+}
+
+/// A redirect policy for requests that carry the API key: follow a redirect
+/// only within the same origin (scheme, host and port). reqwest strips
+/// `Authorization` on a cross-host redirect, but not a custom header such as
+/// `X-API-Key`, and by default it also follows https → http.
+pub fn same_origin_redirects() -> reqwest::redirect::Policy {
+    reqwest::redirect::Policy::custom(|attempt| {
+        let same_origin = attempt
+            .previous()
+            .first()
+            .is_some_and(|first| first.origin() == attempt.url().origin());
+        if attempt.previous().len() > 5 {
+            attempt.error("too many redirects")
+        } else if same_origin {
+            attempt.follow()
+        } else {
+            attempt.stop()
+        }
+    })
+}
+
+fn env_flag(key: &str) -> bool {
+    std::env::var(key)
+        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+        .unwrap_or(false)
 }
 
 /// File name of the rules cache inside the spool dir when `VERICTO_TELEMETRY_BUFFER=disk`.
@@ -146,6 +211,74 @@ fn env_usize(key: &str) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn api_url_must_be_https_unless_loopback_or_allowed() {
+        assert!(check_api_url("https://api.vericto.com", false).is_ok());
+        assert!(check_api_url("http://127.0.0.1:4000", false).is_ok());
+        assert!(check_api_url("http://localhost:4000", false).is_ok());
+        assert!(check_api_url("http://[::1]:4000", false).is_ok());
+        assert!(check_api_url("http://api.vericto.com", false).is_err());
+        assert!(check_api_url("http://api:4000", false).is_err());
+        assert!(check_api_url("http://api:4000", true).is_ok());
+        assert!(check_api_url("ftp://api.vericto.com", true).is_err());
+        assert!(check_api_url("api.vericto.com", false).is_err());
+    }
+
+    /// The API key never follows a redirect to another origin: the client
+    /// stops at the 3xx instead.
+    #[tokio::test]
+    async fn api_key_is_not_sent_across_origins_on_redirect() {
+        use axum::{Router, http::HeaderMap, routing::get};
+        use std::sync::{Arc, Mutex};
+
+        let leaked = Arc::new(Mutex::new(false));
+        let seen = leaked.clone();
+        let other = Router::new().route(
+            "/",
+            get(move |headers: HeaderMap| {
+                let seen = seen.clone();
+                async move {
+                    *seen.lock().unwrap() = headers.contains_key("x-api-key");
+                    "ok"
+                }
+            }),
+        );
+        let other_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let other_url = format!("http://{}/", other_listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(other_listener, other).await });
+
+        let target = other_url.clone();
+        let api = Router::new().route(
+            "/",
+            get(move || {
+                let target = target.clone();
+                async move { axum::response::Redirect::temporary(&target) }
+            }),
+        );
+        let api_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let api_url = format!("http://{}/", api_listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(api_listener, api).await });
+
+        let client = reqwest::Client::builder()
+            .redirect(same_origin_redirects())
+            .build()
+            .unwrap();
+        let res = client
+            .get(&api_url)
+            .header("X-API-Key", "vtro_test")
+            .send()
+            .await
+            .unwrap();
+        assert!(
+            res.status().is_redirection(),
+            "a cross-origin redirect is not followed"
+        );
+        assert!(
+            !*leaked.lock().unwrap(),
+            "the API key reached another origin"
+        );
+    }
 
     #[test]
     fn rules_cache_follows_the_buffer_mode_unless_set() {

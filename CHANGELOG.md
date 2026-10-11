@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- **The API key only goes to an `https://` control plane.** The proxy refuses to
+  start when `VERICTO_API_URL` is `http://` on a host other than loopback, unless
+  `VERICTO_ALLOW_INSECURE_API_URL=true` (development stacks). Requests that carry
+  the key follow redirects only within the same origin.
+
 ## [4.8.1] — 2026-10-10
 
 Requires vericto-engine v3.8.1. Adopts its dialect-aware name semantics for the
