@@ -1,8 +1,13 @@
-# Keeps the SHA-pinned GitHub Actions in ci.yml and release.yml current. Cargo
-# security fixes are left to Dependabot security updates (a repository setting).
-# Routine Cargo version bumps are deliberately left out: vericto-engine and
-# pg_query move together and can change how SQL is parsed, so they are bumped by
-# hand with their own CHANGELOG entry.
+# Keeps the SHA-pinned GitHub Actions in ci.yml and release.yml and the
+# digest-pinned base images in the Dockerfile current, and proposes Cargo
+# updates once a month in a single grouped PR.
+#
+# vericto-engine, pg_query and sqlparser are left out of the version updates:
+# they move together and can change how SQL is parsed, so they are bumped by
+# hand with their own CHANGELOG entry. Security fixes are not missed for them:
+# Dependabot security updates are on in the repository settings, and the
+# `supply-chain` CI job (cargo-deny + cargo-audit) fails every PR while a
+# RustSec advisory applies to Cargo.lock.
 version: 2
 updates:
   - package-ecosystem: github-actions
@@ -11,3 +16,35 @@ updates:
       interval: weekly
     commit-message:
       prefix: ci
+
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 2
+    commit-message:
+      prefix: chore(deps)
+    ignore:
+      - dependency-name: vericto-engine
+      - dependency-name: pg_query
+      - dependency-name: sqlparser
+      # Major bumps change APIs; they are done by hand.
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major"]
+    groups:
+      cargo:
+        patterns: ["*"]
+
+  # Base image digests in the Dockerfile. The Rust image stays on the toolchain
+  # line of rust-toolchain.toml: only its digest moves, not 1.88.
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: monthly
+    commit-message:
+      prefix: chore(docker)
+    ignore:
+      - dependency-name: rust
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]
+      - dependency-name: debian
+        update-types: ["version-update:semver-major"]
