@@ -465,6 +465,14 @@ docker run --rm \
   ghcr.io/vericto/vericto-proxy:4.5.1
 ```
 
+Images released from now on carry a build provenance attestation (Sigstore,
+GitHub Actions) that ties their digest to this repository, the release workflow
+and the commit. Verify one before you deploy it, and deploy by digest:
+
+```bash
+gh attestation verify oci://ghcr.io/vericto/vericto-proxy:<version> --repo vericto/vericto-proxy
+```
+
 To build the image from this checkout instead:
 
 ```bash
