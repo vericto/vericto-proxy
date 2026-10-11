@@ -1,0 +1,57 @@
+# cargo-deny configuration (https://embarkstudios.github.io/cargo-deny/), run by
+# the `supply-chain` job in .github/workflows/ci.yml and locally with
+# `cargo deny check`.
+
+[graph]
+# The graph as the binary is built: default features, every target.
+all-features = false
+
+[advisories]
+# Every RustSec vulnerability, unsound, unmaintained and yanked advisory fails
+# the check. An exception goes in `ignore` with the advisory id and the reason,
+# and is revisited when the dependency is next bumped.
+version = 2
+yanked = "deny"
+unmaintained = "all"
+ignore = []
+
+[licenses]
+version = 2
+# The licenses the dependency tree uses today (third-party/about.toml lists the
+# subset that ships in the image), plus Elastic-2.0 for Vericto's own crates. A
+# dependency under any other license fails the check until it has been reviewed
+# and added here.
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "CDLA-Permissive-2.0",
+    "Elastic-2.0",
+    "ISC",
+    "MIT",
+    "Unicode-3.0",
+    "Zlib",
+]
+confidence-threshold = 0.9
+
+[bans]
+# Duplicate versions are reported, not failed.
+multiple-versions = "warn"
+# vericto-engine is a git dependency pinned by tag and Cargo.lock, which
+# cargo-deny counts as a wildcard; the sources section below restricts it.
+wildcards = "warn"
+allow-wildcard-paths = true
+# TLS is rustls only (see Cargo.toml): no OpenSSL in the binary.
+deny = [
+    { crate = "openssl", reason = "TLS is rustls only" },
+    { crate = "openssl-sys", reason = "TLS is rustls only" },
+]
+
+[sources]
+# crates.io, plus the engine from its public repository, pinned by tag.
+unknown-registry = "deny"
+unknown-git = "deny"
+required-git-spec = "tag"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = ["https://github.com/vericto/vericto-engine"]
