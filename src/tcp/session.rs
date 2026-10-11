@@ -226,7 +226,7 @@ pub(crate) fn startup_settings_block(
             ..
         } = &decision
         {
-            crate::tcp::postgres::log_block(&sql, rule_code, ast_node_path);
+            crate::tcp::postgres::log_block(&sql, dialect, rule_code, ast_node_path);
             return Some(crate::tcp::protocol::postgres::block_message(
                 rule_code,
                 &format!("{ast_node_path} (StartupMessage {name})"),
@@ -403,7 +403,12 @@ pub async fn intercept_client_to_server(
                         ..
                     } = &decision
                     {
-                        crate::tcp::postgres::log_block(&label, rule_code, ast_node_path);
+                        crate::tcp::postgres::log_block(
+                            &label,
+                            proto.dialect(),
+                            rule_code,
+                            ast_node_path,
+                        );
                         let block = proto.build_block_response(&BlockContext {
                             rule_code,
                             ast_node_path,
@@ -519,7 +524,12 @@ pub async fn intercept_client_to_server(
                     ..
                 } = &decision
                 {
-                    crate::tcp::postgres::log_block(&sql, rule_code, ast_node_path);
+                    crate::tcp::postgres::log_block(
+                        &sql,
+                        proto.dialect(),
+                        rule_code,
+                        ast_node_path,
+                    );
                     let block = proto.build_block_response(&BlockContext {
                         rule_code,
                         ast_node_path,
@@ -556,7 +566,7 @@ pub async fn intercept_client_to_server(
                 {
                     if let Some(masked) = proto.with_query(&msg, rewritten) {
                         tracing::info!(
-                            query_preview = %sql.chars().take(80).collect::<String>(),
+                            query_preview = %crate::tcp::postgres::log_preview(&sql, proto.dialect()),
                             "Query MASKED at TCP proxy; forwarding the rewritten SQL"
                         );
                         forward(server_write, &masked.encode()).await?;
@@ -571,7 +581,12 @@ pub async fn intercept_client_to_server(
                     let ast_node_path = "SensitiveColumn > mask not enforceable by the proxy: \
                                          this wire protocol cannot carry the rewritten query";
                     tracing::error!(ast_node_path, "blocking a masked query");
-                    crate::tcp::postgres::log_block(&sql, SENSITIVE_RULE_CODE, ast_node_path);
+                    crate::tcp::postgres::log_block(
+                        &sql,
+                        proto.dialect(),
+                        SENSITIVE_RULE_CODE,
+                        ast_node_path,
+                    );
                     let block = proto.build_block_response(&BlockContext {
                         rule_code: SENSITIVE_RULE_CODE,
                         ast_node_path,
