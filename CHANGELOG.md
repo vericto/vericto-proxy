@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [4.8.2] — 2026-10-11
+
+Security release from the 2026-10 review. Requires vericto-engine v3.8.1 (unchanged).
+Upgrade note: a proxy pointed at an `http://` control plane (local development only)
+now needs `VERICTO_ALLOW_INSECURE_API_URL=true`.
+
 ### Security
 
 - **The API key only goes to an `https://` control plane.** The proxy refuses to
@@ -20,6 +26,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Log lines show queries without their values.** The preview of a blocked or
   masked query in the proxy's log has its literals replaced, as sanitized
   telemetry does, whatever the workspace's reporting mode.
+- The release image is published with a build provenance attestation
+  (`gh attestation verify`), its build is pinned (base images by digest,
+  `--locked`), the crate forbids `unsafe` code, and CI adds cargo-deny,
+  cargo-audit, gitleaks and Dependabot, with every action pinned by SHA.
 
 ## [4.8.1] — 2026-10-10
 
