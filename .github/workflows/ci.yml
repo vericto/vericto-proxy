@@ -60,3 +60,29 @@ jobs:
 
       - name: Run tests
         run: cargo test --all
+
+  # Dependency checks against the committed Cargo.lock: RustSec advisories
+  # (vulnerable, unsound, unmaintained or yanked crates), licenses, bans and
+  # sources, as configured in deny.toml.
+  supply-chain:
+    name: cargo-deny + cargo-audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
+        with:
+          toolchain: "1.88.0"
+
+      # Prebuilt binaries, checksum-verified by the action, so nothing is compiled.
+      - name: Install cargo-deny and cargo-audit
+        uses: taiki-e/install-action@ab6895351a88b908e96a4697860d4ffea5e57dbe # v2.87.27
+        with:
+          tool: cargo-deny@0.20.2,cargo-audit@0.22.2
+
+      - name: cargo deny
+        run: cargo deny --locked check
+
+      - name: cargo audit
+        run: cargo audit --deny warnings

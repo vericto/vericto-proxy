@@ -307,7 +307,8 @@ buffer), or to an empty value to turn it off.
 
 | Variable                          | Default | Description                                      |
 |-----------------------------------|---------|--------------------------------------------------|
-| `VERICTO_API_URL`                   | —       | e.g. `https://api.vericto.com`                     |
+| `VERICTO_API_URL`                   | —       | e.g. `https://api.vericto.com`. Must be `https://` (the API key travels with every request); `http://` only for a loopback host |
+| `VERICTO_ALLOW_INSECURE_API_URL`    | `false` | `true` accepts an `http://` API URL on any host: development stacks only |
 | `VERICTO_API_KEY`                   | —       | Workspace API key (`vtro_...`)                   |
 | `VERICTO_DATABASE_ID`               | —       | UUID of the database record; enables + correlates telemetry |
 | `VERICTO_RULES_SYNC_INTERVAL_SECS`  | `300`   | How often to poll `/sync/rules` (min 30)         |
@@ -462,6 +463,14 @@ docker run --rm \
   -e UPSTREAM_HOST=host.docker.internal \
   -p 3307:3307 \
   ghcr.io/vericto/vericto-proxy:4.5.1
+```
+
+Images released from now on carry a build provenance attestation (Sigstore,
+GitHub Actions) that ties their digest to this repository, the release workflow
+and the commit. Verify one before you deploy it, and deploy by digest:
+
+```bash
+gh attestation verify oci://ghcr.io/vericto/vericto-proxy:<version> --repo vericto/vericto-proxy
 ```
 
 To build the image from this checkout instead:

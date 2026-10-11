@@ -16,6 +16,9 @@
 //!   VERICTO_API_KEY    — workspace API key (vtro_...)
 //!   VERICTO_DATABASE_ID — UUID of the database record in the Vericto platform
 
+// No `unsafe` in the proxy itself; keep it that way without a reviewed opt-out.
+#![forbid(unsafe_code)]
+
 mod config;
 mod tcp;
 mod telemetry;
@@ -75,7 +78,14 @@ async fn main() {
     let readiness = crate::tcp::healthz::Readiness::new();
 
     // Control-plane link (telemetry + rule sync) — optional.
-    let telemetry_sink = match config::ControlPlaneConfig::from_env() {
+    let control_plane = match config::ControlPlaneConfig::from_env() {
+        Ok(cp) => cp,
+        Err(e) => {
+            tracing::error!("{e}");
+            std::process::exit(1);
+        }
+    };
+    let telemetry_sink = match control_plane {
         Some(cp) => {
             tracing::info!(
                 buffer = ?cp.buffer_mode,

@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- **The API key only goes to an `https://` control plane.** The proxy refuses to
+  start when `VERICTO_API_URL` is `http://` on a host other than loopback, unless
+  `VERICTO_ALLOW_INSECURE_API_URL=true` (development stacks). Requests that carry
+  the key follow redirects only within the same origin.
+- **The telemetry spool is private to the proxy's user.** With
+  `VERICTO_TELEMETRY_BUFFER=disk` the spool directory is `0700` and its files
+  `0600` (they were created with the process umask). Enforcing the spool's
+  capacity no longer lists the directory for every event.
+- **Log lines show queries without their values.** The preview of a blocked or
+  masked query in the proxy's log has its literals replaced, as sanitized
+  telemetry does, whatever the workspace's reporting mode.
+
 ## [4.8.1] — 2026-10-10
 
 Requires vericto-engine v3.8.1. Adopts its dialect-aware name semantics for the

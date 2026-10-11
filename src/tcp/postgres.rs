@@ -355,14 +355,22 @@ async fn intercept_client_to_server(
     .await
 }
 
-pub(crate) fn log_block(sql: &str, rule_code: &str, ast_node_path: &str) {
-    let preview: String = sql.chars().take(80).collect();
+pub(crate) fn log_block(sql: &str, dialect: Dialect, rule_code: &str, ast_node_path: &str) {
     tracing::info!(
         rule_code,
         ast_node_path,
-        query_preview = %preview,
+        query_preview = %log_preview(sql, dialect),
         "Query BLOCKED at TCP proxy"
     );
+}
+
+/// The start of a statement for a log line, with its literals replaced as in
+/// sanitized telemetry, whatever the workspace's reporting mode. Logs are read
+/// by whoever operates the host and are often shipped elsewhere, and a query's
+/// values (emails, tokens, the very data a mask hides) do not belong in them;
+/// the statement's shape is what an operator needs to recognise it.
+pub(crate) fn log_preview(sql: &str, dialect: Dialect) -> String {
+    sanitize_for(sql, dialect).chars().take(80).collect()
 }
 
 /// Textual representation of an enforcement action for telemetry.
@@ -1399,6 +1407,28 @@ mod tests {
         assert_eq!(
             ev.rewritten_query.as_deref(),
             Some("SELECT CONCAT(?, RIGHT(`card`, ?)) AS `card` FROM customers WHERE name = ?")
+        );
+    }
+
+    /// Log previews never carry a literal, in either dialect.
+    #[test]
+    fn log_preview_has_no_literals() {
+        let pg = log_preview(
+            "UPDATE users SET email = 'alice@acme.com' WHERE id = 42",
+            Dialect::Postgres,
+        );
+        assert!(!pg.contains("alice@acme.com") && !pg.contains("42"), "{pg}");
+        assert!(pg.starts_with("UPDATE users SET email"), "{pg}");
+        let my = log_preview(
+            "DELETE FROM t WHERE token = \"s3cr3t\" OR 1",
+            Dialect::Mysql,
+        );
+        assert!(!my.contains("s3cr3t"), "{my}");
+        assert!(
+            log_preview(&"x".repeat(500), Dialect::Mysql)
+                .chars()
+                .count()
+                <= 80
         );
     }
 
