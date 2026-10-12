@@ -762,10 +762,8 @@ fn is_system_schema(s: &str) -> bool {
 /// Lowercased words the MySQL lexer reads as identifiers or keywords (bare or
 /// backticked; not `"…"` or `'…'`), or `None` when the text does not lex.
 fn mysql_identifier_words(sql: &str) -> Option<std::collections::HashSet<String>> {
-    use sqlparser::tokenizer::{Token, Tokenizer};
-    let tokens = Tokenizer::new(&sqlparser::dialect::MySqlDialect {}, sql)
-        .tokenize()
-        .ok()?;
+    use sqlparser::tokenizer::Token;
+    let tokens = crate::tcp::protocol::mysql::mysql_tokens(sql).ok()?;
     Some(
         tokens
             .into_iter()
@@ -845,10 +843,8 @@ fn normalize_for(sql: &str, dialect: Dialect) -> Option<String> {
 /// the caller redacts it rather than report it raw. The token kinds are those
 /// of the sqlparser version pinned with the engine.
 fn normalize_mysql(sql: &str) -> Option<String> {
-    use sqlparser::tokenizer::{Token, Tokenizer, Whitespace};
-    let tokens = Tokenizer::new(&sqlparser::dialect::MySqlDialect {}, sql)
-        .tokenize()
-        .ok()?;
+    use sqlparser::tokenizer::{Token, Whitespace};
+    let tokens = crate::tcp::protocol::mysql::mysql_tokens(sql).ok()?;
     let mut out = String::with_capacity(sql.len());
     for t in &tokens {
         match t {
@@ -867,6 +863,8 @@ fn normalize_mysql(sql: &str) -> Option<String> {
             | Token::TripleSingleQuotedRawStringLiteral(_)
             | Token::TripleDoubleQuotedRawStringLiteral(_)
             | Token::NationalStringLiteral(_)
+            | Token::QuoteDelimitedStringLiteral(_)
+            | Token::NationalQuoteDelimitedStringLiteral(_)
             | Token::EscapedStringLiteral(_)
             | Token::UnicodeStringLiteral(_)
             | Token::HexStringLiteral(_) => out.push('?'),
