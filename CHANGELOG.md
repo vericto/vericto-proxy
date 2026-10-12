@@ -7,6 +7,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [4.9.0] — 2026-10-12
+
+Requires vericto-engine v3.9.0. No configuration or wire-protocol changes.
+
+### Security
+
+- **RUSTSEC-2024-0449.** vericto-engine 3.8.1 parsed custom-rule YAML with
+  `serde_yaml`, whose `unsafe-libyaml` is unmaintained; since the advisory
+  reached the RustSec database, the proxy's own `cargo deny` and `cargo audit`
+  fail on it. Engine 3.9.0 uses `serde_norway`, the maintained fork, with the
+  same rule syntax and error messages.
+- **Two built-in rules cover more statements, with the engine.** `DROP TRIGGER`
+  is reported by VERICTO-019 and `COPY … FROM` a server-side file by
+  VERICTO-061, on every dialect including PostgreSQL, so a workspace that
+  blocks those rules now blocks these statements too.
+
+### Changed
+
+- **sqlparser 0.63, with the engine.** The engine parses MySQL, Oracle and SQL
+  Server with sqlparser 0.63 instead of 0.52, and the proxy tokenizes MySQL
+  text with the same version. Statements 0.52 could not parse, which the proxy
+  forwarded or blocked according to the workspace's parse-error setting (and
+  blocked under a `block`/`mask` tag or an enforced allowlist), are now judged
+  by the rules: on MySQL, for example, `SET SESSION TRANSACTION …` sent on
+  connect by Django, Hibernate and SQLAlchemy is allowed, index hints and
+  `WITH ROLLUP` are masked like any query, and data-modifying CTEs are
+  evaluated. Statement kinds the engine does not model still resolve as parse
+  errors. See the engine's 3.9.0 CHANGELOG for the full list.
+- The proxy's MySQL tokenizer keeps a `/*! … */` comment as a comment, as
+  before: sqlparser 0.63 splices its content into the statement as code,
+  whatever its version number, which would have made `/*!50000 USE x */` move
+  the session's current database for certain and put comment text into
+  sanitized telemetry. A `USE` in such a comment still makes the current
+  database unknown.
+
+### Dependencies
+
+- Routine updates (Dependabot): tokio 1.53.2, tokio-rustls 0.26.6, async-trait
+  0.1.92, serde 1.0.229, serde_json 1.0.151 and uuid 1.26.1. tokio-rustls 0.26.6
+  propagates a transport error on a TLS stream at the next read (0.26.5, never
+  shipped here, could swallow it); no API or MSRV change (Rust 1.88).
+
+### CI
+
+- GitHub Actions updates (Dependabot), still pinned by SHA: actions/cache 6.1.0,
+  actions/upload-artifact 7.0.2, actions/download-artifact 8.0.2,
+  docker/login-action 4.6.0 and docker/build-push-action 7.4.0. They run on
+  Node 24; the release image keeps the same tags, labels and per-arch build
+  (no build-time provenance), with the provenance attestation added in 4.8.2.
+
 ## [4.8.2] — 2026-10-11
 
 Security release from the 2026-10 review. Requires vericto-engine v3.8.1 (unchanged).
