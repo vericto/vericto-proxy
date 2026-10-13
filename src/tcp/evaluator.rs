@@ -355,9 +355,7 @@ fn placeholders(sql: &str) -> Option<Vec<i32>> {
 /// (as the server counts them: not inside a string, a quoted identifier or a
 /// comment). `None` when it does not lex.
 fn mysql_placeholders(sql: &str) -> Option<usize> {
-    let tokens = sqlparser::tokenizer::Tokenizer::new(&sqlparser::dialect::MySqlDialect {}, sql)
-        .tokenize()
-        .ok()?;
+    let tokens = crate::tcp::protocol::mysql::mysql_tokens(sql).ok()?;
     Some(
         tokens
             .iter()

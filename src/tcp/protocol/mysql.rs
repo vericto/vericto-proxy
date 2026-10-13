@@ -307,6 +307,85 @@ mod tests {
     }
 }
 
+/// The MySQL tokens of `sql` as the proxy reads them: every `/*! … */`
+/// comment stays one comment token whose text starts with `!`.
+///
+/// Since sqlparser 0.61 the MySQL tokenizer splices the content of such a
+/// comment into the token stream as code, whatever its version number
+/// (`/*!99999 … */`, which no server runs, included). The callers decide on
+/// what MySQL runs, so they must see the comment as such: the comment starts
+/// are found by tokenizing the text with every `/*!` turned into `/* ` (same
+/// length), and only those `!` are blanked for the real tokenization, so a
+/// `/*!` inside a string or a quoted identifier is left alone.
+pub(crate) fn mysql_tokens(
+    sql: &str,
+) -> Result<Vec<sqlparser::tokenizer::Token>, sqlparser::tokenizer::TokenizerError> {
+    use sqlparser::dialect::MySqlDialect;
+    use sqlparser::tokenizer::{Token, Tokenizer, Whitespace};
+    let d = MySqlDialect {};
+    if !sql.contains("/*!") {
+        return Tokenizer::new(&d, sql).tokenize();
+    }
+    let comment_starts = |text: &str| -> Result<Vec<usize>, _> {
+        let toks = Tokenizer::new(&d, text).tokenize_with_location()?;
+        let offs = byte_offsets(text, &toks);
+        Ok(toks
+            .iter()
+            .zip(offs)
+            .filter(|(t, o)| {
+                matches!(t.token, Token::Whitespace(Whitespace::MultiLineComment(_)))
+                    && sql[*o..].starts_with("/*!")
+            })
+            .map(|(_, o)| o)
+            .collect())
+    };
+    let starts = comment_starts(&sql.replace("/*!", "/* "))?;
+    let mut text = sql.as_bytes().to_vec();
+    for &o in &starts {
+        text[o + 2] = b' ';
+    }
+    // Only an ASCII `!` became an ASCII space.
+    let text = String::from_utf8(text).unwrap_or_else(|_| sql.to_string());
+    let toks = Tokenizer::new(&d, &text).tokenize_with_location()?;
+    let offs = byte_offsets(&text, &toks);
+    Ok(toks
+        .into_iter()
+        .zip(offs)
+        .map(|(t, o)| match t.token {
+            Token::Whitespace(Whitespace::MultiLineComment(c)) if starts.contains(&o) => {
+                Token::Whitespace(Whitespace::MultiLineComment(format!(
+                    "!{}",
+                    c.get(1..).unwrap_or_default()
+                )))
+            }
+            other => other,
+        })
+        .collect())
+}
+
+/// Byte offset of every token start (the tokenizer's locations are 1-based
+/// line and character column).
+fn byte_offsets(sql: &str, toks: &[sqlparser::tokenizer::TokenWithSpan]) -> Vec<usize> {
+    let mut out = Vec::with_capacity(toks.len());
+    let mut chars = sql.char_indices().peekable();
+    let (mut line, mut col) = (1u64, 1u64);
+    for t in toks {
+        let want = (t.span.start.line, t.span.start.column);
+        while (line, col) < want {
+            match chars.next() {
+                Some((_, '\n')) => {
+                    line += 1;
+                    col = 1;
+                }
+                Some(_) => col += 1,
+                None => break,
+            }
+        }
+        out.push(chars.peek().map_or(sql.len(), |(b, _)| *b));
+    }
+    out
+}
+
 /// Where a `USE` in a COM_QUERY moves the session's current database.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum UseTarget {
@@ -324,12 +403,11 @@ pub(crate) enum UseTarget {
 /// cannot be sure: a `/*! … */` comment mentioning `use`, or text the
 /// tokenizer rejects that does, makes the database unknown.
 pub(crate) fn sql_use_target(sql: &str) -> Option<UseTarget> {
-    use sqlparser::dialect::MySqlDialect;
     use sqlparser::keywords::Keyword;
-    use sqlparser::tokenizer::{Token, Tokenizer, Whitespace};
+    use sqlparser::tokenizer::{Token, Whitespace};
 
     let mentions_use = |s: &str| s.to_ascii_lowercase().contains("use");
-    let Ok(tokens) = Tokenizer::new(&MySqlDialect {}, sql).tokenize() else {
+    let Ok(tokens) = mysql_tokens(sql) else {
         return mentions_use(sql).then_some(UseTarget::Unknown);
     };
     let mut target = None;
@@ -384,6 +462,32 @@ mod use_tests {
         );
         assert_eq!(
             sql_use_target("USE 'unterminated"),
+            Some(UseTarget::Unknown)
+        );
+    }
+
+    /// sqlparser 0.61+ splices `/*! … */` into the tokens; the proxy still
+    /// sees one comment, and literals are left as they are.
+    #[test]
+    fn executable_comments_stay_comments() {
+        use sqlparser::tokenizer::{Token, Whitespace};
+        let toks = super::mysql_tokens("SELECT id, /*! email, */ id FROM customers").unwrap();
+        assert!(
+            toks.contains(&Token::Whitespace(Whitespace::MultiLineComment(
+                "! email, ".into()
+            )))
+        );
+        assert!(
+            !toks
+                .iter()
+                .any(|t| matches!(t, Token::Word(w) if w.value == "email"))
+        );
+        let toks =
+            super::mysql_tokens("SELECT '/* not a comment */', '-- nor this', '# nor this' FROM t")
+                .unwrap();
+        assert!(toks.contains(&Token::SingleQuotedString("/* not a comment */".into())));
+        assert_eq!(
+            sql_use_target("/*!50000 USE x */; SELECT 1"),
             Some(UseTarget::Unknown)
         );
     }
