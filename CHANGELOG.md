@@ -7,6 +7,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [4.11.0] — 2026-10-14
+
+Telemetry delivery keeps up with the proxy's traffic. On staging (PostgreSQL
+benchmark, 650–1,500 statements per second) 4.9.1 delivered ~114 events per
+second: one request of 100 events at a time, each waiting ~700 ms for the API,
+so the disk spool filled and evicted ~86% of the events. No wire-protocol
+changes and nothing changes on the query path. Pairs with the Vericto API's
+bulk, queued ingest; works with an older API too (see gzip below).
+
+### Changed
+
+- **Batches of 500, sent when full or when 5 s old.** A batch goes as soon as
+  `VERICTO_TELEMETRY_BATCH_SIZE` events (default now 500, from 100, and capped
+  at 500, what `/api/v1/ingest/events` accepts) are pending, or when the oldest
+  pending event has waited `VERICTO_TELEMETRY_FLUSH_SECS` (default 5),
+  whichever comes first. Before, the reporter woke every 5 s.
+- **Up to 4 requests in flight** (`VERICTO_TELEMETRY_MAX_IN_FLIGHT`). The
+  queue hands each batch events no other undelivered batch holds, and an event
+  leaves the buffer (disk spool or memory) only when the request that carried
+  it was answered 2xx, in whatever order the answers arrive; a failed batch is
+  offered again without resending the ones around it. After a restart, whatever
+  was not acknowledged is sent again (at-least-once, as before).
+- **Retries back off exponentially** (`VERICTO_TELEMETRY_RETRY_BASE_MS`, 1 s,
+  doubling to `VERICTO_TELEMETRY_RETRY_MAX_SECS`, 60 s) instead of every tick.
+- **A 413 splits the batch** in halves until the parts fit, instead of dropping
+  it. 415 is now a permanent refusal like 400 and 422.
+
+### Added
+
+- **gzip request bodies** (`Content-Encoding: gzip`, `VERICTO_TELEMETRY_GZIP`,
+  on by default). If the API refuses a compressed body (400 or 415) and accepts
+  the same events uncompressed, the proxy sends uncompressed from then on, so
+  4.11.0 against an API without gzip support loses nothing.
+- `Telemetry pipeline stats` also logs delivered events, requests, retries,
+  events refused permanently, requests in flight and request times.
+
+### Dependencies
+
+- `flate2` 1 (MIT OR Apache-2.0), already in the lockfile through `mysql_async`,
+  now a direct dependency for the gzip bodies.
+
 ## [4.10.0] — 2026-10-13
 
 Requires vericto-engine v4.0.0 (from v3.9.0). No wire-protocol changes, and

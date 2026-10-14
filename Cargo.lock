@@ -2580,12 +2580,13 @@ dependencies = [
 
 [[package]]
 name = "vericto-proxy"
-version = "4.10.0"
+version = "4.11.0"
 dependencies = [
  "arc-swap",
  "async-trait",
  "axum",
  "chrono",
+ "flate2",
  "mysql_async",
  "pg_query",
  "reqwest",
