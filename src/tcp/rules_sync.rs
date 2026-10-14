@@ -299,7 +299,15 @@ fn apply_proxy_config(
             (proto.as_str(), dialect),
             ("postgres", "postgres") | ("mysql", "mysql")
         );
-        if !expected {
+        if dialect.eq_ignore_ascii_case("snowflake") {
+            tracing::warn!(
+                wire_protocol = %proto,
+                dashboard_dialect = %dialect,
+                "The dashboard registers this database as Snowflake, which has no TCP wire \
+                 protocol: no proxy can front it. Check its SQL through the Vericto HTTP API, \
+                 the CLI or MCP, and point this proxy at a Postgres or MySQL database."
+            );
+        } else if !expected {
             tracing::warn!(
                 wire_protocol = %proto,
                 dashboard_dialect = %dialect,

@@ -43,6 +43,13 @@ async fn main() {
     // is used (upstream TLS client + telemetry/rule-sync HTTPS). Idempotent.
     let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
 
+    if let Ok(wire_protocol) = std::env::var("VERICTO_WIRE_PROTOCOL")
+        && let Err(e) = config::check_wire_protocol(&wire_protocol)
+    {
+        tracing::error!("{e}");
+        std::process::exit(1);
+    }
+
     let Some(tcp_opts) = tcp::TcpProxyOptions::from_env() else {
         tracing::error!(
             "UPSTREAM_HOST is not set — vericto-proxy requires a database upstream to proxy to. \

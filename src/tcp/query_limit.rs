@@ -47,7 +47,7 @@ pub fn dialect_cap(dialect: Dialect) -> usize {
         Dialect::Mysql => MYSQL_MAX_PACKET_LEN,
         // Not served over the wire by this proxy; use the stricter cap so a
         // future protocol cannot silently inherit the most permissive one.
-        Dialect::Oracle | Dialect::MsSql => MYSQL_MAX_PACKET_LEN,
+        _ => MYSQL_MAX_PACKET_LEN,
     }
 }
 
@@ -184,6 +184,7 @@ mod tests {
             Dialect::Mysql,
             Dialect::Oracle,
             Dialect::MsSql,
+            Dialect::Snowflake,
         ] {
             assert!(
                 DEFAULT_MAX_QUERY_BYTES <= dialect_cap(dialect),

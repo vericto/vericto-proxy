@@ -195,6 +195,24 @@ pub fn check_api_url(api_url: &str, allow_insecure: bool) -> Result<(), String> 
     }
 }
 
+/// `VERICTO_WIRE_PROTOCOL` names the database protocol this proxy speaks. A
+/// Snowflake value is a configuration error, not a fallback: Snowflake has no
+/// TCP wire protocol a proxy could sit on (clients reach it over HTTPS), so the
+/// proxy would otherwise start as a Postgres proxy in front of nothing it can
+/// serve. Snowflake SQL is checked through the HTTP API, the CLI or MCP instead.
+pub fn check_wire_protocol(value: &str) -> Result<(), String> {
+    if value.trim().eq_ignore_ascii_case("snowflake") {
+        return Err(
+            "VERICTO_WIRE_PROTOCOL=snowflake is not supported: Snowflake has no TCP wire \
+             protocol for vericto-proxy to front. Check Snowflake SQL through the Vericto \
+             HTTP API, the CLI or MCP instead, and set VERICTO_WIRE_PROTOCOL to postgres or mysql \
+             for a proxy."
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
 fn is_loopback(url: &reqwest::Url) -> bool {
     url.host_str().is_some_and(|host| {
         host.eq_ignore_ascii_case("localhost")
@@ -282,6 +300,18 @@ mod tests {
         assert!(check_api_url("http://api:4000", true).is_ok());
         assert!(check_api_url("ftp://api.vericto.com", true).is_err());
         assert!(check_api_url("api.vericto.com", false).is_err());
+    }
+
+    #[test]
+    fn snowflake_wire_protocol_is_a_config_error() {
+        for value in ["snowflake", "Snowflake", " SNOWFLAKE "] {
+            let err = check_wire_protocol(value).expect_err(value);
+            assert!(err.contains("Snowflake has no TCP wire"), "{err}");
+            assert!(err.contains("HTTP API, the CLI or MCP"), "{err}");
+        }
+        for value in ["postgres", "mysql"] {
+            assert!(check_wire_protocol(value).is_ok(), "{value}");
+        }
     }
 
     /// The API key never follows a redirect to another origin: the client

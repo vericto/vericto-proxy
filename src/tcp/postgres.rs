@@ -386,12 +386,7 @@ fn action_str(action: EnforcementAction) -> &'static str {
 /// (and accepted back by `Dialect::parse_dialect`). Reported verbatim in
 /// telemetry so the dashboard reflects the wire protocol the proxy is fronting.
 fn dialect_name(dialect: Dialect) -> &'static str {
-    match dialect {
-        Dialect::Postgres => "postgres",
-        Dialect::Mysql => "mysql",
-        Dialect::Oracle => "oracle",
-        Dialect::MsSql => "mssql",
-    }
+    dialect.as_str()
 }
 
 /// Who issued a query, for its telemetry event: the session's database user and,
