@@ -41,12 +41,87 @@ pub struct ControlPlaneConfig {
     /// Max undelivered events kept (memory ring, or the disk spool) before the
     /// oldest are dropped.
     pub memory_capacity: usize,
-    /// Max events flushed in one POST /ingest/events batch.
+    /// Max events in one POST /ingest/events batch, and the number of pending
+    /// events that triggers a send. `VERICTO_TELEMETRY_BATCH_SIZE`, default 500,
+    /// at most [`MAX_INGEST_BATCH`].
     pub batch_size: usize,
-    /// How often the reporter flushes the buffer.
+    /// Longest the oldest pending event waits before a partial batch is sent.
+    /// `VERICTO_TELEMETRY_FLUSH_SECS`, default 5.
     pub flush_interval: Duration,
     /// How the disk spool is fed and how long shutdown may take to flush it.
     pub spool: SpoolTuning,
+    /// How batches are sent: concurrency, compression, retry backoff.
+    pub delivery: DeliveryTuning,
+}
+
+/// The most events `/api/v1/ingest/events` accepts in one request: a larger batch
+/// is refused (400) as a whole, so `VERICTO_TELEMETRY_BATCH_SIZE` is capped here.
+pub const MAX_INGEST_BATCH: usize = 500;
+
+/// How the reporter sends batches (since 4.11.0).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeliveryTuning {
+    /// POSTs in flight at once. `VERICTO_TELEMETRY_MAX_IN_FLIGHT`, default 4.
+    pub max_in_flight: usize,
+    /// Send the body gzip-compressed (`Content-Encoding: gzip`).
+    /// `VERICTO_TELEMETRY_GZIP`, default true. Turned off for the rest of the
+    /// process if the API refuses a compressed body that it accepts uncompressed.
+    pub gzip: bool,
+    /// First wait after a retryable failure; doubles on each consecutive one.
+    /// `VERICTO_TELEMETRY_RETRY_BASE_MS`, default 1000.
+    pub retry_base: Duration,
+    /// Longest wait between retries. `VERICTO_TELEMETRY_RETRY_MAX_SECS`, default 60.
+    pub retry_max: Duration,
+}
+
+impl Default for DeliveryTuning {
+    fn default() -> Self {
+        Self {
+            max_in_flight: 4,
+            gzip: true,
+            retry_base: Duration::from_millis(1000),
+            retry_max: Duration::from_secs(60),
+        }
+    }
+}
+
+impl DeliveryTuning {
+    fn from_env() -> Self {
+        let d = Self::default();
+        let retry_base = env_u64("VERICTO_TELEMETRY_RETRY_BASE_MS")
+            .map(|ms| Duration::from_millis(ms.max(1)))
+            .unwrap_or(d.retry_base);
+        Self {
+            max_in_flight: env_usize("VERICTO_TELEMETRY_MAX_IN_FLIGHT")
+                .unwrap_or(d.max_in_flight)
+                .clamp(1, 64),
+            gzip: std::env::var("VERICTO_TELEMETRY_GZIP")
+                .map(|v| !matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false" | "no"))
+                .unwrap_or(d.gzip),
+            retry_base,
+            retry_max: env_u64("VERICTO_TELEMETRY_RETRY_MAX_SECS")
+                .map(Duration::from_secs)
+                .unwrap_or(d.retry_max)
+                .max(retry_base),
+        }
+    }
+}
+
+/// `VERICTO_TELEMETRY_BATCH_SIZE`, between 1 and [`MAX_INGEST_BATCH`]; a larger
+/// value is lowered with a warning rather than having every batch refused.
+fn batch_size_from(value: Option<usize>) -> usize {
+    match value {
+        Some(v) if v > MAX_INGEST_BATCH => {
+            tracing::warn!(
+                configured = v,
+                maximum = MAX_INGEST_BATCH,
+                "VERICTO_TELEMETRY_BATCH_SIZE is above what the API accepts in one request; using the maximum"
+            );
+            MAX_INGEST_BATCH
+        }
+        Some(v) => v.max(1),
+        None => MAX_INGEST_BATCH,
+    }
 }
 
 /// Tuning of the asynchronous telemetry pipeline (since 4.9.1).
@@ -165,11 +240,12 @@ impl ControlPlaneConfig {
             buffer_mode,
             disk_spool_path,
             memory_capacity: env_usize("VERICTO_TELEMETRY_MEMORY_CAPACITY").unwrap_or(10_000),
-            batch_size: env_usize("VERICTO_TELEMETRY_BATCH_SIZE").unwrap_or(100),
+            batch_size: batch_size_from(env_usize("VERICTO_TELEMETRY_BATCH_SIZE")),
             flush_interval: Duration::from_secs(
-                env_u64("VERICTO_TELEMETRY_FLUSH_SECS").unwrap_or(5),
+                env_u64("VERICTO_TELEMETRY_FLUSH_SECS").unwrap_or(5).max(1),
             ),
             spool: SpoolTuning::from_env(),
+            delivery: DeliveryTuning::from_env(),
         }))
     }
 }
@@ -288,6 +364,25 @@ fn env_usize(key: &str) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The API refuses a batch of more than 500 events as a whole (400, dropped),
+    /// so a larger setting is lowered instead of losing every batch.
+    #[test]
+    fn telemetry_batch_size_defaults_to_and_is_capped_at_the_api_limit() {
+        assert_eq!(batch_size_from(None), 500);
+        assert_eq!(batch_size_from(Some(100)), 100);
+        assert_eq!(batch_size_from(Some(5_000)), MAX_INGEST_BATCH);
+        assert_eq!(batch_size_from(Some(0)), 1);
+    }
+
+    #[test]
+    fn delivery_defaults() {
+        let d = DeliveryTuning::default();
+        assert_eq!(d.max_in_flight, 4);
+        assert!(d.gzip);
+        assert_eq!(d.retry_base, Duration::from_secs(1));
+        assert_eq!(d.retry_max, Duration::from_secs(60));
+    }
 
     #[test]
     fn api_url_must_be_https_unless_loopback_or_allowed() {

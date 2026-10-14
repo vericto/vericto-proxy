@@ -317,8 +317,12 @@ buffer), or to an empty value to turn it off.
 | `VERICTO_TELEMETRY_DISK_PATH`       | `/var/lib/vericto/spool` | Spool dir when buffer=disk        |
 | `VERICTO_RULES_CACHE_PATH`          | `<spool dir>/.rules-cache` with buffer=disk, else off | Last-good ruleset kept for restarts; empty = off |
 | `VERICTO_TELEMETRY_MEMORY_CAPACITY` | `10000` | Max undelivered events: the memory ring buffer, or the disk spool with buffer=disk (oldest dropped past it) |
-| `VERICTO_TELEMETRY_BATCH_SIZE`      | `100`   | Max events per POST `/ingest/events`             |
-| `VERICTO_TELEMETRY_FLUSH_SECS`      | `5`     | How often the reporter flushes                   |
+| `VERICTO_TELEMETRY_BATCH_SIZE`      | `500`   | Max events per POST `/ingest/events` (at most 500, the API's limit); this many pending events trigger a send |
+| `VERICTO_TELEMETRY_FLUSH_SECS`      | `5`     | Longest the oldest pending event waits before a partial batch is sent (whichever comes first with the batch size) |
+| `VERICTO_TELEMETRY_MAX_IN_FLIGHT`   | `4`     | POSTs outstanding at once (1–64)                 |
+| `VERICTO_TELEMETRY_GZIP`            | `true`  | gzip request bodies (`Content-Encoding: gzip`); turned off automatically if the API refuses them |
+| `VERICTO_TELEMETRY_RETRY_BASE_MS`   | `1000`  | First wait after a retryable delivery failure; doubles per consecutive failure |
+| `VERICTO_TELEMETRY_RETRY_MAX_SECS`  | `60`    | Longest wait between delivery retries            |
 | `VERICTO_TELEMETRY_QUEUE_CAPACITY`  | `2048`  | buffer=disk: events queued in memory for the spool writer; past it new events are dropped and counted, queries never wait |
 | `VERICTO_TELEMETRY_SPOOL_FLUSH_MS`  | `50`    | buffer=disk: longest an event waits before its batch is written and fsynced |
 | `VERICTO_TELEMETRY_SPOOL_BATCH_MAX` | `1000`  | buffer=disk: most events per spool file (one write and fsync) |
@@ -331,7 +335,17 @@ adds no latency to queries. An event reaches the disk at most
 `VERICTO_TELEMETRY_SPOOL_FLUSH_MS` after its statement ran; a crash (not a
 SIGTERM) inside that window loses those events. The proxy logs
 `Telemetry pipeline stats` every minute while there is activity: queue depth,
-spooled events, dropped events and the batch write time.
+spooled events, dropped events and the batch write time, and the delivery side:
+events delivered, requests, retries, events refused permanently, requests in
+flight and the last and longest request time.
+
+Delivery (since 4.11.0) sends a batch as soon as `VERICTO_TELEMETRY_BATCH_SIZE`
+events are pending, or when the oldest has waited `VERICTO_TELEMETRY_FLUSH_SECS`,
+with up to `VERICTO_TELEMETRY_MAX_IN_FLIGHT` requests outstanding. An event leaves
+the buffer only when the request that carried it is answered 2xx, whatever order the
+answers arrive in; a retryable failure (network, 5xx, 429, 401/403) keeps the batch
+for a later attempt with exponential backoff, a 413 splits the batch, and a
+payload the API refuses (400, 415, 422) is dropped and logged at `error`.
 
 ### TLS (optional)
 

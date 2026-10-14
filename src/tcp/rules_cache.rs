@@ -181,6 +181,7 @@ mod tests {
             batch_size: 10,
             flush_interval: Duration::from_secs(5),
             spool: crate::config::SpoolTuning::default(),
+            delivery: crate::config::DeliveryTuning::default(),
         }
     }
 

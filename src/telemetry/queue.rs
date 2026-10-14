@@ -29,6 +29,17 @@
 //!   segment names carry a monotonic sequence number and their event count.
 //! - Single-event `*.json` files left by earlier versions are read back as
 //!   segments of one event, oldest first, so an upgrade loses nothing.
+//!
+//! ## Batches in flight (since 4.11.0)
+//!
+//! The reporter keeps several requests outstanding, so `drain_batch` is called
+//! again before earlier batches are settled. Each segment records the line ranges
+//! batches hold (`leased`) and the ranges acked ahead of an earlier, still
+//! unanswered batch (`acked`). A drain skips held lines, so two batches never carry
+//! the same event; an ack folds its range into the delivered prefix once every
+//! range before it is acked too, and a segment is removed only when all of it is;
+//! a nack releases its range for the next drain. None of this is on disk: after a
+//! restart, whatever was not fully delivered is sent again (at-least-once).
 
 use std::collections::VecDeque;
 use std::fs;
@@ -57,10 +68,11 @@ pub struct Batch {
     spans: Vec<Span>,
 }
 
-/// The part of one spool segment a batch carries: its lines up to `end`.
-#[derive(Debug, Clone, Copy)]
+/// The part of one spool segment a batch carries: its lines `start..end`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Span {
     id: u64,
+    start: usize,
     end: usize,
 }
 
@@ -92,13 +104,19 @@ pub struct QueueStats {
 pub trait EventQueue: Send + Sync {
     /// Enqueue an event. Never blocks and never does I/O; drops when full.
     fn push(&self, event: TelemetryEvent);
-    /// Take up to `max` events for delivery.
+    /// Take up to `max` events for delivery. Several batches may be out at once:
+    /// a batch never contains an event another undelivered batch holds, and the
+    /// events of a batch stay buffered until it is acked.
     fn drain_batch(&self, max: usize) -> Batch;
-    /// Confirm a batch was delivered (removes it durably for disk mode).
+    /// Confirm a batch was delivered (removes it durably for disk mode). Batches
+    /// may be acked in any order.
     fn ack(&self, batch: &Batch);
     /// Return events to the queue when delivery failed (memory mode re-buffers;
-    /// disk mode leaves the segments in place so they retry next cycle).
+    /// disk mode releases the batch's lines, which the next drain offers again).
     fn nack(&self, batch: Batch);
+    /// Events a `drain_batch` could hand out now: buffered and not held by a
+    /// batch in flight.
+    fn available(&self) -> usize;
     /// Current counters.
     fn stats(&self) -> QueueStats;
     /// Persist everything accepted before this call, waiting at most `timeout`.
@@ -252,6 +270,10 @@ impl EventQueue for MemoryQueue {
         }
     }
 
+    fn available(&self) -> usize {
+        self.inner.lock().unwrap().len()
+    }
+
     fn stats(&self) -> QueueStats {
         QueueStats {
             queue_depth: self.inner.lock().unwrap().len(),
@@ -336,6 +358,9 @@ struct DiskShared {
     capacity: usize,
     queue_capacity: usize,
     index: Mutex<SpoolIndex>,
+    /// Serializes `drain_batch`: between reading a segment and recording what it
+    /// took, no other drain may hand out the same lines.
+    drain_lock: Mutex<()>,
     /// The segment `drain_batch` read last (ids are never reused).
     head_cache: Mutex<Option<(u64, Arc<Vec<u8>>)>>,
     /// Events accepted by `push` and not yet written (or lost) by the writer.
@@ -372,11 +397,79 @@ struct Segment {
     /// restart a partly delivered segment is sent again from its start, which is
     /// what at-least-once allows.
     delivered: usize,
+    /// Line ranges held by batches in flight (since 4.11.0, several at once).
+    leased: Vec<(usize, usize)>,
+    /// Line ranges past `delivered` already acked: a later batch can be acked
+    /// before an earlier one. Folded into `delivered` once the gap closes.
+    acked: Vec<(usize, usize)>,
+}
+
+/// Lines of `ranges` below `limit`.
+fn lines_below(ranges: &[(usize, usize)], limit: usize) -> usize {
+    ranges
+        .iter()
+        .map(|&(a, b)| b.min(limit).saturating_sub(a))
+        .sum()
 }
 
 impl Segment {
+    fn new(id: u64, path: PathBuf, count: usize) -> Self {
+        Self {
+            id,
+            path,
+            count,
+            delivered: 0,
+            leased: Vec::new(),
+            acked: Vec::new(),
+        }
+    }
+
+    /// Undelivered events (in flight or not).
     fn remaining(&self) -> usize {
-        self.count.saturating_sub(self.delivered)
+        self.count
+            .saturating_sub(self.delivered)
+            .saturating_sub(lines_below(&self.acked, self.count))
+    }
+
+    /// Undelivered events not held by a batch in flight.
+    fn available(&self) -> usize {
+        self.remaining()
+            .saturating_sub(lines_below(&self.leased, self.count))
+    }
+
+    fn release(&mut self, span: &Span) {
+        if let Some(pos) = self
+            .leased
+            .iter()
+            .position(|&r| r == (span.start, span.end))
+        {
+            self.leased.swap_remove(pos);
+        }
+    }
+
+    /// Marks `span` delivered and advances `delivered` over every acked range
+    /// that now touches it.
+    fn ack(&mut self, span: &Span) {
+        self.release(span);
+        if span.end > self.delivered {
+            self.acked.push((span.start.max(self.delivered), span.end));
+        }
+        self.acked.sort_unstable();
+        let mut i = 0;
+        while i < self.acked.len() {
+            let (a, b) = self.acked[i];
+            if a <= self.delivered {
+                self.delivered = self.delivered.max(b);
+                self.acked.remove(i);
+                i = 0; // a range past it may touch the new end
+            } else {
+                i += 1;
+            }
+        }
+    }
+
+    fn complete(&self) -> bool {
+        self.delivered >= self.count && self.leased.is_empty()
     }
 }
 
@@ -420,6 +513,7 @@ impl DiskQueue {
             capacity,
             queue_capacity: opts.queue_capacity.max(1),
             index: Mutex::new(index),
+            drain_lock: Mutex::new(()),
             head_cache: Mutex::new(None),
             pending: AtomicUsize::new(0),
             enqueued: AtomicU64::new(0),
@@ -540,12 +634,7 @@ impl SpoolIndex {
         let id = self.next_id;
         self.next_id += 1;
         self.events += count;
-        self.segments.push_back(Segment {
-            id,
-            path,
-            count,
-            delivered: 0,
-        });
+        self.segments.push_back(Segment::new(id, path, count));
     }
 
     fn position(&self, id: u64) -> Option<usize> {
@@ -780,9 +869,13 @@ impl EventQueue for DiskQueue {
 
     fn drain_batch(&self, max: usize) -> Batch {
         let max = max.max(1);
+        let _drain = self.shared.drain_lock.lock().unwrap();
         loop {
-            // Snapshot the head of the index; files are read without the lock.
-            let heads: Vec<(u64, PathBuf, usize, usize)> = {
+            // Snapshot the segments that have lines to hand out; files are read
+            // without the index lock. Lines held by a batch in flight are skipped,
+            // so concurrent batches never carry the same event.
+            #[allow(clippy::type_complexity)]
+            let heads: Vec<(u64, PathBuf, usize, Vec<(usize, usize)>, bool)> = {
                 let index = self.shared.index.lock().unwrap();
                 let mut covered = 0;
                 let mut heads = Vec::new();
@@ -790,8 +883,16 @@ impl EventQueue for DiskQueue {
                     if covered >= max {
                         break;
                     }
-                    covered += seg.remaining();
-                    heads.push((seg.id, seg.path.clone(), seg.delivered, seg.count));
+                    let available = seg.available();
+                    let idle = seg.leased.is_empty();
+                    if available == 0 && !idle {
+                        continue; // all of it is in flight
+                    }
+                    covered += available;
+                    let mut taken: Vec<(usize, usize)> =
+                        seg.leased.iter().chain(seg.acked.iter()).copied().collect();
+                    taken.push((0, seg.delivered));
+                    heads.push((seg.id, seg.path.clone(), seg.count, taken, idle));
                 }
                 heads
             };
@@ -799,7 +900,7 @@ impl EventQueue for DiskQueue {
                 events: Vec::new(),
                 spans: Vec::new(),
             };
-            for (id, path, delivered, count) in heads {
+            for (id, path, count, taken, idle) in heads {
                 if batch.events.len() >= max {
                     break;
                 }
@@ -822,11 +923,14 @@ impl EventQueue for DiskQueue {
                         continue;
                     }
                 };
+                let is_taken = |i: usize| taken.iter().any(|&(a, b)| a <= i && i < b);
+                let mut runs: Vec<(usize, usize)> = Vec::new();
                 let mut line_no = 0;
                 let mut full = false;
                 let valid_before = batch.events.len();
                 for line in bytes.split(|b| *b == b'\n').filter(|l| !l.is_empty()) {
-                    if line_no < delivered {
+                    let i = line_no;
+                    if is_taken(i) {
                         line_no += 1;
                         continue;
                     }
@@ -834,26 +938,48 @@ impl EventQueue for DiskQueue {
                         full = true;
                         break;
                     }
+                    match runs.last_mut() {
+                        Some(run) if run.1 == i => run.1 = i + 1,
+                        _ => runs.push((i, i + 1)),
+                    }
                     match serde_json::from_slice::<TelemetryEvent>(line) {
                         Ok(ev) => batch.events.push(ev),
-                        // A line that does not parse is discarded with the batch's
-                        // ack, like an unreadable file, and for the same reason.
+                        // A line that does not parse is carried by the batch (and
+                        // retired with its ack) without being sent, like an
+                        // unreadable file, and for the same reason.
                         Err(e) => {
-                            tracing::error!(file = %path.display(), line = line_no + 1, error = %e, "Telemetry spool event failed to deserialize; discarding so the queue can advance")
+                            tracing::error!(file = %path.display(), line = i + 1, error = %e, "Telemetry spool event failed to deserialize; discarding so the queue can advance")
                         }
                     }
                     line_no += 1;
                 }
-                if !full && batch.events.len() == valid_before {
-                    // Nothing left in it that can be delivered: gone now, not at
+                if !full && idle && batch.events.len() == valid_before {
+                    // Nothing left in it that can be delivered (only lines that do
+                    // not parse, or none) and nothing in flight: gone now, not at
                     // the next ack, so it cannot sit at the head of the queue.
                     self.shared.discard(id);
                     continue;
                 }
-                // Read to the end: the ack retires the whole segment, even if it
-                // held fewer lines than its name says.
-                let end = if full { line_no } else { line_no.max(count) };
-                batch.spans.push(Span { id, end });
+                if runs.is_empty() {
+                    continue;
+                }
+                // Read to the end: the run that reaches it retires the rest of the
+                // segment too, even if it held fewer lines than its name says.
+                if !full {
+                    if let Some(last) = runs.last_mut() {
+                        if last.1 == line_no {
+                            last.1 = line_no.max(count);
+                        }
+                    }
+                }
+                let mut index = self.shared.index.lock().unwrap();
+                let pos = index.position(id);
+                for (start, end) in runs {
+                    batch.spans.push(Span { id, start, end });
+                    if let Some(pos) = pos {
+                        index.segments[pos].leased.push((start, end));
+                    }
+                }
             }
             if batch.events.is_empty() && !batch.spans.is_empty() {
                 // Nothing deliverable in what was read (only bad lines): retire it
@@ -877,9 +1003,9 @@ impl EventQueue for DiskQueue {
                 };
                 let seg = &mut index.segments[pos];
                 let before = seg.remaining();
-                seg.delivered = seg.delivered.max(span.end);
+                seg.ack(span);
                 let after = seg.remaining();
-                let complete = after == 0;
+                let complete = seg.complete();
                 index.events = index.events.saturating_sub(before - after);
                 if complete {
                     if let Some(seg) = index.segments.remove(pos) {
@@ -897,8 +1023,20 @@ impl EventQueue for DiskQueue {
         }
     }
 
-    fn nack(&self, _batch: Batch) {
-        // Leave segments in place; they retry on the next flush cycle.
+    fn nack(&self, batch: Batch) {
+        // The segments stay in place; their lines are released, so the next
+        // drain offers them again (oldest first).
+        let mut index = self.shared.index.lock().unwrap();
+        for span in &batch.spans {
+            if let Some(pos) = index.position(span.id) {
+                index.segments[pos].release(span);
+            }
+        }
+    }
+
+    fn available(&self) -> usize {
+        let index = self.shared.index.lock().unwrap();
+        index.segments.iter().map(Segment::available).sum()
     }
 
     fn stats(&self) -> QueueStats {
@@ -1513,6 +1651,150 @@ mod tests {
         assert_eq!(s.enqueued, 10);
         assert_eq!(s.evicted_oldest, 7);
         assert_eq!(drain_ids(&q, 10), vec!["m7", "m8", "m9"]);
+    }
+
+    // ─── 4.11.0: several batches in flight ──────────────────────────────────
+
+    fn ids(batch: &Batch) -> Vec<String> {
+        batch.events.iter().map(|e| e.event_id.clone()).collect()
+    }
+
+    /// Batches drained while others are in flight never share an event, acks may
+    /// arrive in any order, and an event leaves the disk only when the batch that
+    /// carried it is acked.
+    #[test]
+    fn concurrent_batches_are_disjoint_and_acked_in_any_order() {
+        let dir = scratch("lease");
+        let q = open(
+            &dir,
+            DiskOptions {
+                batch_max: 6,
+                ..opts(100)
+            },
+        );
+        for i in 0..10 {
+            q.push(allowed_event(&format!("l{i}")));
+        }
+        assert!(q.flush(FLUSH));
+        assert_eq!(q.files_on_disk().len(), 2, "segments of 6 and 4");
+
+        let a = q.drain_batch(4); // l0..l3, first segment
+        let b = q.drain_batch(4); // l4, l5 (rest of the first), l6, l7
+        let c = q.drain_batch(4); // l8, l9
+        assert_eq!(ids(&a), vec!["l0", "l1", "l2", "l3"]);
+        assert_eq!(ids(&b), vec!["l4", "l5", "l6", "l7"]);
+        assert_eq!(ids(&c), vec!["l8", "l9"]);
+        assert!(
+            q.drain_batch(4).events.is_empty(),
+            "everything is in flight"
+        );
+        assert_eq!(q.available(), 0);
+        assert_eq!(q.stats().spooled, 10, "nothing delivered yet");
+
+        // The later batches answer first.
+        q.ack(&c);
+        q.ack(&b);
+        assert_eq!(q.stats().spooled, 4, "only a's events are left");
+        assert_eq!(
+            q.files_on_disk().len(),
+            1,
+            "the second segment is done; the first still holds a"
+        );
+
+        q.ack(&a);
+        assert_eq!(q.stats().spooled, 0);
+        assert!(q.files_on_disk().is_empty());
+    }
+
+    /// A failed batch in the middle is offered again, alone, while the batches
+    /// around it stay in flight; nothing is lost and nothing is sent twice.
+    #[test]
+    fn a_nacked_batch_is_offered_again_without_its_neighbours() {
+        let dir = scratch("nack-middle");
+        let q = open(&dir, opts(100));
+        for i in 0..9 {
+            q.push(allowed_event(&format!("n{i}")));
+        }
+        assert!(q.flush(FLUSH));
+        let a = q.drain_batch(3);
+        let b = q.drain_batch(3);
+        let c = q.drain_batch(3);
+        q.nack(b);
+        assert_eq!(q.available(), 3);
+        let again = q.drain_batch(10);
+        assert_eq!(ids(&again), vec!["n3", "n4", "n5"]);
+        q.ack(&c);
+        q.ack(&again);
+        assert_eq!(q.stats().spooled, 3);
+        assert_eq!(q.files_on_disk().len(), 1, "a is still in flight");
+        q.ack(&a);
+        assert!(q.files_on_disk().is_empty());
+        assert_eq!(q.stats().spooled, 0);
+    }
+
+    /// In-flight state is in memory: after a restart, whatever was not acked is
+    /// sent again (at-least-once), including what was acked out of order.
+    #[test]
+    fn a_restart_resends_what_was_not_acked() {
+        let dir = scratch("lease-restart");
+        let q = open(&dir, opts(100));
+        for i in 0..6 {
+            q.push(allowed_event(&format!("r{i}")));
+        }
+        assert!(q.flush(FLUSH));
+        let _a = q.drain_batch(3);
+        let b = q.drain_batch(3);
+        q.ack(&b); // acked out of order; the segment stays for a
+        drop(q);
+
+        let q = open(&dir, opts(100));
+        assert_eq!(q.stats().spooled, 6);
+        assert_eq!(drain_ids(&q, 10), vec!["r0", "r1", "r2", "r3", "r4", "r5"]);
+        assert!(q.files_on_disk().is_empty());
+    }
+
+    /// Eviction may take a segment that a batch in flight holds; its ack is then a
+    /// no-op and the counters stay right.
+    #[test]
+    fn eviction_of_a_segment_in_flight_keeps_the_counters_right() {
+        let dir = scratch("lease-evict");
+        let q = open(
+            &dir,
+            DiskOptions {
+                batch_max: 2,
+                ..opts(4)
+            },
+        );
+        for i in 0..4 {
+            q.push(allowed_event(&format!("e{i}")));
+        }
+        assert!(q.flush(FLUSH));
+        let a = q.drain_batch(2); // e0, e1 (oldest segment)
+        for i in 4..6 {
+            q.push(allowed_event(&format!("e{i}")));
+        }
+        assert!(q.flush(FLUSH));
+        assert_eq!(q.stats().evicted_oldest, 2, "the oldest segment went");
+        q.ack(&a);
+        assert_eq!(q.stats().spooled, 4);
+        assert_eq!(drain_ids(&q, 10), vec!["e2", "e3", "e4", "e5"]);
+        assert_eq!(q.stats().spooled, 0);
+    }
+
+    #[test]
+    fn memory_queue_batches_are_disjoint_and_nack_rebuffers() {
+        let q = MemoryQueue::new(10);
+        for i in 0..6 {
+            q.push(allowed_event(&format!("m{i}")));
+        }
+        let a = q.drain_batch(3);
+        let b = q.drain_batch(3);
+        assert_eq!(ids(&a), vec!["m0", "m1", "m2"]);
+        assert_eq!(ids(&b), vec!["m3", "m4", "m5"]);
+        assert_eq!(q.available(), 0);
+        q.nack(a);
+        assert_eq!(q.available(), 3);
+        assert_eq!(drain_ids(&q, 10), vec!["m0", "m1", "m2"]);
     }
 
     #[test]
