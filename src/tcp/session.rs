@@ -506,7 +506,8 @@ pub async fn intercept_client_to_server(
                     tokio::task::spawn_blocking(move || {
                         let decision = evaluate_message(&sql, dialect, kind, &rules, &policy);
                         let eval_us = eval_start.elapsed().as_micros();
-                        // Telemetry before any forwarding (R5.7).
+                        // Telemetry before any forwarding (R5.7): enqueued in memory,
+                        // persisted by the background writer, so it costs no I/O here.
                         crate::tcp::postgres::report_telemetry(
                             &config, &sql, dialect, &decision, eval_us, &identity,
                         );

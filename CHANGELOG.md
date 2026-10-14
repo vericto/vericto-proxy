@@ -7,6 +7,95 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [4.9.1] — 2026-10-13
+
+Requires vericto-engine v3.9.0 (unchanged). No wire-protocol changes. Telemetry
+is now asynchronous: see the behaviour changes below before upgrading a proxy
+that runs `VERICTO_TELEMETRY_BUFFER=disk`.
+
+### Performance
+
+- **Telemetry no longer holds statements back with the disk buffer.** Up to
+  4.9.0, `VERICTO_TELEMETRY_BUFFER=disk` wrote every statement's event to the
+  spool synchronously, after evaluation and before the statement was
+  forwarded: create a file, write it, rename it. On a network volume (EFS)
+  each of those is a round trip, and the kernel holds the spool directory's
+  lock across create, rename and unlink, so all connections queued behind one
+  another and behind the reporter's deletes. Throughput through the proxy was
+  capped at about 40 statements per second at any concurrency, with the
+  proxy's CPU nearly idle (staging session 1: +17.5 ms p50 at concurrency 1,
+  +192 ms p50 and about 1 s p99 at concurrency 16). Now the query path only
+  places the event in a bounded in-memory channel (`try_send`, no I/O, no
+  lock held across I/O) and forwards the statement at once. A background
+  writer thread persists the channel's contents in batches: one spool file
+  per batch of up to `VERICTO_TELEMETRY_SPOOL_BATCH_MAX` events (default
+  1000) or every `VERICTO_TELEMETRY_SPOOL_FLUSH_MS` (default 50 ms), written
+  to a temporary name, fsynced, renamed into place and the directory fsynced.
+  On a local reproduction with EFS-like latency on the spool (Postgres 17,
+  concurrency 16), throughput through the proxy went from 42 to about 4,600
+  statements per second (direct: about 5,600, database-bound), the median
+  added latency from 343 ms to 0.15 ms, and the p99 added to OLTP statements
+  from 790 ms to 1.5 ms. MySQL 8.0 shows the same: 36 to about 2,500
+  statements per second, added p50 395 ms to 0.05 ms.
+- **No directory listing on the spool after startup.** The spool index
+  (segments, event counts, delivery progress) is kept in memory and rebuilt
+  from one listing at startup; spool files have monotonic names
+  (`seg-<seq>-<count>.jsonl`). 4.9.0 still listed and sorted the whole spool
+  for every delivery batch, and for every event once the spool was full,
+  holding the lock every connection's `push` needed (at a full 5,000-file
+  spool on the reproduction: 113 ms per listing, 271 ms waiting for the lock,
+  9 statements per second).
+- **Spool reads and deletes are off the async workers.** The reporter read
+  and deleted spool files on a tokio worker thread, stalling the sessions
+  scheduled on it for the duration of each delivery's deletes (52 to 615 ms
+  per 100-event batch on the reproduction). They now run on the blocking pool.
+- **The memory buffer no longer logs inside its lock.** When the in-memory
+  buffer was full, every event logged a warning while holding the buffer's
+  mutex, serialising all connections on stdout. Drops are now counted and
+  warned about at most every 10 seconds, outside the lock.
+
+### Changed
+
+- **Durability of the disk buffer.** An event reaches the spool at most
+  `VERICTO_TELEMETRY_SPOOL_FLUSH_MS` (plus one write) after its statement,
+  instead of before the statement was forwarded. A crash or `SIGKILL` inside
+  that window loses those events; a `SIGTERM` does not (see below). What is on
+  disk is now fsynced (4.9.0 did not fsync), so it also survives a power loss.
+  Delivery stays at least once: a spool file is deleted only once all its
+  events are acknowledged, and a partly delivered file is sent again from its
+  start after a restart.
+- **Backpressure: drop, never block.** When the channel in front of the disk
+  writer is full (`VERICTO_TELEMETRY_QUEUE_CAPACITY`, default 2048 events) new
+  events are dropped and counted, and a warning is logged at most every 10
+  seconds; statements are never held back. There was, and is, no blocking or
+  fail-closed telemetry mode.
+- **Capacity is counted in events.** `VERICTO_TELEMETRY_MEMORY_CAPACITY`
+  (default 10,000) still bounds the disk spool; past it the oldest spool files
+  are dropped, a whole file (up to one batch) at a time, counted and warned
+  about. The spool holds far fewer files than events: an external watch on the
+  file count (such as the benchmark's 5,000-file stop condition) should count
+  events or bytes instead.
+- **Clean shutdown.** On `SIGTERM` or `SIGINT` the proxy writes what is still
+  queued to the spool, delivers what it can, and exits, within
+  `VERICTO_TELEMETRY_SHUTDOWN_TIMEOUT_MS` (default 5000). Before, there was no
+  handler: as a container's PID 1 without an init (the image runs the binary
+  directly) the proxy ignored `SIGTERM` until the runtime sent `SIGKILL` (30 s
+  later with `docker stop -t 30`, exit 137); it now exits 0 in about a second.
+  With the memory buffer the shutdown delivery is the only chance for buffered
+  events.
+- **Upgrade.** One-event `*.json` files left by 4.9.0 and earlier are read back
+  and delivered first; nothing needs to be drained before upgrading.
+
+### Added
+
+- `Telemetry pipeline stats` log line every minute while there is activity:
+  queue depth, spooled events, events enqueued, dropped because the queue was
+  full, evicted for capacity, lost to write errors, batches written, last and
+  longest batch write time.
+- Configuration: `VERICTO_TELEMETRY_QUEUE_CAPACITY`,
+  `VERICTO_TELEMETRY_SPOOL_FLUSH_MS`, `VERICTO_TELEMETRY_SPOOL_BATCH_MAX`,
+  `VERICTO_TELEMETRY_SHUTDOWN_TIMEOUT_MS` (README, Control plane).
+
 ## [4.9.0] — 2026-10-12
 
 Requires vericto-engine v3.9.0. No configuration or wire-protocol changes.

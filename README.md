@@ -315,9 +315,22 @@ buffer), or to an empty value to turn it off.
 | `VERICTO_TELEMETRY_BUFFER`          | `memory`| `memory` or `disk` (survives restarts)           |
 | `VERICTO_TELEMETRY_DISK_PATH`       | `/var/lib/vericto/spool` | Spool dir when buffer=disk        |
 | `VERICTO_RULES_CACHE_PATH`          | `<spool dir>/.rules-cache` with buffer=disk, else off | Last-good ruleset kept for restarts; empty = off |
-| `VERICTO_TELEMETRY_MEMORY_CAPACITY` | `10000` | Max events in the memory ring buffer             |
+| `VERICTO_TELEMETRY_MEMORY_CAPACITY` | `10000` | Max undelivered events: the memory ring buffer, or the disk spool with buffer=disk (oldest dropped past it) |
 | `VERICTO_TELEMETRY_BATCH_SIZE`      | `100`   | Max events per POST `/ingest/events`             |
 | `VERICTO_TELEMETRY_FLUSH_SECS`      | `5`     | How often the reporter flushes                   |
+| `VERICTO_TELEMETRY_QUEUE_CAPACITY`  | `2048`  | buffer=disk: events queued in memory for the spool writer; past it new events are dropped and counted, queries never wait |
+| `VERICTO_TELEMETRY_SPOOL_FLUSH_MS`  | `50`    | buffer=disk: longest an event waits before its batch is written and fsynced |
+| `VERICTO_TELEMETRY_SPOOL_BATCH_MAX` | `1000`  | buffer=disk: most events per spool file (one write and fsync) |
+| `VERICTO_TELEMETRY_SHUTDOWN_TIMEOUT_MS` | `5000` | On SIGTERM/SIGINT: time allowed to write queued events to the spool and deliver what it can before exiting |
+
+Telemetry never holds a statement back. The query path only places the event in
+memory; with `buffer=disk` a background writer persists events to the spool in
+batches (one file per batch, fsynced), so a slow or network volume such as EFS
+adds no latency to queries. An event reaches the disk at most
+`VERICTO_TELEMETRY_SPOOL_FLUSH_MS` after its statement ran; a crash (not a
+SIGTERM) inside that window loses those events. The proxy logs
+`Telemetry pipeline stats` every minute while there is activity: queue depth,
+spooled events, dropped events and the batch write time.
 
 ### TLS (optional)
 

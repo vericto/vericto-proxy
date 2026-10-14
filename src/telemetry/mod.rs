@@ -2,9 +2,11 @@
 //! API in batches over HTTPS.
 //!
 //! Hard invariant: telemetry MUST NEVER block or fail the SQL data path. The
-//! hot path only calls `EventQueue::push` (non-blocking, bounded). A background
-//! `Reporter` task drains and delivers. If the API is down, events buffer (and
-//! drop oldest when full) — the proxy keeps evaluating and blocking queries.
+//! hot path only calls `EventQueue::push` (non-blocking, bounded, in memory: no
+//! I/O in either buffer mode). A background `Reporter` task drains and delivers;
+//! with the disk buffer a writer thread persists events to the spool in batches
+//! (see `queue`). If the API is down, events buffer (and drop when full, counted
+//! and logged) — the proxy keeps evaluating and blocking queries.
 
 pub mod queue;
 pub mod reporter;

@@ -553,6 +553,7 @@ mod tests {
             memory_capacity: 10,
             batch_size: 10,
             flush_interval: Duration::from_secs(5),
+            spool: crate::config::SpoolTuning::default(),
         };
         let fresh = || {
             (
@@ -735,6 +736,7 @@ mod tests {
             memory_capacity: 10,
             batch_size: 10,
             flush_interval: Duration::from_secs(5),
+            spool: crate::config::SpoolTuning::default(),
         };
         let start = |cfg: ControlPlaneConfig| {
             let pol: SharedPolicy = Arc::new(ArcSwap::from_pointee(EnforcementPolicy::default()));
@@ -791,6 +793,7 @@ mod tests {
             memory_capacity: 10,
             batch_size: 10,
             flush_interval: Duration::from_secs(5),
+            spool: crate::config::SpoolTuning::default(),
         };
         let builtin = crate::tcp::evaluator::default_ruleset();
         let rules: SharedRuleset = Arc::new(ArcSwap::from_pointee(builtin.clone()));
@@ -940,6 +943,7 @@ mod tests {
             memory_capacity: 10,
             batch_size: 10,
             flush_interval: Duration::from_secs(5),
+            spool: crate::config::SpoolTuning::default(),
         };
         let start = |cfg: ControlPlaneConfig| {
             let access: SharedAccessPolicies =
