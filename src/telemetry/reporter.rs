@@ -32,8 +32,9 @@
 use std::collections::HashMap;
 use std::io::Write;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
+use std::time::{Duration, Instant, SystemTime};
 
 use tokio::task::JoinSet;
 
@@ -69,6 +70,56 @@ struct Shared {
     dropped_permanent: AtomicU64,
     last_request_us: AtomicU64,
     max_request_us: AtomicU64,
+    /// Unix milliseconds of the last request answered 2xx; 0 = none yet.
+    last_delivery_ms: AtomicI64,
+    /// Batches whose requests are outstanding.
+    in_flight: AtomicUsize,
+    /// The oldest event of each batch in flight, by flight token: a batch of the
+    /// memory buffer has left the ring while it is out, and is still undelivered.
+    in_flight_oldest: Mutex<Vec<(u64, SystemTime)>>,
+    next_flight: AtomicU64,
+}
+
+/// One batch in flight, for the delivery-lag metric and the in-flight gauge.
+/// Dropped with the delivery task, whether it finished, failed or panicked.
+struct InFlight {
+    shared: Arc<Shared>,
+    token: u64,
+}
+
+impl InFlight {
+    fn new(shared: &Arc<Shared>, oldest: Option<SystemTime>) -> Self {
+        let token = shared.next_flight.fetch_add(1, Ordering::Relaxed);
+        shared.in_flight.fetch_add(1, Ordering::Relaxed);
+        if let Some(at) = oldest {
+            shared.in_flight_oldest.lock().unwrap().push((token, at));
+        }
+        Self {
+            shared: Arc::clone(shared),
+            token,
+        }
+    }
+}
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        self.shared.in_flight.fetch_sub(1, Ordering::Relaxed);
+        if let Ok(mut held) = self.shared.in_flight_oldest.lock() {
+            held.retain(|(t, _)| *t != self.token);
+        }
+    }
+}
+
+/// Where delivery stands (since 4.12.0): for the metrics and the rule-sync
+/// heartbeat. In-memory reads only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct DeliveryState {
+    /// The last time the API answered 2xx to a telemetry request.
+    pub last_delivery_at: Option<SystemTime>,
+    /// Telemetry requests outstanding.
+    pub in_flight: usize,
+    /// The oldest event a batch in flight carries.
+    pub oldest_in_flight: Option<SystemTime>,
 }
 
 /// The reporter's own totals since the process started.
@@ -102,6 +153,10 @@ impl Reporter {
             dropped_permanent: AtomicU64::new(0),
             last_request_us: AtomicU64::new(0),
             max_request_us: AtomicU64::new(0),
+            last_delivery_ms: AtomicI64::new(0),
+            in_flight: AtomicUsize::new(0),
+            in_flight_oldest: Mutex::new(Vec::new()),
+            next_flight: AtomicU64::new(0),
         });
         Self {
             cfg,
@@ -252,6 +307,11 @@ impl Reporter {
                 self.shared
                     .delivered
                     .fetch_add(sent.delivered as u64, Ordering::Relaxed);
+                if sent.delivered > 0 {
+                    self.shared
+                        .last_delivery_ms
+                        .store(chrono::Utc::now().timestamp_millis(), Ordering::Relaxed);
+                }
                 let _ = tokio::task::spawn_blocking(move || queue.ack(&batch)).await;
                 Ok(())
             }
@@ -391,6 +451,22 @@ impl Reporter {
         }
     }
 
+    /// Where delivery stands now (since 4.12.0).
+    pub fn delivery_state(&self) -> DeliveryState {
+        let ms = self.shared.last_delivery_ms.load(Ordering::Relaxed);
+        DeliveryState {
+            last_delivery_at: (ms > 0)
+                .then(|| SystemTime::UNIX_EPOCH + Duration::from_millis(ms as u64)),
+            in_flight: self.shared.in_flight.load(Ordering::Relaxed),
+            oldest_in_flight: self
+                .shared
+                .in_flight_oldest
+                .lock()
+                .ok()
+                .and_then(|held| held.iter().map(|(_, at)| *at).min()),
+        }
+    }
+
     fn log_stats(&self, s: &QueueStats, in_flight: usize) {
         let d = &self.shared;
         tracing::info!(
@@ -440,9 +516,16 @@ impl Flights {
     fn launch(&mut self, reporter: Reporter, url: Arc<str>, batch: Batch) {
         let batch = Arc::new(batch);
         let held = Arc::clone(&batch);
-        let handle = self
-            .tasks
-            .spawn(async move { reporter.deliver_events(&url, &held.events).await });
+        // Events leave in FIFO order, so the first is the batch's oldest.
+        let oldest = held
+            .events
+            .first()
+            .map(|e| crate::telemetry::queue::event_time(&e.occurred_at));
+        let flight = InFlight::new(&reporter.shared, oldest);
+        let handle = self.tasks.spawn(async move {
+            let _flight = flight;
+            reporter.deliver_events(&url, &held.events).await
+        });
         self.batches.insert(handle.id(), batch);
     }
 
@@ -844,6 +927,29 @@ mod tests {
         wait_for(|| all_seen(&seen, "d", 350)).await;
         wait_for(|| queue.stats().spooled == 0 && queue.stats().queue_depth == 0).await;
         assert_eq!(queue.stats().dropped_queue_full, 0);
+    }
+
+    /// The delivery lag counts a memory batch while it is in flight (it has left
+    /// the ring but is not delivered), and the last 2xx is recorded.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn delivery_state_tracks_requests_in_flight_and_the_last_2xx() {
+        let api = mock_with(Arc::new(|_, _| Answer::Ok), Duration::from_millis(300)).await;
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = cfg(&api.url, dir.path());
+        cfg.buffer_mode = crate::config::BufferMode::Memory;
+        let queue: Arc<dyn EventQueue> = Arc::from(crate::telemetry::new_queue(&cfg));
+        let reporter = Reporter::new(cfg, queue.clone());
+        assert_eq!(reporter.delivery_state(), DeliveryState::default());
+        tokio::spawn(reporter.clone().run());
+        for i in 0..10 {
+            queue.push(event(format!("m{i}")));
+        }
+        wait_for(|| reporter.delivery_state().in_flight > 0).await;
+        assert!(reporter.delivery_state().oldest_in_flight.is_some());
+        assert_eq!(queue.oldest_buffered_at(), None, "the batch left the ring");
+        wait_for(|| reporter.delivery_state().last_delivery_at.is_some()).await;
+        wait_for(|| reporter.delivery_state().in_flight == 0).await;
+        assert_eq!(reporter.delivery_state().oldest_in_flight, None);
     }
 
     /// Shutdown: what is still queued is written and then delivered within the

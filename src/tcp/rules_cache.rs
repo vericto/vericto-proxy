@@ -123,8 +123,14 @@ fn write_atomic(path: &Path, file: &CacheFile) -> std::io::Result<()> {
     if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
         fs::create_dir_all(dir)?;
     }
+    // Unique per write: replicas sharing the spool volume (one rules cache for all
+    // of them, since 4.12.0 too with VERICTO_TELEMETRY_SPOOL_SUBDIR) must not
+    // truncate each other's temporary file before its rename.
     let mut tmp_name = path.as_os_str().to_owned();
-    tmp_name.push(".tmp");
+    tmp_name.push(format!(
+        ".{}.tmp",
+        &uuid::Uuid::new_v4().simple().to_string()[..12]
+    ));
     let tmp = PathBuf::from(tmp_name);
 
     let mut opts = fs::OpenOptions::new();

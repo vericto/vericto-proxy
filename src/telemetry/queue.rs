@@ -64,7 +64,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use crate::config::{BufferMode, ControlPlaneConfig};
 use crate::telemetry::TelemetryEvent;
@@ -155,6 +155,28 @@ pub trait EventQueue: Send + Sync {
     fn available(&self) -> usize;
     /// Current counters.
     fn stats(&self) -> QueueStats;
+    /// When the oldest event still buffered (delivered or not yet) was recorded,
+    /// `None` when nothing is buffered (since 4.12.0, for the delivery-lag metric).
+    /// In-memory reads, plus at most one `stat` per head segment of the disk spool;
+    /// never a scan of the spool. Events a batch in flight holds are the
+    /// reporter's to account for in memory mode (they left the ring).
+    fn oldest_buffered_at(&self) -> Option<SystemTime> {
+        None
+    }
+    /// The directory of a disk spool, `None` for a memory buffer (also when the
+    /// disk spool could not be opened and the proxy fell back to memory).
+    fn spool_dir(&self) -> Option<PathBuf> {
+        None
+    }
+    /// Takes over another proxy's spool directory, already moved out of its
+    /// owner's reach (see [`DiskQueue::adopt_dir`]). Disk spool only.
+    fn adopt(&self, dir: &Path) -> std::io::Result<(usize, usize)> {
+        let _ = dir;
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "not a disk spool",
+        ))
+    }
     /// Persist everything accepted before this call, waiting at most `timeout`.
     /// `true` when it is persisted (always, for a queue with nothing to persist).
     /// Blocks the calling thread: shutdown and tests only, never the query path.
@@ -217,6 +239,14 @@ impl WarnLimiter {
             .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
             .is_ok()
     }
+}
+
+/// An event's `occurred_at` (RFC 3339) as a time; now when it does not parse,
+/// which reads as "no lag" rather than inventing one.
+pub fn event_time(occurred_at: &str) -> SystemTime {
+    chrono::DateTime::parse_from_rfc3339(occurred_at)
+        .map(SystemTime::from)
+        .unwrap_or_else(|_| SystemTime::now())
 }
 
 // ─── In-memory ───────────────────────────────────────────────────────────────
@@ -309,6 +339,12 @@ impl EventQueue for MemoryQueue {
 
     fn available(&self) -> usize {
         self.inner.lock().unwrap().len()
+    }
+
+    fn oldest_buffered_at(&self) -> Option<SystemTime> {
+        // FIFO: the front is the oldest (a nacked batch goes back to the front).
+        let q = self.inner.lock().unwrap();
+        q.front().map(|ev| event_time(&ev.occurred_at))
     }
 
     fn stats(&self) -> QueueStats {
@@ -454,6 +490,10 @@ struct Segment {
     /// Line ranges past `delivered` already acked: a later batch can be acked
     /// before an earlier one. Folded into `delivered` once the gap closes.
     acked: Vec<(usize, usize)>,
+    /// When the file was written: set for segments this process wrote, and read
+    /// once from the file's mtime for a segment found at startup or adopted, the
+    /// first time it is the oldest one (delivery-lag metric).
+    written_at: Option<SystemTime>,
 }
 
 /// Lines of `ranges` below `limit`.
@@ -474,6 +514,7 @@ impl Segment {
             delivered: 0,
             leased: Vec::new(),
             acked: Vec::new(),
+            written_at: None,
         }
     }
 
@@ -638,6 +679,31 @@ impl DiskQueue {
         })
     }
 
+    /// Takes over the spool in `dir`, another proxy's (since 4.12.0,
+    /// `telemetry::spool_dir`), which the caller has already moved where nobody
+    /// else reads it: its files join this spool's index ahead of this spool's own
+    /// (they are older), keep their paths, and are delivered, bounded and evicted
+    /// like the rest. Returns the segments and events adopted.
+    pub fn adopt_dir(&self, dir: &Path) -> std::io::Result<(usize, usize)> {
+        let (files, _, _) = collect_spool(dir, 1)?;
+        let (segments, mut events) = (files.len(), 0);
+        {
+            let mut index = self.shared.index.lock().unwrap();
+            for (path, count, bytes) in files.into_iter().rev() {
+                let id = index.next_id;
+                index.next_id += 1;
+                index.events += count;
+                index.bytes += bytes;
+                events += count;
+                index
+                    .segments
+                    .push_front(Segment::new(id, path, count, bytes));
+            }
+        }
+        self.shared.evict_to_fit(0, 0);
+        Ok((segments, events))
+    }
+
     /// Spool files on disk right now (`.json` legacy files and segments). Lists
     /// the directory: tests and diagnostics only.
     #[cfg(test)]
@@ -666,13 +732,36 @@ impl Drop for DiskQueue {
     }
 }
 
-/// Lists the spool once and returns its index and how many legacy files it has.
-/// Legacy `*.json` files (one event each, named by timestamp) come first in name
-/// order, then segments in sequence order. Hidden files (temporaries, the rules
-/// cache) and anything else are left alone.
-fn rebuild_index(dir: &Path) -> std::io::Result<(SpoolIndex, usize)> {
-    let mut legacy: Vec<(PathBuf, u64)> = Vec::new();
-    let mut segments: Vec<(u64, usize, u64, PathBuf)> = Vec::new();
+/// Name of the subdirectory of a spool that holds spools adopted from other
+/// proxies (since 4.12.0, `telemetry::spool_dir`): `adopted/<name>/`, each one a
+/// spool of its own, possibly with an `adopted/` of its own.
+pub const ADOPTED_DIR: &str = "adopted";
+
+/// How deep `adopted/` directories are followed: a chain of restarts each adopting
+/// the previous spool nests one level per restart, and each is pruned once drained.
+const MAX_ADOPTED_DEPTH: usize = 16;
+
+/// A spool file to index: `(path, events, bytes)`.
+type SpoolFile = (PathBuf, usize, u64);
+
+/// The spool files of one directory, oldest first.
+struct Listing {
+    /// Legacy `*.json` files (one event each, named by timestamp), in name order.
+    legacy: Vec<(PathBuf, u64)>,
+    /// Segments in sequence order: `(seq, count, bytes, path)`.
+    segments: Vec<(u64, usize, u64, PathBuf)>,
+    /// The directory has an `adopted/` subdirectory.
+    adopted: bool,
+}
+
+/// Lists `dir` once. Hidden files (temporaries, the rules cache, a lease) and
+/// anything else are left alone.
+fn list_spool(dir: &Path) -> std::io::Result<Listing> {
+    let mut listing = Listing {
+        legacy: Vec::new(),
+        segments: Vec::new(),
+        adopted: false,
+    };
     for entry in fs::read_dir(dir)? {
         let Ok(entry) = entry else { continue };
         let path = entry.path();
@@ -682,26 +771,84 @@ fn rebuild_index(dir: &Path) -> std::io::Result<(SpoolIndex, usize)> {
         if name.starts_with('.') {
             continue;
         }
+        if name == ADOPTED_DIR {
+            listing.adopted = entry.file_type().is_ok_and(|t| t.is_dir());
+            continue;
+        }
         if let Some((seq, count, bytes)) = parse_segment_name(name) {
             let bytes = bytes.unwrap_or_else(|| file_bytes(&entry));
-            segments.push((seq, count, bytes, path));
+            listing.segments.push((seq, count, bytes, path));
         } else if name.ends_with(".json") {
             let bytes = file_bytes(&entry);
-            legacy.push((path, bytes));
+            listing.legacy.push((path, bytes));
         }
     }
-    legacy.sort(); // lexical = chronological (timestamped names)
-    segments.sort_by_key(|(seq, _, _, _)| *seq);
+    listing.legacy.sort(); // lexical = chronological (timestamped names)
+    listing.segments.sort_by_key(|(seq, _, _, _)| *seq);
+    Ok(listing)
+}
 
+/// Every spool file of `dir` and of the spools adopted into it, oldest first:
+/// adopted spools (older than this one's own files), then legacy files, then
+/// segments. `(path, events, bytes)`, plus the number of legacy files and the
+/// listing of `dir` itself.
+fn collect_spool(dir: &Path, depth: usize) -> std::io::Result<(Vec<SpoolFile>, usize, Listing)> {
+    let mut listing = list_spool(dir)?;
+    let mut files = Vec::new();
+    let mut legacy_files = listing.legacy.len();
+    if listing.adopted {
+        if depth >= MAX_ADOPTED_DEPTH {
+            tracing::warn!(dir = %dir.display(), "Adopted telemetry spools nested too deep; the deepest are not read");
+        } else {
+            let mut children: Vec<PathBuf> = fs::read_dir(dir.join(ADOPTED_DIR))?
+                .filter_map(|e| e.ok())
+                .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+                .map(|e| e.path())
+                .collect();
+            children.sort();
+            for child in children {
+                match collect_spool(&child, depth + 1) {
+                    Ok((more, legacy, _)) => {
+                        files.extend(more);
+                        legacy_files += legacy;
+                    }
+                    Err(e) => {
+                        tracing::warn!(dir = %child.display(), error = %e, "Adopted telemetry spool unreadable; skipped")
+                    }
+                }
+            }
+        }
+    }
+    files.extend(
+        listing
+            .legacy
+            .drain(..)
+            .map(|(path, bytes)| (path, 1, bytes)),
+    );
+    files.extend(
+        listing
+            .segments
+            .iter()
+            .map(|(_, count, bytes, path)| (path.clone(), *count, *bytes)),
+    );
+    Ok((files, legacy_files, listing))
+}
+
+/// Lists the spool once and returns its index and how many legacy files it has.
+/// Spools adopted from other proxies (`adopted/`) come first, then legacy `*.json`
+/// files in name order, then segments in sequence order. Hidden files
+/// (temporaries, the rules cache, a lease) and anything else are left alone.
+fn rebuild_index(dir: &Path) -> std::io::Result<(SpoolIndex, usize)> {
+    let (files, legacy_files, listing) = collect_spool(dir, 0)?;
     let mut index = SpoolIndex {
-        next_seq: segments.last().map(|(seq, _, _, _)| seq + 1).unwrap_or(1),
+        next_seq: listing
+            .segments
+            .last()
+            .map(|(seq, _, _, _)| seq + 1)
+            .unwrap_or(1),
         ..SpoolIndex::default()
     };
-    let legacy_files = legacy.len();
-    for (path, bytes) in legacy {
-        index.add(path, 1, bytes);
-    }
-    for (_, count, bytes, path) in segments {
+    for (path, count, bytes) in files {
         index.add(path, count, bytes);
     }
     Ok((index, legacy_files))
@@ -854,7 +1001,13 @@ impl DiskShared {
         sync_dir(&self.dir);
 
         self.evict_to_fit(count, bytes);
-        self.index.lock().unwrap().add(path, count, bytes);
+        {
+            let mut index = self.index.lock().unwrap();
+            index.add(path, count, bytes);
+            if let Some(seg) = index.segments.back_mut() {
+                seg.written_at = Some(SystemTime::now());
+            }
+        }
         self.pending.fetch_sub(accepted, Ordering::Relaxed);
 
         let us = started.elapsed().as_micros() as u64;
@@ -1129,6 +1282,35 @@ impl EventQueue for DiskQueue {
     fn available(&self) -> usize {
         let index = self.shared.index.lock().unwrap();
         index.segments.iter().map(Segment::available).sum()
+    }
+
+    fn spool_dir(&self) -> Option<PathBuf> {
+        Some(self.shared.dir.clone())
+    }
+
+    fn adopt(&self, dir: &Path) -> std::io::Result<(usize, usize)> {
+        self.adopt_dir(dir)
+    }
+
+    fn oldest_buffered_at(&self) -> Option<SystemTime> {
+        let (id, path, at) = {
+            let index = self.shared.index.lock().unwrap();
+            let seg = index.segments.iter().find(|s| s.remaining() > 0)?;
+            (seg.id, seg.path.clone(), seg.written_at)
+        };
+        if at.is_some() {
+            return at;
+        }
+        // A segment this process did not write: its mtime, read once, outside the
+        // index lock (one round trip on EFS, once per such head segment).
+        let at = fs::metadata(&path)
+            .and_then(|m| m.modified())
+            .unwrap_or_else(|_| SystemTime::now());
+        let mut index = self.shared.index.lock().unwrap();
+        if let Some(pos) = index.position(id) {
+            index.segments[pos].written_at = Some(at);
+        }
+        Some(at)
     }
 
     fn stats(&self) -> QueueStats {
@@ -1738,6 +1920,45 @@ mod tests {
 
     /// Memory mode: a full ring drops the oldest and counts it, still without
     /// waiting.
+    /// The delivery lag reads the oldest buffered event in constant time: the
+    /// head segment's write time (its mtime after a restart), the ring's front.
+    #[test]
+    fn the_oldest_buffered_event_is_known_without_a_scan() {
+        let dir = scratch("oldest");
+        let before = SystemTime::now() - Duration::from_secs(1);
+        {
+            let q = open(&dir, opts(100));
+            assert_eq!(q.oldest_buffered_at(), None);
+            q.push(allowed_event("a"));
+            assert!(q.flush(FLUSH));
+            assert!(q.oldest_buffered_at().unwrap() >= before);
+            let batch = q.drain_batch(10);
+            assert!(
+                q.oldest_buffered_at().is_some(),
+                "a batch in flight is still undelivered"
+            );
+            q.ack(&batch);
+            assert_eq!(q.oldest_buffered_at(), None);
+            q.push(allowed_event("b"));
+            assert!(q.flush(FLUSH));
+        }
+        let q = open(&dir, opts(100));
+        let at = q.oldest_buffered_at().unwrap();
+        assert!(
+            at >= before && at <= SystemTime::now(),
+            "from the file's mtime"
+        );
+
+        let m = MemoryQueue::new(10);
+        assert_eq!(m.oldest_buffered_at(), None);
+        m.push(allowed_event("m"));
+        assert_eq!(
+            m.oldest_buffered_at(),
+            Some(event_time(&allowed_event("m").occurred_at))
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn memory_queue_counts_what_it_evicts() {
         let q = MemoryQueue::new(3);

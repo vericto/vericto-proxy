@@ -43,6 +43,37 @@ counters, shows them in the dashboard and announces the quota state.
   quota 429 without a reset time, as older APIs send) keeps the backoff.
 - `Telemetry pipeline stats` also logs `spool_bytes`, `dropped_quota` and
   `quota_paused`.
+- **Delivery lag.** The proxy knows how far behind its telemetry is without
+  scanning the spool: the write time of the oldest spool segment (its mtime,
+  read once, after a restart), the front of the memory ring, and the oldest
+  event of each batch in flight. The rule-sync header carries it as
+  `oldest_undelivered_age_s` (0 when nothing waits), with `last_delivery_at`
+  (the last 2xx) and `spool_max_bytes`. Fields were only added: `v` stays 1.
+- **Metrics** (README, "Metrics"), both off by default: `GET /metrics` in the
+  Prometheus text format on the health-check listener
+  (`VERICTO_METRICS_PROMETHEUS`), never on the database port; and a CloudWatch
+  Embedded Metric Format line on stdout every 60 s (`VERICTO_METRICS_EMF`,
+  `VERICTO_METRICS_EMF_NAMESPACE` default `Vericto/Proxy`,
+  `VERICTO_METRICS_EMF_INTERVAL_SECS`, `VERICTO_METRICS_PROXY_NAME`,
+  `VERICTO_METRICS_EMF_TASK_DIMENSION`), dimensions `[ProxyName]` and
+  `[ProxyName, TaskId]`. Oldest undelivered age, seconds since the last
+  delivery, spool bytes, events, bound and percentage, delivered, dropped by
+  cause, quota pause and requests in flight, all named `vericto_proxy_*`. Labels
+  are a fixed set (`cause`, `version`, `buffer`); no query text, user, address
+  or workspace/database id, ever.
+- **`VERICTO_HEALTHZ_ADDR`**: the address the health-check listener binds
+  (default `0.0.0.0`, as before).
+- **One spool directory per proxy on a shared volume**
+  (`VERICTO_TELEMETRY_SPOOL_SUBDIR=task|hostname|<name>`, README "Several
+  proxies on one volume"). Each proxy spools to `<spool dir>/tasks/<name>/`
+  under a lease it renews every 30 s and releases on shutdown, and adopts, at
+  startup and every minute, the directories whose lease is released or older
+  than `VERICTO_TELEMETRY_SPOOL_ORPHAN_SECS` (default 600): an atomic rename
+  into its own `adopted/` directory, so exactly one proxy takes each, and their
+  events are delivered first. Files at the top of the shared directory are
+  claimed one by one the same way. Up to now, replicas mounting one EFS access
+  point shared one spool: each sent the others' files too, counted them against
+  its own bound and evicted them.
 
 ### Changed
 
@@ -66,7 +97,21 @@ counters, shows them in the dashboard and announces the quota state.
   startup from one directory listing. Files written by 4.9.1–4.11 and legacy
   `*.json` files are read as before and measured once with `stat`.
 
+### Fixed
+
+- The rules cache is written under a temporary name unique to each write, so
+  replicas sharing the spool volume no longer truncate each other's temporary
+  file before its rename.
+
 ### Upgrade notes
+
+- Several replicas on one spool volume: set `VERICTO_TELEMETRY_SPOOL_SUBDIR=task`
+  (the Vericto Enterprise kit does). The files already in the shared directory
+  are claimed and delivered by the upgraded proxies. A version without the
+  setting does not read `tasks/`: let the spool drain before downgrading.
+- The health-check listener now waits up to 2 s for a request before closing a
+  connection that sends nothing; a TCP probe that closes its side is answered
+  at once, as before.
 
 - With `VERICTO_TELEMETRY_BUFFER=disk` and no `VERICTO_TELEMETRY_MEMORY_CAPACITY`,
   the spool can now grow to 1 GiB during an outage. Make sure the volume has

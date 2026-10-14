@@ -9,9 +9,11 @@
 //! and logged) — the proxy keeps evaluating and blocking queries.
 
 pub mod heartbeat;
+pub mod metrics;
 pub mod queue;
 pub mod quota;
 pub mod reporter;
+pub mod spool_dir;
 
 use serde::{Deserialize, Serialize};
 

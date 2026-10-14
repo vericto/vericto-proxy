@@ -12,8 +12,17 @@
 //! sync without it, from 4.11 or older, exactly as before. The counters are totals
 //! since this process started, under an `instance_id` drawn at startup, so the API
 //! can tell a restart (new instance, counters from zero) from new drops.
+//!
+//! Since 4.12.0 the header also says how far behind delivery is:
+//! `oldest_undelivered_age_s` (0 when nothing waits), `last_delivery_at` and the
+//! spool's bound, `spool_max_bytes`. Fields are only ever added, so `v` stays 1 and
+//! an API that does not know them ignores them. The same figures feed `/metrics`
+//! and the CloudWatch EMF line (`telemetry::metrics`).
 
 use std::sync::Arc;
+use std::time::{Duration, SystemTime};
+
+use chrono::{DateTime, Utc};
 
 use serde::Serialize;
 
@@ -60,6 +69,50 @@ pub struct HeartbeatStats {
     pub quota_paused: bool,
     /// When that pause ends on its own (RFC 3339), while paused.
     pub quota_resets_at: Option<String>,
+    /// Seconds since the oldest event still undelivered was recorded; 0 when
+    /// nothing waits (since 4.12.0).
+    pub oldest_undelivered_age_s: u64,
+    /// When the API last answered 2xx to a telemetry request (RFC 3339); `None`
+    /// before the first since the process started (since 4.12.0).
+    pub last_delivery_at: Option<String>,
+    /// The disk spool's byte bound; 0 for the memory buffer (since 4.12.0).
+    pub spool_max_bytes: u64,
+}
+
+/// Everything the pipeline can say about itself at one instant (since 4.12.0):
+/// the counters of [`HeartbeatStats`] plus the delivery lag. In-memory reads, and
+/// at most one `stat` of the spool's head segment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PipelineSnapshot {
+    pub buffer: &'static str,
+    pub enqueued: u64,
+    pub delivered: u64,
+    pub dropped_queue_full: u64,
+    pub evicted_oldest: u64,
+    pub dropped_permanent: u64,
+    pub write_failures: u64,
+    pub dropped_quota: u64,
+    pub spooled_events: u64,
+    pub spool_bytes: u64,
+    pub spool_max_bytes: u64,
+    pub quota_paused: bool,
+    pub quota_resets_at: Option<DateTime<Utc>>,
+    /// Seconds since the oldest undelivered event was recorded; 0 when none waits.
+    pub oldest_undelivered_age_s: u64,
+    /// Seconds delivery has made no progress while events wait: since the later
+    /// of the last 2xx, the oldest waiting event and the process start; 0 when
+    /// nothing waits.
+    pub seconds_since_last_delivery: u64,
+    pub last_delivery_at: Option<DateTime<Utc>>,
+    /// Telemetry requests outstanding.
+    pub in_flight: u64,
+}
+
+/// Whole seconds from `earlier` to `now`; 0 when `earlier` is not before it.
+fn secs_between(earlier: SystemTime, now: SystemTime) -> u64 {
+    now.duration_since(earlier)
+        .unwrap_or(Duration::ZERO)
+        .as_secs()
 }
 
 /// Reads the counters of a running pipeline for the rule syncer.
@@ -70,6 +123,8 @@ pub struct StatsSource {
     queue: Arc<dyn EventQueue>,
     reporter: Reporter,
     quota: Arc<QuotaGate>,
+    spool_max_bytes: u64,
+    started_at: SystemTime,
 }
 
 impl StatsSource {
@@ -84,6 +139,64 @@ impl StatsSource {
             queue,
             quota: reporter.quota_gate(),
             reporter,
+            spool_max_bytes: 0,
+            started_at: SystemTime::now(),
+        }
+    }
+
+    /// The disk spool's byte bound, reported as `spool_max_bytes` (0 by default:
+    /// the memory buffer, or a disk spool that fell back to memory).
+    pub fn with_spool_max_bytes(mut self, bytes: u64) -> Self {
+        self.spool_max_bytes = bytes;
+        self
+    }
+
+    /// The pipeline right now.
+    pub fn pipeline(&self) -> PipelineSnapshot {
+        self.pipeline_at(SystemTime::now())
+    }
+
+    fn pipeline_at(&self, now: SystemTime) -> PipelineSnapshot {
+        let q = self.queue.stats();
+        let d = self.reporter.delivery_counters();
+        let state = self.reporter.delivery_state();
+        let oldest = match (self.queue.oldest_buffered_at(), state.oldest_in_flight) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        let spooled_events = (q.spooled + q.queue_depth) as u64;
+        // Something waits only if an event is buffered or in flight; a spool whose
+        // head time is known but whose counts read 0 a moment later has drained.
+        let waiting = oldest.filter(|_| spooled_events > 0 || state.in_flight > 0);
+        let (age, stalled) = match waiting {
+            None => (0, 0),
+            Some(oldest) => {
+                let progress = [state.last_delivery_at, Some(oldest), Some(self.started_at)]
+                    .into_iter()
+                    .flatten()
+                    .max()
+                    .unwrap_or(now);
+                (secs_between(oldest, now), secs_between(progress, now))
+            }
+        };
+        PipelineSnapshot {
+            buffer: self.buffer,
+            enqueued: q.enqueued,
+            delivered: d.delivered,
+            dropped_queue_full: q.dropped_queue_full,
+            evicted_oldest: q.evicted_oldest,
+            dropped_permanent: d.dropped_permanent,
+            write_failures: q.write_failures,
+            dropped_quota: q.dropped_quota,
+            spooled_events,
+            spool_bytes: q.spool_bytes,
+            spool_max_bytes: self.spool_max_bytes,
+            quota_paused: self.quota.is_paused(),
+            quota_resets_at: self.quota.resets_at(),
+            oldest_undelivered_age_s: age,
+            seconds_since_last_delivery: stalled,
+            last_delivery_at: state.last_delivery_at.map(DateTime::<Utc>::from),
+            in_flight: state.in_flight as u64,
         }
     }
 
@@ -94,24 +207,26 @@ impl StatsSource {
 
     /// The counters right now. In-memory reads only: cheap enough for every sync.
     pub fn snapshot(&self) -> HeartbeatStats {
-        let q = self.queue.stats();
-        let d = self.reporter.delivery_counters();
+        let p = self.pipeline();
         HeartbeatStats {
             v: STATS_VERSION,
             instance_id: self.instance_id.clone(),
             proxy_version: env!("CARGO_PKG_VERSION"),
-            buffer: self.buffer,
-            enqueued: q.enqueued,
-            delivered: d.delivered,
-            dropped_queue_full: q.dropped_queue_full,
-            evicted_oldest: q.evicted_oldest,
-            dropped_permanent: d.dropped_permanent,
-            write_failures: q.write_failures,
-            spooled_events: (q.spooled + q.queue_depth) as u64,
-            spool_bytes: q.spool_bytes,
-            dropped_quota: q.dropped_quota,
-            quota_paused: self.quota.is_paused(),
-            quota_resets_at: self.quota.resets_at().map(|t| t.to_rfc3339()),
+            buffer: p.buffer,
+            enqueued: p.enqueued,
+            delivered: p.delivered,
+            dropped_queue_full: p.dropped_queue_full,
+            evicted_oldest: p.evicted_oldest,
+            dropped_permanent: p.dropped_permanent,
+            write_failures: p.write_failures,
+            spooled_events: p.spooled_events,
+            spool_bytes: p.spool_bytes,
+            dropped_quota: p.dropped_quota,
+            quota_paused: p.quota_paused,
+            quota_resets_at: p.quota_resets_at.map(|t| t.to_rfc3339()),
+            oldest_undelivered_age_s: p.oldest_undelivered_age_s,
+            last_delivery_at: p.last_delivery_at.map(|t| t.to_rfc3339()),
+            spool_max_bytes: p.spool_max_bytes,
         }
     }
 
@@ -175,11 +290,57 @@ mod tests {
         assert_eq!(json["dropped_quota"], 0);
         assert_eq!(json["quota_paused"], false);
         assert!(json["quota_resets_at"].is_null());
+        // Delivery lag (4.12.0): nothing was delivered yet; the age is a number
+        // (its value is covered by the test below).
+        assert!(json["last_delivery_at"].is_null());
+        assert_eq!(json["spool_max_bytes"], 0);
+        assert!(json["oldest_undelivered_age_s"].is_u64());
         assert!(uuid::Uuid::parse_str(json["instance_id"].as_str().unwrap()).is_ok());
         assert!(source.header_value().is_ascii());
         // Same process, same instance: the API computes deltas against it.
         let again: serde_json::Value = serde_json::from_str(&source.header_value()).unwrap();
         assert_eq!(again["instance_id"], json["instance_id"]);
+    }
+
+    /// The lag is measured from the oldest event waiting, and reads 0 once
+    /// nothing waits: an idle proxy is not "behind".
+    #[test]
+    fn the_delivery_lag_is_the_age_of_the_oldest_waiting_event() {
+        let queue: Arc<dyn EventQueue> = Arc::new(MemoryQueue::new(10));
+        let reporter = Reporter::new(cfg(), Arc::clone(&queue));
+        let source = StatsSource::new(BufferMode::Memory, Arc::clone(&queue), reporter);
+        let now = SystemTime::now();
+        let idle = source.pipeline_at(now);
+        assert_eq!(idle.oldest_undelivered_age_s, 0);
+        assert_eq!(idle.seconds_since_last_delivery, 0);
+
+        let at =
+            |secs_ago: i64| (chrono::Utc::now() - chrono::Duration::seconds(secs_ago)).to_rfc3339();
+        for (id, ago) in [("old", 400), ("new", 10)] {
+            let mut ev = event(id);
+            ev.occurred_at = at(ago);
+            queue.push(ev);
+        }
+        let p = source.pipeline_at(now);
+        assert!((399..=401).contains(&p.oldest_undelivered_age_s), "{p:?}");
+        // Nothing delivered yet: stalled since the process started, which is
+        // later than the oldest event here.
+        assert!(p.seconds_since_last_delivery <= p.oldest_undelivered_age_s);
+        assert_eq!(p.spooled_events, 2);
+        let _ = queue.drain_batch(10);
+        assert_eq!(source.pipeline_at(now).oldest_undelivered_age_s, 0);
+    }
+
+    #[test]
+    fn the_spool_bound_is_reported_when_set() {
+        let queue: Arc<dyn EventQueue> = Arc::new(MemoryQueue::new(2));
+        let source = StatsSource::new(
+            BufferMode::Disk,
+            Arc::clone(&queue),
+            Reporter::new(cfg(), Arc::clone(&queue)),
+        )
+        .with_spool_max_bytes(1 << 30);
+        assert_eq!(source.snapshot().spool_max_bytes, 1 << 30);
     }
 
     #[test]

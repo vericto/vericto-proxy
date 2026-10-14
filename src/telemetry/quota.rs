@@ -214,6 +214,18 @@ impl EventQueue for QuotaGatedQueue {
     fn flush(&self, timeout: Duration) -> bool {
         self.inner.flush(timeout)
     }
+
+    fn oldest_buffered_at(&self) -> Option<std::time::SystemTime> {
+        self.inner.oldest_buffered_at()
+    }
+
+    fn spool_dir(&self) -> Option<std::path::PathBuf> {
+        self.inner.spool_dir()
+    }
+
+    fn adopt(&self, dir: &std::path::Path) -> std::io::Result<(usize, usize)> {
+        self.inner.adopt(dir)
+    }
 }
 
 #[cfg(test)]
