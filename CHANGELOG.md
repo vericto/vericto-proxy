@@ -7,6 +7,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [4.10.0] — 2026-10-13
+
+Requires vericto-engine v4.0.0 (from v3.9.0). No wire-protocol changes, and
+nothing changes for Postgres or MySQL traffic: the engine's 4.0.0 release
+compared every verdict of this repository's SQL with 3.9.0 and none differs.
+The 4.9.1 telemetry pipeline is unchanged.
+
+### Changed
+
+- **vericto-engine v4.0.0.** The engine adds the Snowflake dialect and makes its
+  growing public types `#[non_exhaustive]`. The proxy builds against it with two
+  changes: the telemetry dialect name is `Dialect::as_str()` (the same four
+  names as before), and the query-size cap gives every dialect the proxy does
+  not serve over the wire the stricter MySQL cap, as it already did for Oracle
+  and SQL Server.
+- **The built-in fallback catalogue lists VERICTO-091 to VERICTO-097**, the
+  engine's Snowflake rules (Critical: 091 stage unload or file transfer, 092
+  external stage or integration, 093 share to another account; High: 094
+  recovery reduced, 095 warehouse cost, 096 code that runs later, 097 role
+  switch), all `block`, so the list stays the engine's whole catalogue. They
+  read only what the engine's Snowflake parser records and never fire on the
+  Postgres or MySQL protocol.
+
+### Added
+
+- **`VERICTO_WIRE_PROTOCOL=snowflake` is a startup error**, instead of falling
+  back to the Postgres protocol. Snowflake has no TCP wire protocol a proxy can
+  front (clients reach it over HTTPS): check Snowflake SQL through the HTTP API,
+  the CLI or MCP. Other values behave as before.
+- A sync whose dashboard dialect is `snowflake` logs a specific warning (no
+  proxy can front a Snowflake database) instead of the generic protocol
+  mismatch one.
+
 ## [4.9.1] — 2026-10-13
 
 Requires vericto-engine v3.9.0 (unchanged). No wire-protocol changes. Telemetry

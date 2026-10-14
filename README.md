@@ -24,9 +24,10 @@ engines**. Only the value above and (optionally) the default ports change.
 
 No AI, no stochastic heuristics — the same input always produces the same result.
 
-> **Other dialects** (Oracle, SQL Server): evaluate via the
-> [HTTP API](https://vericto.com/integration-guide#http-setup); there is no wire
-> proxy for them.
+> **Other dialects** (Oracle, SQL Server, Snowflake): evaluate via the
+> [HTTP API](https://vericto.com/integration-guide#http-setup), the CLI or MCP;
+> there is no wire proxy for them. Snowflake has no TCP wire protocol at all, so
+> `VERICTO_WIRE_PROTOCOL=snowflake` stops the proxy at startup with an error.
 
 ---
 

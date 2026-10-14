@@ -440,6 +440,12 @@ pub fn default_ruleset() -> Vec<Rule> {
         // MySQL text the engine and MySQL would read differently. Engine-driven: the
         // engine blocks it whatever this list holds; listed so the catalogue is whole.
         ("VERICTO-086", Severity::Critical, EnforcementAction::Block),
+        // Snowflake rules (VERICTO-091 to VERICTO-097). They read only what the
+        // engine's Snowflake parser records, so they never fire on the Postgres or
+        // MySQL wire protocol this proxy serves; listed so the catalogue is whole.
+        ("VERICTO-091", Severity::Critical, EnforcementAction::Block), // Stage unload or file transfer
+        ("VERICTO-092", Severity::Critical, EnforcementAction::Block), // External stage or integration
+        ("VERICTO-093", Severity::Critical, EnforcementAction::Block), // Share to another account
         // High / BLOCK.
         ("VERICTO-002", Severity::High, EnforcementAction::Block), // DELETE with LIMIT 0 (MySQL)
         ("VERICTO-013", Severity::High, EnforcementAction::Block), // DROP INDEX without IF EXISTS
@@ -462,6 +468,11 @@ pub fn default_ruleset() -> Vec<Rule> {
         // session user's `access_policy` (block under enforce, flag under observe),
         // never through this list.
         ("VERICTO-087", Severity::High, EnforcementAction::Block),
+        // Snowflake only (see above).
+        ("VERICTO-094", Severity::High, EnforcementAction::Block), // Recovery reduced
+        ("VERICTO-095", Severity::High, EnforcementAction::Block), // Warehouse cost
+        ("VERICTO-096", Severity::High, EnforcementAction::Block), // Code that runs later
+        ("VERICTO-097", Severity::High, EnforcementAction::Block), // Role switch
         // Medium / FLAG.
         ("VERICTO-050", Severity::Medium, EnforcementAction::Flag), // SELECT without LIMIT
         ("VERICTO-051", Severity::Medium, EnforcementAction::Flag), // SELECT * without WHERE
@@ -501,6 +512,9 @@ mod tests {
         ("VERICTO-080", Severity::Critical, EnforcementAction::Block),
         ("VERICTO-081", Severity::Critical, EnforcementAction::Block),
         ("VERICTO-086", Severity::Critical, EnforcementAction::Block),
+        ("VERICTO-091", Severity::Critical, EnforcementAction::Block),
+        ("VERICTO-092", Severity::Critical, EnforcementAction::Block),
+        ("VERICTO-093", Severity::Critical, EnforcementAction::Block),
         ("VERICTO-002", Severity::High, EnforcementAction::Block),
         ("VERICTO-013", Severity::High, EnforcementAction::Block),
         ("VERICTO-015", Severity::High, EnforcementAction::Block),
@@ -517,6 +531,10 @@ mod tests {
         ("VERICTO-084", Severity::High, EnforcementAction::Block),
         ("VERICTO-085", Severity::High, EnforcementAction::Block),
         ("VERICTO-087", Severity::High, EnforcementAction::Block),
+        ("VERICTO-094", Severity::High, EnforcementAction::Block),
+        ("VERICTO-095", Severity::High, EnforcementAction::Block),
+        ("VERICTO-096", Severity::High, EnforcementAction::Block),
+        ("VERICTO-097", Severity::High, EnforcementAction::Block),
         ("VERICTO-050", Severity::Medium, EnforcementAction::Flag),
         ("VERICTO-051", Severity::Medium, EnforcementAction::Flag),
         ("VERICTO-061", Severity::Medium, EnforcementAction::Flag),
