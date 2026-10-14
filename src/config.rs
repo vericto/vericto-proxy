@@ -38,12 +38,70 @@ pub struct ControlPlaneConfig {
     pub buffer_mode: BufferMode,
     /// Spool directory when buffer_mode = Disk.
     pub disk_spool_path: String,
-    /// Max events held in memory before the oldest are dropped.
+    /// Max undelivered events kept (memory ring, or the disk spool) before the
+    /// oldest are dropped.
     pub memory_capacity: usize,
     /// Max events flushed in one POST /ingest/events batch.
     pub batch_size: usize,
     /// How often the reporter flushes the buffer.
     pub flush_interval: Duration,
+    /// How the disk spool is fed and how long shutdown may take to flush it.
+    pub spool: SpoolTuning,
+}
+
+/// Tuning of the asynchronous telemetry pipeline (since 4.9.1).
+///
+/// With `BufferMode::Disk` the query path no longer touches the spool: it hands
+/// the event to a bounded in-memory channel and a background writer persists the
+/// channel's contents in batches. These are its knobs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SpoolTuning {
+    /// Events the channel in front of the disk writer holds before new events
+    /// are dropped (counted and logged; the query is never held back).
+    /// `VERICTO_TELEMETRY_QUEUE_CAPACITY`, default 2048.
+    pub queue_capacity: usize,
+    /// Longest an event waits in the channel before its batch is written and
+    /// fsynced. A batch is also written as soon as it holds `segment_max`
+    /// events. `VERICTO_TELEMETRY_SPOOL_FLUSH_MS`, default 50.
+    pub flush_every: Duration,
+    /// Most events written in one segment (one write and fsync).
+    /// `VERICTO_TELEMETRY_SPOOL_BATCH_MAX`, default 1000.
+    pub segment_max: usize,
+    /// On SIGTERM/SIGINT, how long the proxy may spend writing what is still
+    /// queued to the spool and delivering what it can before it exits.
+    /// `VERICTO_TELEMETRY_SHUTDOWN_TIMEOUT_MS`, default 5000.
+    pub shutdown_timeout: Duration,
+}
+
+impl Default for SpoolTuning {
+    fn default() -> Self {
+        Self {
+            queue_capacity: 2048,
+            flush_every: Duration::from_millis(50),
+            segment_max: 1000,
+            shutdown_timeout: Duration::from_millis(5000),
+        }
+    }
+}
+
+impl SpoolTuning {
+    fn from_env() -> Self {
+        let d = Self::default();
+        Self {
+            queue_capacity: env_usize("VERICTO_TELEMETRY_QUEUE_CAPACITY")
+                .unwrap_or(d.queue_capacity)
+                .max(1),
+            flush_every: env_u64("VERICTO_TELEMETRY_SPOOL_FLUSH_MS")
+                .map(|ms| Duration::from_millis(ms.max(1)))
+                .unwrap_or(d.flush_every),
+            segment_max: env_usize("VERICTO_TELEMETRY_SPOOL_BATCH_MAX")
+                .unwrap_or(d.segment_max)
+                .max(1),
+            shutdown_timeout: env_u64("VERICTO_TELEMETRY_SHUTDOWN_TIMEOUT_MS")
+                .map(Duration::from_millis)
+                .unwrap_or(d.shutdown_timeout),
+        }
+    }
 }
 
 impl ControlPlaneConfig {
@@ -111,6 +169,7 @@ impl ControlPlaneConfig {
             flush_interval: Duration::from_secs(
                 env_u64("VERICTO_TELEMETRY_FLUSH_SECS").unwrap_or(5),
             ),
+            spool: SpoolTuning::from_env(),
         }))
     }
 }

@@ -85,6 +85,7 @@ async fn main() {
             std::process::exit(1);
         }
     };
+    let mut shutdown_flush: Option<ShutdownFlush> = None;
     let telemetry_sink = match control_plane {
         Some(cp) => {
             tracing::info!(
@@ -116,6 +117,11 @@ async fn main() {
             // Telemetry reporter: drains the queue and POSTs to /ingest/events.
             let queue: Arc<dyn telemetry::EventQueue> = Arc::from(telemetry::new_queue(&cp));
             let reporter = telemetry::Reporter::new(cp.clone(), queue.clone());
+            shutdown_flush = Some(ShutdownFlush {
+                queue: queue.clone(),
+                reporter: reporter.clone(),
+                timeout: cp.spool.shutdown_timeout,
+            });
             tokio::spawn(async move { reporter.run().await });
 
             tcp_opts
@@ -159,34 +165,110 @@ async fn main() {
         "vericto-proxy starting"
     );
 
-    let result = match wire_protocol.as_str() {
-        "mysql" => {
-            tcp::run_mysql_proxy(
-                tcp_opts,
-                ruleset,
-                policy,
-                agent_access,
-                telemetry_mode,
-                telemetry_sink,
-            )
-            .await
-        }
-        _ => {
-            tcp::run_pg_proxy(
-                tcp_opts,
-                ruleset,
-                policy,
-                agent_access,
-                telemetry_mode,
-                telemetry_sink,
-            )
-            .await
+    let proxy = async {
+        match wire_protocol.as_str() {
+            "mysql" => {
+                tcp::run_mysql_proxy(
+                    tcp_opts,
+                    ruleset,
+                    policy,
+                    agent_access,
+                    telemetry_mode,
+                    telemetry_sink,
+                )
+                .await
+            }
+            _ => {
+                tcp::run_pg_proxy(
+                    tcp_opts,
+                    ruleset,
+                    policy,
+                    agent_access,
+                    telemetry_mode,
+                    telemetry_sink,
+                )
+                .await
+            }
         }
     };
 
-    if let Err(e) = result {
-        tracing::error!(error = %e, wire_protocol = %wire_protocol, "The TCP proxy failed");
-        std::process::exit(1);
+    tokio::select! {
+        result = proxy => {
+            if let Err(e) = result {
+                tracing::error!(error = %e, wire_protocol = %wire_protocol, "The TCP proxy failed");
+                std::process::exit(1);
+            }
+        }
+        signal = shutdown_signal() => {
+            tracing::info!(signal, "Shutting down");
+            if let Some(flush) = shutdown_flush {
+                flush.run().await;
+            }
+            // Exit now: open sessions and blocking-pool work are abandoned, as
+            // they would be by the default disposition of the signal.
+            std::process::exit(0);
+        }
+    }
+}
+
+/// What the proxy does with buffered telemetry when it is asked to stop.
+struct ShutdownFlush {
+    queue: Arc<dyn telemetry::EventQueue>,
+    reporter: telemetry::Reporter,
+    timeout: std::time::Duration,
+}
+
+impl ShutdownFlush {
+    /// Within `timeout` in total: write what is still queued to the spool (disk
+    /// mode), then deliver what can be delivered. What is not delivered stays
+    /// on disk for the next process (disk mode) or is lost (memory mode, as on
+    /// any restart).
+    async fn run(self) {
+        let started = std::time::Instant::now();
+        let queue = self.queue.clone();
+        let timeout = self.timeout;
+        let persisted = tokio::task::spawn_blocking(move || queue.flush(timeout))
+            .await
+            .unwrap_or(false);
+        let left = timeout.saturating_sub(started.elapsed());
+        let delivered = tokio::time::timeout(left, self.reporter.deliver_pending())
+            .await
+            .ok();
+        let stats = self.queue.stats();
+        tracing::info!(
+            persisted,
+            delivered = delivered.unwrap_or(0),
+            delivery_finished = delivered.is_some(),
+            queue_depth = stats.queue_depth,
+            spooled = stats.spooled,
+            dropped_queue_full = stats.dropped_queue_full,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "Telemetry flushed at shutdown"
+        );
+    }
+}
+
+/// Resolves on SIGTERM (what ECS, Kubernetes and `docker stop` send) or SIGINT.
+async fn shutdown_signal() -> &'static str {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        match signal(SignalKind::terminate()) {
+            Ok(mut term) => tokio::select! {
+                _ = term.recv() => "SIGTERM",
+                _ = tokio::signal::ctrl_c() => "SIGINT",
+            },
+            Err(e) => {
+                tracing::warn!(error = %e, "Cannot listen for SIGTERM; only SIGINT triggers a clean shutdown");
+                let _ = tokio::signal::ctrl_c().await;
+                "SIGINT"
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+        "SIGINT"
     }
 }
 
