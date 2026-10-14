@@ -889,6 +889,67 @@ mod tests {
     use crate::tcp::evaluator::Observation;
     use vericto_engine::{ReportedViolation, Severity};
 
+    /// The measurement behind `VERICTO_TELEMETRY_SPOOL_MAX_BYTES`' default (README,
+    /// "Disk spool size"): the average spool line of a pgbench-style mix (the
+    /// staging benchmark's traffic) plus a few application statements that break
+    /// rules, evaluated with the built-in ruleset and serialized exactly as the
+    /// spool writes them (one JSON object and a newline per event). Run with
+    /// `--nocapture` to see the figure.
+    #[test]
+    fn the_default_spool_bound_covers_minutes_of_an_api_outage() {
+        let workload = [
+            "BEGIN;",
+            "UPDATE pgbench_accounts SET abalance = abalance + -3122 WHERE aid = 4187363;",
+            "SELECT abalance FROM pgbench_accounts WHERE aid = 4187363;",
+            "UPDATE pgbench_tellers SET tbalance = tbalance + -3122 WHERE tid = 87;",
+            "UPDATE pgbench_branches SET bbalance = bbalance + -3122 WHERE bid = 9;",
+            "INSERT INTO pgbench_history (tid, bid, aid, delta, mtime) VALUES (87, 9, 4187363, -3122, CURRENT_TIMESTAMP);",
+            "END;",
+            "SELECT id, email, created_at FROM users WHERE id = 48211 LIMIT 1",
+            "SELECT o.id, o.total, c.name FROM orders o JOIN customers c ON c.id = o.customer_id WHERE o.created_at > now() - interval '1 day' ORDER BY o.created_at DESC LIMIT 50",
+            "SELECT * FROM orders",
+            "DELETE FROM sessions",
+        ];
+        let rules = crate::tcp::evaluator::default_ruleset();
+        let policy = vericto_engine::EnforcementPolicy::default();
+        let identity = EventIdentity {
+            db_user: Some("app_rw".to_string()),
+            access_mode: None,
+        };
+        let database_id = uuid::Uuid::new_v4().to_string();
+        let mut total = 0usize;
+        for sql in workload {
+            let decision = crate::tcp::evaluator::evaluate(sql, Dialect::Postgres, &rules, &policy);
+            let mut event = build_event(
+                &database_id,
+                sql,
+                Dialect::Postgres,
+                &decision,
+                412,
+                crate::tcp::rules_sync::TelemetryQueryMode::Raw,
+                &identity,
+            );
+            event.event_id = uuid::Uuid::new_v4().to_string();
+            total += serde_json::to_vec(&event).unwrap().len() + 1;
+        }
+        let average = total / workload.len();
+        let events_per_sec = 1_500;
+        let minutes = crate::telemetry::queue::DEFAULT_SPOOL_MAX_BYTES as usize
+            / (average * events_per_sec)
+            / 60;
+        println!(
+            "average spool line: {average} bytes; default bound: {minutes} min at {events_per_sec} events/s"
+        );
+        assert!(
+            (250..2_000).contains(&average),
+            "average event of {average} bytes: re-check the README arithmetic"
+        );
+        assert!(
+            minutes >= 15,
+            "the default spool bound covers only {minutes} min at {events_per_sec} events/s"
+        );
+    }
+
     /// Builds a ReportedViolation without depending on a real evaluation, so the
     /// mapping can be tested independently of which rules happen to exist.
     fn violation(code: &str, sev: Severity, action: EnforcementAction) -> ReportedViolation {

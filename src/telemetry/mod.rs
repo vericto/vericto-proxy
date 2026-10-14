@@ -8,7 +8,9 @@
 //! (see `queue`). If the API is down, events buffer (and drop when full, counted
 //! and logged) — the proxy keeps evaluating and blocking queries.
 
+pub mod heartbeat;
 pub mod queue;
+pub mod quota;
 pub mod reporter;
 
 use serde::{Deserialize, Serialize};

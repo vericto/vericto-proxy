@@ -7,6 +7,73 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [4.12.0] — 2026-10-14
+
+Telemetry loss is visible outside the proxy, the disk spool rides out a longer
+API outage, and a workspace over its monthly quota no longer makes the proxy
+retry all month. No wire-protocol changes; enforcement is unchanged. Works with
+the current Vericto API, which ignores the new header and sends no quota reset
+time (so 4.11's retries apply there); the API's matching release stores the
+counters, shows them in the dashboard and announces the quota state.
+
+### Added
+
+- **Pipeline counters in every rule sync.** `GET /api/v1/sync/rules` (the
+  proxy's heartbeat, every `VERICTO_RULES_SYNC_INTERVAL_SECS`) carries an
+  `X-Vericto-Telemetry-Stats` header with compact JSON: `enqueued`, `delivered`,
+  `dropped_queue_full`, `evicted_oldest`, `dropped_permanent`, `write_failures`,
+  the events (`spooled_events`) and bytes (`spool_bytes`) buffered now,
+  `dropped_quota`, `quota_paused` and `quota_resets_at`, the buffer mode and the
+  proxy version. Totals are since the process started,
+  under a random `instance_id` drawn at startup, so the API tells a restart
+  (counters from 0) from new drops. Up to 4.11 these figures were only in the
+  proxy's own `Telemetry pipeline stats` log line, so events evicted from a full
+  spool were lost without the control plane knowing. The header has no query
+  text, user name or address. An API that does not know it ignores it.
+- **Telemetry pauses over the monthly quota.** On a 429 whose body says
+  `code: "QUOTA_EXCEEDED"` and when the quota resets (`error.resets_at`, or a
+  `Retry-After` header), or a rule sync saying `telemetry_quota: "exceeded"`
+  with `telemetry_quota_resets_at`, the proxy stops sending and retrying
+  telemetry and stops enqueuing new events (counted as `dropped_quota`).
+  Queries are evaluated and enforced exactly as before, and events already
+  buffered wait. It resumes when a rule sync says `telemetry_quota: "ok"` (an
+  upgrade, or the new month) or the reset time passes. One WARN on pausing, one
+  INFO on resuming. Up to 4.11 the proxy retried such batches with backoff all
+  month while its spool filled and evicted. Any other 429 (a rate limit, or a
+  quota 429 without a reset time, as older APIs send) keeps the backoff.
+- `Telemetry pipeline stats` also logs `spool_bytes`, `dropped_quota` and
+  `quota_paused`.
+
+### Changed
+
+- **The disk spool is bounded by bytes:** `VERICTO_TELEMETRY_SPOOL_MAX_BYTES`,
+  default 1 GiB (at least 1 MiB). Up to 4.11 it held at most
+  `VERICTO_TELEMETRY_MEMORY_CAPACITY` events (10,000), under 7 seconds of an
+  API outage at 1,500 statements per second. Measured over a pgbench-style mix,
+  a spool line averages 417 bytes, so 1 GiB holds ~28 minutes at 1,500 events
+  per second, and it is 5% of Fargate's default 20 GiB of ephemeral storage
+  (README, "Disk spool size"). Past the bound the oldest segments are evicted
+  and counted (`evicted_oldest`), as before. The memory buffer keeps its event
+  bound, `VERICTO_TELEMETRY_MEMORY_CAPACITY` (10,000).
+- **An event bound on the spool only when one is configured:**
+  `VERICTO_TELEMETRY_SPOOL_MAX_EVENTS`, or `VERICTO_TELEMETRY_MEMORY_CAPACITY`
+  when that is set, so a deployment that bounded its spool with it keeps that
+  bound. The spool also keeps at most 100,000 segment files, which bounds the
+  in-memory index and the startup listing when traffic is so low that each file
+  carries one event.
+- **Segment files carry their size in the name,**
+  `seg-<seq>-<count>-<bytes>.jsonl`, so the index (bytes included) is rebuilt at
+  startup from one directory listing. Files written by 4.9.1–4.11 and legacy
+  `*.json` files are read as before and measured once with `stat`.
+
+### Upgrade notes
+
+- With `VERICTO_TELEMETRY_BUFFER=disk` and no `VERICTO_TELEMETRY_MEMORY_CAPACITY`,
+  the spool can now grow to 1 GiB during an outage. Make sure the volume has
+  room, or set `VERICTO_TELEMETRY_SPOOL_MAX_BYTES` lower.
+- A downgrade to 4.11 or earlier ignores the segments written by 4.12 (they stay
+  on disk, undelivered, until 4.12 runs again). Let the spool drain first.
+
 ## [4.11.0] — 2026-10-14
 
 Telemetry delivery keeps up with the proxy's traffic. On staging (PostgreSQL

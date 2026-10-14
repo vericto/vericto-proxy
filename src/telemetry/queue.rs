@@ -40,6 +40,21 @@
 //! range before it is acked too, and a segment is removed only when all of it is;
 //! a nack releases its range for the next drain. None of this is on disk: after a
 //! restart, whatever was not fully delivered is sent again (at-least-once).
+//!
+//! ## Bounded by bytes (since 4.12.0)
+//!
+//! Up to 4.11 the spool held at most `VERICTO_TELEMETRY_MEMORY_CAPACITY` events
+//! (10,000): at 1,500 statements per second that is under 7 seconds of an API
+//! outage. It is now bounded by the bytes it holds on disk,
+//! `VERICTO_TELEMETRY_SPOOL_MAX_BYTES` (default [`DEFAULT_SPOOL_MAX_BYTES`]), and
+//! by an event count only when one is configured (`VERICTO_TELEMETRY_SPOOL_MAX_EVENTS`,
+//! or `VERICTO_TELEMETRY_MEMORY_CAPACITY` as before). It also holds at most
+//! [`MAX_SPOOL_SEGMENTS`] files, which bounds the in-memory index when traffic is
+//! so low that every segment carries one event. Past any bound the oldest segments
+//! go, as before. A segment's size is in its name (`seg-<seq>-<count>-<bytes>.jsonl`),
+//! so the index is rebuilt at startup from one directory listing, without a `stat`
+//! per file; a segment named by 4.9.1–4.11 (`seg-<seq>-<count>.jsonl`) or a legacy
+//! `*.json` file is measured once with `stat`.
 
 use std::collections::VecDeque;
 use std::fs;
@@ -60,6 +75,20 @@ pub const DROP_WARN_EVERY: Duration = Duration::from_secs(10);
 
 /// How often the disk writer looks at its channel while it collects a batch.
 const WRITER_POLL: Duration = Duration::from_millis(5);
+
+/// Default bound of the disk spool, in bytes: 1 GiB. See the README ("Disk spool
+/// size") for the arithmetic: about 28 minutes of an API outage at 1,500 events
+/// per second of the measured average event size (417 bytes), and 5% of
+/// Fargate's default 20 GiB of ephemeral storage.
+pub const DEFAULT_SPOOL_MAX_BYTES: u64 = 1024 * 1024 * 1024;
+
+/// Most segment files the spool holds. A segment is written every
+/// `VERICTO_TELEMETRY_SPOOL_FLUSH_MS` (50 ms) when it is not full, so at low
+/// traffic each one carries a single event; this keeps the in-memory index (about
+/// 200 bytes per segment) and the directory listed at startup bounded then. At
+/// 1,500 events per second a segment carries ~75 events and the byte bound is
+/// reached long before this one.
+pub const MAX_SPOOL_SEGMENTS: usize = 100_000;
 
 /// A batch drained for delivery, with an opaque handle to ack/remove it.
 pub struct Batch {
@@ -85,14 +114,21 @@ pub struct QueueStats {
     pub queue_depth: usize,
     /// Undelivered events on disk (disk mode).
     pub spooled: usize,
+    /// Bytes of the spool files holding undelivered events (disk mode). A file
+    /// counts until all of it is delivered.
+    pub spool_bytes: u64,
     /// Events accepted by `push`.
     pub enqueued: u64,
     /// Events refused by `push` because the channel to the disk writer was full.
     pub dropped_queue_full: u64,
-    /// Oldest events discarded to stay within the buffer's capacity.
+    /// Oldest events discarded to stay within the buffer's bounds (events, and
+    /// bytes and files for the disk spool).
     pub evicted_oldest: u64,
     /// Events lost because their segment could not be written.
     pub write_failures: u64,
+    /// Events not enqueued while telemetry was paused for the monthly quota
+    /// (`telemetry::quota`). Filled in by the gated queue around this one.
+    pub dropped_quota: u64,
     /// Segments written (one write + fsync each).
     pub batches_written: u64,
     /// Wall time of the last segment write, including both fsyncs.
@@ -133,7 +169,8 @@ pub fn new_queue(cfg: &ControlPlaneConfig) -> Box<dyn EventQueue> {
         BufferMode::Memory => Box::new(MemoryQueue::new(cfg.memory_capacity)),
         BufferMode::Disk => {
             let opts = DiskOptions::new(
-                cfg.memory_capacity,
+                cfg.spool.max_events.unwrap_or(usize::MAX),
+                cfg.spool.max_bytes,
                 cfg.spool.queue_capacity,
                 cfg.spool.segment_max,
                 cfg.spool.flush_every,
@@ -290,7 +327,12 @@ impl EventQueue for MemoryQueue {
 #[derive(Debug, Clone)]
 pub struct DiskOptions {
     /// Undelivered events kept on disk; past it the oldest segments go.
+    /// `usize::MAX` (the default) = bounded by bytes only.
     pub capacity: usize,
+    /// Bytes of spool files kept on disk; past it the oldest segments go.
+    pub max_bytes: u64,
+    /// Segment files kept on disk; past it the oldest go.
+    pub max_segments: usize,
     /// Events the channel in front of the writer holds; past it `push` drops.
     pub queue_capacity: usize,
     /// Most events per segment, i.e. per write and fsync. Independent of the
@@ -306,12 +348,15 @@ pub struct DiskOptions {
 impl DiskOptions {
     pub fn new(
         capacity: usize,
+        max_bytes: u64,
         queue_capacity: usize,
         batch_max: usize,
         flush_every: Duration,
     ) -> Self {
         Self {
             capacity,
+            max_bytes,
+            max_segments: MAX_SPOOL_SEGMENTS,
             queue_capacity,
             batch_max,
             flush_every,
@@ -325,7 +370,8 @@ impl Default for DiskOptions {
     fn default() -> Self {
         let tuning = crate::config::SpoolTuning::default();
         Self::new(
-            10_000,
+            tuning.max_events.unwrap_or(usize::MAX),
+            tuning.max_bytes,
             tuning.queue_capacity,
             tuning.segment_max,
             tuning.flush_every,
@@ -356,6 +402,8 @@ enum WriterMsg {
 struct DiskShared {
     dir: PathBuf,
     capacity: usize,
+    max_bytes: u64,
+    max_segments: usize,
     queue_capacity: usize,
     index: Mutex<SpoolIndex>,
     /// Serializes `drain_batch`: between reading a segment and recording what it
@@ -382,6 +430,8 @@ struct SpoolIndex {
     segments: VecDeque<Segment>,
     /// Undelivered events across `segments`.
     events: usize,
+    /// Bytes of the files in `segments`.
+    bytes: u64,
     /// In-memory identity of the next segment entry (stable across evictions).
     next_id: u64,
     /// Sequence number of the next segment file.
@@ -393,6 +443,8 @@ struct Segment {
     path: PathBuf,
     /// Events in the file.
     count: usize,
+    /// Size of the file.
+    bytes: u64,
     /// Leading events already delivered (acked). In memory only: after a
     /// restart a partly delivered segment is sent again from its start, which is
     /// what at-least-once allows.
@@ -413,11 +465,12 @@ fn lines_below(ranges: &[(usize, usize)], limit: usize) -> usize {
 }
 
 impl Segment {
-    fn new(id: u64, path: PathBuf, count: usize) -> Self {
+    fn new(id: u64, path: PathBuf, count: usize, bytes: u64) -> Self {
         Self {
             id,
             path,
             count,
+            bytes,
             delivered: 0,
             leased: Vec::new(),
             acked: Vec::new(),
@@ -476,17 +529,36 @@ impl Segment {
 const SEGMENT_PREFIX: &str = "seg-";
 const SEGMENT_SUFFIX: &str = ".jsonl";
 
-fn segment_name(seq: u64, count: usize) -> String {
-    format!("{SEGMENT_PREFIX}{seq:020}-{count}{SEGMENT_SUFFIX}")
+/// `seg-<seq>-<count>-<bytes>.jsonl` (since 4.12.0; the size lets the index be
+/// rebuilt without a `stat` per file).
+fn segment_name(seq: u64, count: usize, bytes: u64) -> String {
+    format!("{SEGMENT_PREFIX}{seq:020}-{count}-{bytes}{SEGMENT_SUFFIX}")
 }
 
-/// `(seq, count)` from a segment file name.
-fn parse_segment_name(name: &str) -> Option<(u64, usize)> {
+/// `(seq, count, bytes)` from a segment file name. `bytes` is `None` for a
+/// segment named by 4.9.1–4.11 (`seg-<seq>-<count>.jsonl`), which has no size in
+/// its name.
+fn parse_segment_name(name: &str) -> Option<(u64, usize, Option<u64>)> {
     let core = name
         .strip_prefix(SEGMENT_PREFIX)?
         .strip_suffix(SEGMENT_SUFFIX)?;
-    let (seq, count) = core.split_once('-')?;
-    Some((seq.parse().ok()?, count.parse().ok()?))
+    let mut parts = core.split('-');
+    let seq = parts.next()?.parse().ok()?;
+    let count = parts.next()?.parse().ok()?;
+    let bytes = match parts.next() {
+        Some(b) => Some(b.parse().ok()?),
+        None => None,
+    };
+    if parts.next().is_some() {
+        return None;
+    }
+    Some((seq, count, bytes))
+}
+
+/// Size of a spool file whose name does not carry it (legacy or pre-4.12 names).
+/// 0 when it cannot be read: the file is then discarded at its first drain anyway.
+fn file_bytes(entry: &fs::DirEntry) -> u64 {
+    entry.metadata().map(|m| m.len()).unwrap_or(0)
 }
 
 impl DiskQueue {
@@ -511,6 +583,8 @@ impl DiskQueue {
         let shared = Arc::new(DiskShared {
             dir,
             capacity,
+            max_bytes: opts.max_bytes.max(1),
+            max_segments: opts.max_segments.max(1),
             queue_capacity: opts.queue_capacity.max(1),
             index: Mutex::new(index),
             drain_lock: Mutex::new(()),
@@ -529,7 +603,7 @@ impl DiskQueue {
         });
         // A spool written with a larger capacity (or by many restarts) is brought
         // within this one's bound before anything new arrives.
-        shared.evict_to_fit(0);
+        shared.evict_to_fit(0, 0);
         {
             let index = shared.index.lock().unwrap();
             tracing::info!(
@@ -537,6 +611,8 @@ impl DiskQueue {
                 segments = index.segments.len(),
                 legacy_files = legacy,
                 events = index.events,
+                bytes = index.bytes,
+                max_bytes = shared.max_bytes,
                 elapsed_ms = started.elapsed().as_millis() as u64,
                 "Telemetry spool index rebuilt"
             );
@@ -595,8 +671,8 @@ impl Drop for DiskQueue {
 /// order, then segments in sequence order. Hidden files (temporaries, the rules
 /// cache) and anything else are left alone.
 fn rebuild_index(dir: &Path) -> std::io::Result<(SpoolIndex, usize)> {
-    let mut legacy: Vec<PathBuf> = Vec::new();
-    let mut segments: Vec<(u64, usize, PathBuf)> = Vec::new();
+    let mut legacy: Vec<(PathBuf, u64)> = Vec::new();
+    let mut segments: Vec<(u64, usize, u64, PathBuf)> = Vec::new();
     for entry in fs::read_dir(dir)? {
         let Ok(entry) = entry else { continue };
         let path = entry.path();
@@ -606,35 +682,39 @@ fn rebuild_index(dir: &Path) -> std::io::Result<(SpoolIndex, usize)> {
         if name.starts_with('.') {
             continue;
         }
-        if let Some((seq, count)) = parse_segment_name(name) {
-            segments.push((seq, count, path));
+        if let Some((seq, count, bytes)) = parse_segment_name(name) {
+            let bytes = bytes.unwrap_or_else(|| file_bytes(&entry));
+            segments.push((seq, count, bytes, path));
         } else if name.ends_with(".json") {
-            legacy.push(path);
+            let bytes = file_bytes(&entry);
+            legacy.push((path, bytes));
         }
     }
     legacy.sort(); // lexical = chronological (timestamped names)
-    segments.sort_by_key(|(seq, _, _)| *seq);
+    segments.sort_by_key(|(seq, _, _, _)| *seq);
 
     let mut index = SpoolIndex {
-        next_seq: segments.last().map(|(seq, _, _)| seq + 1).unwrap_or(1),
+        next_seq: segments.last().map(|(seq, _, _, _)| seq + 1).unwrap_or(1),
         ..SpoolIndex::default()
     };
     let legacy_files = legacy.len();
-    for path in legacy {
-        index.add(path, 1);
+    for (path, bytes) in legacy {
+        index.add(path, 1, bytes);
     }
-    for (_, count, path) in segments {
-        index.add(path, count);
+    for (_, count, bytes, path) in segments {
+        index.add(path, count, bytes);
     }
     Ok((index, legacy_files))
 }
 
 impl SpoolIndex {
-    fn add(&mut self, path: PathBuf, count: usize) {
+    fn add(&mut self, path: PathBuf, count: usize, bytes: u64) {
         let id = self.next_id;
         self.next_id += 1;
         self.events += count;
-        self.segments.push_back(Segment::new(id, path, count));
+        self.bytes += bytes;
+        self.segments
+            .push_back(Segment::new(id, path, count, bytes));
     }
 
     fn position(&self, id: u64) -> Option<usize> {
@@ -648,6 +728,7 @@ impl SpoolIndex {
         let seg = self.segments.remove(pos)?;
         let remaining = seg.remaining();
         self.events = self.events.saturating_sub(remaining);
+        self.bytes = self.bytes.saturating_sub(seg.bytes);
         Some((seg.path, remaining))
     }
 }
@@ -741,7 +822,8 @@ impl DiskShared {
             index.next_seq += 1;
             seq
         };
-        let name = segment_name(seq, count);
+        let bytes = body.len() as u64;
+        let name = segment_name(seq, count, bytes);
         let path = self.dir.join(&name);
         // Written under a hidden temporary name, fsynced, then renamed: `rename`
         // within one directory is atomic, so a reader never observes a partially
@@ -771,8 +853,8 @@ impl DiskShared {
         }
         sync_dir(&self.dir);
 
-        self.evict_to_fit(count);
-        self.index.lock().unwrap().add(path, count);
+        self.evict_to_fit(count, bytes);
+        self.index.lock().unwrap().add(path, count, bytes);
         self.pending.fetch_sub(accepted, Ordering::Relaxed);
 
         let us = started.elapsed().as_micros() as u64;
@@ -781,19 +863,27 @@ impl DiskShared {
         self.max_batch_write_us.fetch_max(us, Ordering::Relaxed);
     }
 
-    /// Drops the oldest segments until `incoming` more events fit the capacity.
-    /// Files are removed outside the index lock.
-    fn evict_to_fit(&self, incoming: usize) {
+    /// Drops the oldest segments until one more segment of `incoming` events and
+    /// `incoming_bytes` bytes fits every bound: events, bytes and files (`0, 0`:
+    /// until the spool is within them). A segment larger than the byte bound on
+    /// its own is still written, into an otherwise empty spool. Files are removed
+    /// outside the index lock.
+    fn evict_to_fit(&self, incoming: usize, incoming_bytes: u64) {
         let mut doomed = Vec::new();
         let mut evicted = 0usize;
+        let new_segment = usize::from(incoming > 0);
         {
             let mut index = self.index.lock().unwrap();
-            while index.events + incoming > self.capacity {
+            while index.events.saturating_add(incoming) > self.capacity
+                || index.bytes.saturating_add(incoming_bytes) > self.max_bytes
+                || index.segments.len() + new_segment > self.max_segments
+            {
                 let Some(seg) = index.segments.pop_front() else {
                     break;
                 };
                 let remaining = seg.remaining();
                 index.events = index.events.saturating_sub(remaining);
+                index.bytes = index.bytes.saturating_sub(seg.bytes);
                 evicted += remaining;
                 doomed.push(seg.path);
             }
@@ -809,7 +899,8 @@ impl DiskShared {
             if self.warn_evict.allow() {
                 tracing::warn!(
                     evicted_total = total,
-                    capacity = self.capacity,
+                    max_bytes = self.max_bytes,
+                    max_events = (self.capacity != usize::MAX).then_some(self.capacity),
                     "Telemetry disk spool full — dropped the oldest events"
                 );
             }
@@ -1009,6 +1100,7 @@ impl EventQueue for DiskQueue {
                 index.events = index.events.saturating_sub(before - after);
                 if complete {
                     if let Some(seg) = index.segments.remove(pos) {
+                        index.bytes = index.bytes.saturating_sub(seg.bytes);
                         done.push(seg.path);
                     }
                 }
@@ -1041,9 +1133,14 @@ impl EventQueue for DiskQueue {
 
     fn stats(&self) -> QueueStats {
         let s = &self.shared;
+        let (spooled, spool_bytes) = {
+            let index = s.index.lock().unwrap();
+            (index.events, index.bytes)
+        };
         QueueStats {
             queue_depth: s.pending.load(Ordering::Relaxed),
-            spooled: s.index.lock().unwrap().events,
+            spooled,
+            spool_bytes,
             enqueued: s.enqueued.load(Ordering::Relaxed),
             dropped_queue_full: s.dropped_queue_full.load(Ordering::Relaxed),
             evicted_oldest: s.evicted_oldest.load(Ordering::Relaxed),
@@ -1051,6 +1148,7 @@ impl EventQueue for DiskQueue {
             batches_written: s.batches_written.load(Ordering::Relaxed),
             last_batch_write_us: s.last_batch_write_us.load(Ordering::Relaxed),
             max_batch_write_us: s.max_batch_write_us.load(Ordering::Relaxed),
+            dropped_quota: 0,
         }
     }
 
@@ -1256,7 +1354,7 @@ mod tests {
         let dir = scratch("badline");
         let good = serde_json::to_string(&allowed_event("after")).unwrap();
         fs::write(
-            dir.join(segment_name(7, 2)),
+            dir.join(segment_name(7, 2, 0)),
             format!("{{ not json\n{good}\n"),
         )
         .unwrap();
@@ -1797,6 +1895,141 @@ mod tests {
         assert_eq!(drain_ids(&q, 10), vec!["m0", "m1", "m2"]);
     }
 
+    // ─── 4.12.0: bounded by bytes ───────────────────────────────────────────
+
+    /// One spool line of `allowed_event(id)`, as the writer lays it out.
+    fn line_bytes(id: &str) -> u64 {
+        serde_json::to_vec(&allowed_event(id)).unwrap().len() as u64 + 1
+    }
+
+    /// The byte bound evicts the oldest segments, keeps the newest, and counts
+    /// what it evicted; with no event bound, the count alone never evicts.
+    #[test]
+    fn the_spool_is_bounded_by_bytes() {
+        let dir = scratch("bytes");
+        let per_segment = line_bytes("b0");
+        let opts = || DiskOptions {
+            capacity: usize::MAX,
+            max_bytes: per_segment * 3,
+            batch_max: 1,
+            ..DiskOptions::default()
+        };
+        let q = open(&dir, opts());
+        for i in 0..5 {
+            q.push(allowed_event(&format!("b{i}")));
+        }
+        assert!(q.flush(FLUSH));
+        let stats = q.stats();
+        assert_eq!(stats.spooled, 3);
+        assert_eq!(stats.spool_bytes, per_segment * 3);
+        assert_eq!(stats.evicted_oldest, 2);
+        let on_disk: u64 = q
+            .files_on_disk()
+            .iter()
+            .map(|p| fs::metadata(p).unwrap().len())
+            .sum();
+        assert_eq!(on_disk, stats.spool_bytes, "the index matches the disk");
+        drop(q);
+
+        // After a restart the sizes come from the names, and the bound still holds.
+        let q = open(&dir, opts());
+        assert_eq!(q.stats().spool_bytes, per_segment * 3);
+        q.push(allowed_event("b5"));
+        assert!(q.flush(FLUSH));
+        assert_eq!(q.stats().spool_bytes, per_segment * 3);
+        assert_eq!(drain_ids(&q, 10), vec!["b3", "b4", "b5"]);
+        let stats = q.stats();
+        assert_eq!(
+            (stats.spooled, stats.spool_bytes),
+            (0, 0),
+            "ack frees the bytes"
+        );
+        assert!(q.files_on_disk().is_empty());
+    }
+
+    /// A segment named by 4.9.1–4.11 (no size in its name) and a legacy file are
+    /// measured at startup and count against the byte bound like any other.
+    #[test]
+    fn files_written_before_4_12_count_against_the_byte_bound() {
+        let dir = scratch("bytes-upgrade");
+        let line = serde_json::to_vec(&allowed_event("old-seg")).unwrap();
+        let mut body = line.clone();
+        body.push(b'\n');
+        fs::write(dir.join("seg-00000000000000000003-1.jsonl"), &body).unwrap();
+        let legacy = serde_json::to_vec(&allowed_event("legacy")).unwrap();
+        fs::write(dir.join("2026-10-01T00-00-00__legacy.json"), &legacy).unwrap();
+
+        let q = open(
+            &dir,
+            DiskOptions {
+                capacity: usize::MAX,
+                max_bytes: 1 << 20,
+                ..DiskOptions::default()
+            },
+        );
+        assert_eq!(q.stats().spooled, 2);
+        assert_eq!(q.stats().spool_bytes, (body.len() + legacy.len()) as u64);
+        q.push(allowed_event("new"));
+        assert!(q.flush(FLUSH));
+        assert_eq!(drain_ids(&q, 10), vec!["legacy", "old-seg", "new"]);
+        assert_eq!(q.stats().spool_bytes, 0);
+    }
+
+    /// A segment larger than the whole bound is still written (into an empty
+    /// spool) rather than lost on arrival.
+    #[test]
+    fn a_segment_larger_than_the_bound_replaces_everything_before_it() {
+        let dir = scratch("bytes-big");
+        let q = open(
+            &dir,
+            DiskOptions {
+                capacity: usize::MAX,
+                max_bytes: 10,
+                batch_max: 1,
+                ..DiskOptions::default()
+            },
+        );
+        q.push(allowed_event("x0"));
+        q.push(allowed_event("x1"));
+        assert!(q.flush(FLUSH));
+        assert_eq!(q.stats().spooled, 1);
+        assert_eq!(q.stats().evicted_oldest, 1);
+        assert_eq!(drain_ids(&q, 10), vec!["x1"]);
+    }
+
+    /// At low traffic every segment holds one event; the file bound keeps the
+    /// index and the startup listing bounded then.
+    #[test]
+    fn the_number_of_segment_files_is_bounded() {
+        let dir = scratch("segments");
+        let q = open(
+            &dir,
+            DiskOptions {
+                capacity: usize::MAX,
+                max_bytes: 1 << 30,
+                max_segments: 2,
+                batch_max: 1,
+                ..DiskOptions::default()
+            },
+        );
+        for i in 0..4 {
+            q.push(allowed_event(&format!("s{i}")));
+        }
+        assert!(q.flush(FLUSH));
+        assert_eq!(q.files_on_disk().len(), 2);
+        assert_eq!(q.stats().evicted_oldest, 2);
+        assert_eq!(drain_ids(&q, 10), vec!["s2", "s3"]);
+    }
+
+    /// The default disk spool has no event bound: 4.11's 10,000 no longer caps it.
+    #[test]
+    fn the_default_disk_spool_is_not_bounded_by_10000_events() {
+        let o = DiskOptions::default();
+        assert_eq!(o.capacity, usize::MAX);
+        assert_eq!(o.max_bytes, DEFAULT_SPOOL_MAX_BYTES);
+        assert_eq!(o.max_segments, MAX_SPOOL_SEGMENTS);
+    }
+
     #[test]
     fn warnings_are_rate_limited() {
         let w = WarnLimiter::new();
@@ -1807,8 +2040,17 @@ mod tests {
 
     #[test]
     fn segment_names_round_trip_and_sort_by_sequence() {
-        assert_eq!(parse_segment_name(&segment_name(42, 100)), Some((42, 100)));
-        assert!(segment_name(9, 1) < segment_name(10, 1));
+        assert_eq!(
+            parse_segment_name(&segment_name(42, 100, 51_200)),
+            Some((42, 100, Some(51_200)))
+        );
+        // As 4.9.1–4.11 named them: no size.
+        assert_eq!(
+            parse_segment_name("seg-00000000000000000042-100.jsonl"),
+            Some((42, 100, None))
+        );
+        assert_eq!(parse_segment_name("seg-1-2-3-4.jsonl"), None);
+        assert!(segment_name(9, 1, 900) < segment_name(10, 1, 10));
         assert_eq!(parse_segment_name("2026-10-01T03-52-50__e1.json"), None);
     }
 }

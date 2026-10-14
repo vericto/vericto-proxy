@@ -101,6 +101,24 @@ async fn main() {
                 "Control-plane link enabled (telemetry + rule sync)"
             );
 
+            // Telemetry reporter: drains the queue and POSTs to /ingest/events. The
+            // queue is gated by the monthly-quota pause it shares with the reporter
+            // and the rule syncer (4.12.0, telemetry::quota).
+            let quota_gate = Arc::new(telemetry::quota::QuotaGate::new());
+            let queue: Arc<dyn telemetry::EventQueue> =
+                Arc::new(telemetry::quota::QuotaGatedQueue::new(
+                    telemetry::new_queue(&cp),
+                    Arc::clone(&quota_gate),
+                ));
+            let reporter =
+                telemetry::Reporter::new(cp.clone(), queue.clone()).with_quota_gate(quota_gate);
+            // Its counters ride on every rule sync (4.12.0).
+            let sync_stats = telemetry::heartbeat::StatsSource::new(
+                cp.buffer_mode,
+                queue.clone(),
+                reporter.clone(),
+            );
+
             // Rule syncer: polls GET /sync/rules and swaps the ruleset and
             // policy in place. Flips `readiness` after its first attempt.
             let sync_cfg = cp.clone();
@@ -117,13 +135,11 @@ async fn main() {
                     sync_agent_access,
                     sync_telemetry_mode,
                     sync_readiness,
+                    Some(sync_stats),
                 )
                 .await
             });
 
-            // Telemetry reporter: drains the queue and POSTs to /ingest/events.
-            let queue: Arc<dyn telemetry::EventQueue> = Arc::from(telemetry::new_queue(&cp));
-            let reporter = telemetry::Reporter::new(cp.clone(), queue.clone());
             shutdown_flush = Some(ShutdownFlush {
                 queue: queue.clone(),
                 reporter: reporter.clone(),
