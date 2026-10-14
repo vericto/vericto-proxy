@@ -43,6 +43,18 @@ bulk, queued ingest; works with an older API too (see gzip below).
 - `Telemetry pipeline stats` also logs delivered events, requests, retries,
   events refused permanently, requests in flight and request times.
 
+### Security
+
+- `rustls` 0.23.45 → 0.23.46 (lockfile only) for RUSTSEC-2026-0346 (`Debug`
+  output of client session values exposes TLS secrets), RUSTSEC-2026-0347
+  (buffered data sent to the outer server after an ECH rejection),
+  RUSTSEC-2026-0348 (Brotli certificate decompression can allocate up to 1 GiB
+  before authentication) and RUSTSEC-2026-0349 (an unauthenticated ServerHello
+  can downgrade later connections to classical key exchange). rustls is the TLS
+  stack of the proxy's client and server connections and of its requests to the
+  Vericto API. The proxy does not configure ECH or enable Brotli certificate
+  compression.
+
 ### Dependencies
 
 - `flate2` 1 (MIT OR Apache-2.0), already in the lockfile through `mysql_async`,
