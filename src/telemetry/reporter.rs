@@ -21,18 +21,27 @@
 //! - A retryable failure (transport error, 5xx, 429, 401/403...) releases the batch
 //!   for a later attempt and pauses new requests with exponential backoff; one that
 //!   succeeds resets it. A 413 splits the batch in halves before anything is dropped.
+//!
+//! ## Since 4.12.0
+//!
+//! - A 429 with `code: "QUOTA_EXCEEDED"` and a reset time pauses telemetry until the
+//!   quota resets or a rule sync says it is lifted (`telemetry::quota`): no request
+//!   is sent or retried meanwhile, and the batch stays buffered. Any other 429 keeps
+//!   the backoff above.
 
 use std::collections::HashMap;
 use std::io::Write;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
+use std::time::{Duration, Instant, SystemTime};
 
 use tokio::task::JoinSet;
 
 use crate::config::ControlPlaneConfig;
 use crate::telemetry::TelemetryEvent;
 use crate::telemetry::queue::{Batch, EventQueue, QueueStats};
+use crate::telemetry::quota::{QUOTA_EXCEEDED_CODE, QuotaGate};
 
 /// How often the reporter logs the queue's counters (only when something moved).
 pub const STATS_LOG_EVERY: Duration = Duration::from_secs(60);
@@ -47,6 +56,8 @@ pub struct Reporter {
     queue: Arc<dyn EventQueue>,
     client: reqwest::Client,
     shared: Arc<Shared>,
+    /// Paused while the workspace is over its monthly quota (4.12.0).
+    quota: Arc<QuotaGate>,
 }
 
 /// State shared by the reporter's delivery tasks.
@@ -59,6 +70,63 @@ struct Shared {
     dropped_permanent: AtomicU64,
     last_request_us: AtomicU64,
     max_request_us: AtomicU64,
+    /// Unix milliseconds of the last request answered 2xx; 0 = none yet.
+    last_delivery_ms: AtomicI64,
+    /// Batches whose requests are outstanding.
+    in_flight: AtomicUsize,
+    /// The oldest event of each batch in flight, by flight token: a batch of the
+    /// memory buffer has left the ring while it is out, and is still undelivered.
+    in_flight_oldest: Mutex<Vec<(u64, SystemTime)>>,
+    next_flight: AtomicU64,
+}
+
+/// One batch in flight, for the delivery-lag metric and the in-flight gauge.
+/// Dropped with the delivery task, whether it finished, failed or panicked.
+struct InFlight {
+    shared: Arc<Shared>,
+    token: u64,
+}
+
+impl InFlight {
+    fn new(shared: &Arc<Shared>, oldest: Option<SystemTime>) -> Self {
+        let token = shared.next_flight.fetch_add(1, Ordering::Relaxed);
+        shared.in_flight.fetch_add(1, Ordering::Relaxed);
+        if let Some(at) = oldest {
+            shared.in_flight_oldest.lock().unwrap().push((token, at));
+        }
+        Self {
+            shared: Arc::clone(shared),
+            token,
+        }
+    }
+}
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        self.shared.in_flight.fetch_sub(1, Ordering::Relaxed);
+        if let Ok(mut held) = self.shared.in_flight_oldest.lock() {
+            held.retain(|(t, _)| *t != self.token);
+        }
+    }
+}
+
+/// Where delivery stands (since 4.12.0): for the metrics and the rule-sync
+/// heartbeat. In-memory reads only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct DeliveryState {
+    /// The last time the API answered 2xx to a telemetry request.
+    pub last_delivery_at: Option<SystemTime>,
+    /// Telemetry requests outstanding.
+    pub in_flight: usize,
+    /// The oldest event a batch in flight carries.
+    pub oldest_in_flight: Option<SystemTime>,
+}
+
+/// The reporter's own totals since the process started.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct DeliveryCounters {
+    pub delivered: u64,
+    pub dropped_permanent: u64,
 }
 
 /// What became of a batch whose requests all completed.
@@ -85,13 +153,30 @@ impl Reporter {
             dropped_permanent: AtomicU64::new(0),
             last_request_us: AtomicU64::new(0),
             max_request_us: AtomicU64::new(0),
+            last_delivery_ms: AtomicI64::new(0),
+            in_flight: AtomicUsize::new(0),
+            in_flight_oldest: Mutex::new(Vec::new()),
+            next_flight: AtomicU64::new(0),
         });
         Self {
             cfg,
             queue,
             client,
             shared,
+            quota: Arc::new(QuotaGate::new()),
         }
+    }
+
+    /// Shares `gate` with the queue and the rule syncer, so a quota 429 here pauses
+    /// all of them and a sync that lifts it resumes this reporter.
+    pub fn with_quota_gate(mut self, gate: Arc<QuotaGate>) -> Self {
+        self.quota = gate;
+        self
+    }
+
+    /// The gate this reporter pauses on (for the heartbeat and the rule syncer).
+    pub fn quota_gate(&self) -> Arc<QuotaGate> {
+        Arc::clone(&self.quota)
     }
 
     fn ingest_url(&self) -> String {
@@ -118,7 +203,13 @@ impl Reporter {
             if paused_until.is_some_and(|t| Instant::now() >= t) {
                 paused_until = None;
             }
-            if paused_until.is_none() {
+            // Over the monthly quota nothing is sent or retried; what is buffered
+            // waits for the pause to end (telemetry::quota).
+            let quota_paused = self.quota.is_paused();
+            if quota_paused {
+                pending_since = None;
+            }
+            if paused_until.is_none() && !quota_paused {
                 while flights.len() < self.max_in_flight() {
                     let available = self.queue.available();
                     if available == 0 {
@@ -178,7 +269,7 @@ impl Reporter {
         let mut delivered = 0;
         let mut failed = false;
         loop {
-            while !failed && flights.len() < self.max_in_flight() {
+            while !failed && !self.quota.is_paused() && flights.len() < self.max_in_flight() {
                 let Some(batch) = self.drain().await else {
                     break;
                 };
@@ -208,7 +299,7 @@ impl Reporter {
 
     /// Acks a batch whose requests completed (delivered or refused for good), or
     /// releases it for a retry. `Err` when the delivery should back off.
-    async fn settle(&self, batch: Batch, outcome: Result<Sent, String>) -> Result<(), ()> {
+    async fn settle(&self, batch: Batch, outcome: Result<Sent, Failure>) -> Result<(), ()> {
         let count = batch.events.len();
         let queue = Arc::clone(&self.queue);
         match outcome {
@@ -216,10 +307,21 @@ impl Reporter {
                 self.shared
                     .delivered
                     .fetch_add(sent.delivered as u64, Ordering::Relaxed);
+                if sent.delivered > 0 {
+                    self.shared
+                        .last_delivery_ms
+                        .store(chrono::Utc::now().timestamp_millis(), Ordering::Relaxed);
+                }
                 let _ = tokio::task::spawn_blocking(move || queue.ack(&batch)).await;
                 Ok(())
             }
-            Err(reason) => {
+            // Over the quota: the batch stays buffered for after the pause, which the
+            // gate already entered (and logged once). Not a retry, not a backoff.
+            Err(Failure::Quota) => {
+                let _ = tokio::task::spawn_blocking(move || queue.nack(batch)).await;
+                Ok(())
+            }
+            Err(Failure::Retry(reason)) => {
                 self.shared.retries.fetch_add(1, Ordering::Relaxed);
                 tracing::warn!(error = %reason, count, "Telemetry delivery failed; will retry");
                 let _ = tokio::task::spawn_blocking(move || queue.nack(batch)).await;
@@ -231,7 +333,7 @@ impl Reporter {
     /// Sends `events`, splitting on 413. `Err` (retry the whole batch) as soon as a
     /// part fails retryably; parts already delivered are sent again then, which the
     /// API deduplicates by event id.
-    async fn deliver_events(&self, url: &str, events: &[TelemetryEvent]) -> Result<Sent, String> {
+    async fn deliver_events(&self, url: &str, events: &[TelemetryEvent]) -> Result<Sent, Failure> {
         match self.post(url, events).await {
             Ok(()) => Ok(Sent {
                 delivered: events.len(),
@@ -264,7 +366,11 @@ impl Reporter {
                     dropped: events.len(),
                 })
             }
-            Err(DeliveryError::Retryable { reason }) => Err(reason),
+            Err(DeliveryError::Retryable { reason }) => Err(Failure::Retry(reason)),
+            Err(DeliveryError::Quota { resets_at }) => {
+                self.quota.pause(resets_at, "ingest");
+                Err(Failure::Quota)
+            }
         }
     }
 
@@ -316,6 +422,14 @@ impl Reporter {
         if status.is_success() {
             return Ok(());
         }
+        if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            if let Some(resets_at) = quota_reset_of(res).await {
+                return Err(DeliveryError::Quota { resets_at });
+            }
+            return Err(DeliveryError::Retryable {
+                reason: format!("ingest returned HTTP {status}"),
+            });
+        }
         if classify(status).is_permanent() {
             Err(DeliveryError::Permanent {
                 status: status.as_u16(),
@@ -327,11 +441,38 @@ impl Reporter {
         }
     }
 
+    /// Events the API answered 2xx for, and events it refused permanently
+    /// (dropped), since the process started. Reported in the rule-sync heartbeat
+    /// (see `telemetry::heartbeat`).
+    pub fn delivery_counters(&self) -> DeliveryCounters {
+        DeliveryCounters {
+            delivered: self.shared.delivered.load(Ordering::Relaxed),
+            dropped_permanent: self.shared.dropped_permanent.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Where delivery stands now (since 4.12.0).
+    pub fn delivery_state(&self) -> DeliveryState {
+        let ms = self.shared.last_delivery_ms.load(Ordering::Relaxed);
+        DeliveryState {
+            last_delivery_at: (ms > 0)
+                .then(|| SystemTime::UNIX_EPOCH + Duration::from_millis(ms as u64)),
+            in_flight: self.shared.in_flight.load(Ordering::Relaxed),
+            oldest_in_flight: self
+                .shared
+                .in_flight_oldest
+                .lock()
+                .ok()
+                .and_then(|held| held.iter().map(|(_, at)| *at).min()),
+        }
+    }
+
     fn log_stats(&self, s: &QueueStats, in_flight: usize) {
         let d = &self.shared;
         tracing::info!(
             queue_depth = s.queue_depth,
             spooled = s.spooled,
+            spool_bytes = s.spool_bytes,
             enqueued = s.enqueued,
             dropped_queue_full = s.dropped_queue_full,
             evicted_oldest = s.evicted_oldest,
@@ -343,6 +484,8 @@ impl Reporter {
             requests = d.requests.load(Ordering::Relaxed),
             retries = d.retries.load(Ordering::Relaxed),
             dropped_permanent = d.dropped_permanent.load(Ordering::Relaxed),
+            dropped_quota = s.dropped_quota,
+            quota_paused = self.quota.is_paused(),
             in_flight,
             last_request_ms = d.last_request_us.load(Ordering::Relaxed) as f64 / 1000.0,
             max_request_ms = d.max_request_us.load(Ordering::Relaxed) as f64 / 1000.0,
@@ -357,7 +500,7 @@ impl Reporter {
 /// events held for the life of the process.
 #[derive(Default)]
 struct Flights {
-    tasks: JoinSet<Result<Sent, String>>,
+    tasks: JoinSet<Result<Sent, Failure>>,
     batches: HashMap<tokio::task::Id, Arc<Batch>>,
 }
 
@@ -373,18 +516,28 @@ impl Flights {
     fn launch(&mut self, reporter: Reporter, url: Arc<str>, batch: Batch) {
         let batch = Arc::new(batch);
         let held = Arc::clone(&batch);
-        let handle = self
-            .tasks
-            .spawn(async move { reporter.deliver_events(&url, &held.events).await });
+        // Events leave in FIFO order, so the first is the batch's oldest.
+        let oldest = held
+            .events
+            .first()
+            .map(|e| crate::telemetry::queue::event_time(&e.occurred_at));
+        let flight = InFlight::new(&reporter.shared, oldest);
+        let handle = self.tasks.spawn(async move {
+            let _flight = flight;
+            reporter.deliver_events(&url, &held.events).await
+        });
         self.batches.insert(handle.id(), batch);
     }
 
     /// The next finished batch and its outcome; `None` when nothing is in flight.
-    async fn next(&mut self) -> Option<(Batch, Result<Sent, String>)> {
+    async fn next(&mut self) -> Option<(Batch, Result<Sent, Failure>)> {
         loop {
             let (id, outcome) = match self.tasks.join_next_with_id().await? {
                 Ok((id, outcome)) => (id, outcome),
-                Err(e) => (e.id(), Err(format!("delivery task failed: {e}"))),
+                Err(e) => (
+                    e.id(),
+                    Err(Failure::Retry(format!("delivery task failed: {e}"))),
+                ),
             };
             let Some(batch) = self.batches.remove(&id) else {
                 continue;
@@ -472,6 +625,55 @@ enum DeliveryError {
     Permanent { status: u16 },
     /// Transport error, or a server-side condition that may clear.
     Retryable { reason: String },
+    /// 429 QUOTA_EXCEEDED: refused until the monthly quota resets (4.12.0).
+    Quota {
+        resets_at: chrono::DateTime<chrono::Utc>,
+    },
+}
+
+/// Why a batch's requests did not all succeed.
+#[derive(Debug)]
+enum Failure {
+    /// Retry with backoff.
+    Retry(String),
+    /// Over the monthly quota: telemetry is paused (the gate is already entered).
+    Quota,
+}
+
+impl std::fmt::Display for Failure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Failure::Retry(reason) => f.write_str(reason),
+            Failure::Quota => f.write_str("monthly quota exceeded"),
+        }
+    }
+}
+
+/// The quota reset a 429 announces: `QUOTA_EXCEEDED` in its body and a reset time
+/// (`error.resets_at`, else `Retry-After`). `None` for any other 429, including a
+/// quota 429 from an API before 4.12's, which says no reset time: those keep the
+/// backoff and retries of 4.11.
+async fn quota_reset_of(res: reqwest::Response) -> Option<chrono::DateTime<chrono::Utc>> {
+    let retry_after = res
+        .headers()
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.trim().parse::<u64>().ok());
+    // The error body is small; a larger one is not the API's quota answer.
+    let body = res.bytes().await.ok()?;
+    if body.len() > 64 * 1024 {
+        return None;
+    }
+    let json: serde_json::Value = serde_json::from_slice(&body).ok()?;
+    let error = json.get("error")?;
+    if error.get("code")?.as_str()? != QUOTA_EXCEEDED_CODE {
+        return None;
+    }
+    crate::telemetry::quota::reset_time(
+        error.get("resets_at").and_then(|v| v.as_str()),
+        retry_after,
+        chrono::Utc::now(),
+    )
 }
 
 enum Disposition {
@@ -521,6 +723,13 @@ mod tests {
     enum Answer {
         Ok,
         Status(u16),
+        /// 429 with the API's quota body (`code`), and the reset time in the body
+        /// (`resets_at`) and/or a `Retry-After` header.
+        Quota {
+            code: &'static str,
+            resets_at: Option<&'static str>,
+            retry_after: Option<u64>,
+        },
     }
 
     type Rule = Arc<dyn Fn(usize, &Request) -> Answer + Send + Sync>;
@@ -545,6 +754,7 @@ mod tests {
     }
 
     async fn mock_with(rule: Rule, delay: Duration) -> MockIngest {
+        use axum::response::IntoResponse;
         use axum::{Router, body::Bytes, http::HeaderMap, http::StatusCode as S, routing::post};
         let seen = Arc::new(Mutex::new(Vec::new()));
         let requests = Arc::new(Mutex::new(Vec::new()));
@@ -596,9 +806,30 @@ mod tests {
                         match rule(n, &req) {
                             Answer::Ok => {
                                 seen.lock().unwrap().extend(req.ids);
-                                S::ACCEPTED
+                                S::ACCEPTED.into_response()
                             }
-                            Answer::Status(code) => S::from_u16(code).unwrap(),
+                            Answer::Status(code) => S::from_u16(code).unwrap().into_response(),
+                            Answer::Quota {
+                                code,
+                                resets_at,
+                                retry_after,
+                            } => {
+                                let mut error =
+                                    serde_json::json!({ "code": code, "message": "quota" });
+                                if let Some(r) = resets_at {
+                                    error["resets_at"] = r.into();
+                                }
+                                let mut res = (
+                                    S::TOO_MANY_REQUESTS,
+                                    axum::Json(serde_json::json!({ "error": error })),
+                                )
+                                    .into_response();
+                                if let Some(secs) = retry_after {
+                                    res.headers_mut()
+                                        .insert("retry-after", secs.to_string().parse().unwrap());
+                                }
+                                res
+                            }
                         }
                     }
                 }),
@@ -696,6 +927,29 @@ mod tests {
         wait_for(|| all_seen(&seen, "d", 350)).await;
         wait_for(|| queue.stats().spooled == 0 && queue.stats().queue_depth == 0).await;
         assert_eq!(queue.stats().dropped_queue_full, 0);
+    }
+
+    /// The delivery lag counts a memory batch while it is in flight (it has left
+    /// the ring but is not delivered), and the last 2xx is recorded.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn delivery_state_tracks_requests_in_flight_and_the_last_2xx() {
+        let api = mock_with(Arc::new(|_, _| Answer::Ok), Duration::from_millis(300)).await;
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = cfg(&api.url, dir.path());
+        cfg.buffer_mode = crate::config::BufferMode::Memory;
+        let queue: Arc<dyn EventQueue> = Arc::from(crate::telemetry::new_queue(&cfg));
+        let reporter = Reporter::new(cfg, queue.clone());
+        assert_eq!(reporter.delivery_state(), DeliveryState::default());
+        tokio::spawn(reporter.clone().run());
+        for i in 0..10 {
+            queue.push(event(format!("m{i}")));
+        }
+        wait_for(|| reporter.delivery_state().in_flight > 0).await;
+        assert!(reporter.delivery_state().oldest_in_flight.is_some());
+        assert_eq!(queue.oldest_buffered_at(), None, "the batch left the ring");
+        wait_for(|| reporter.delivery_state().last_delivery_at.is_some()).await;
+        wait_for(|| reporter.delivery_state().in_flight == 0).await;
+        assert_eq!(reporter.delivery_state().oldest_in_flight, None);
     }
 
     /// Shutdown: what is still queued is written and then delivered within the
@@ -967,6 +1221,148 @@ mod tests {
             "the batch holding p3 is dropped, the rest delivered"
         );
         assert!(!seen.contains(&"p3".to_string()));
+    }
+
+    /// Over the monthly quota (4.12.0): the first 429 QUOTA_EXCEEDED pauses
+    /// telemetry. Nothing more is sent or retried, new events do not reach the
+    /// spool (counted as dropped_quota), and what was buffered waits. When the
+    /// pause is lifted (a rule sync says "ok"), the buffered events are delivered.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_quota_429_pauses_telemetry_until_it_is_lifted() {
+        let lifted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let api = {
+            let lifted = lifted.clone();
+            mock_with(
+                Arc::new(move |_, _| {
+                    if lifted.load(Ordering::SeqCst) {
+                        Answer::Ok
+                    } else {
+                        Answer::Quota {
+                            code: "QUOTA_EXCEEDED",
+                            resets_at: Some("2099-01-01T00:00:00.000Z"),
+                            retry_after: Some(3600),
+                        }
+                    }
+                }),
+                Duration::ZERO,
+            )
+            .await
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = cfg(&api.url, dir.path());
+        cfg.batch_size = 10;
+        let gate = Arc::new(QuotaGate::new());
+        let queue: Arc<dyn EventQueue> = Arc::new(crate::telemetry::quota::QuotaGatedQueue::new(
+            crate::telemetry::new_queue(&cfg),
+            gate.clone(),
+        ));
+        for i in 0..10 {
+            queue.push(event(format!("q{i}")));
+        }
+        tokio::spawn(
+            Reporter::new(cfg, queue.clone())
+                .with_quota_gate(gate.clone())
+                .run(),
+        );
+        wait_for(|| gate.is_paused()).await;
+        let sent = api.requests.lock().unwrap().len();
+        assert_eq!(sent, 1, "one request, then the pause");
+
+        // While paused: no request, no retry, the spool does not grow.
+        for i in 0..200 {
+            queue.push(event(format!("x{i}")));
+        }
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert_eq!(
+            api.requests.lock().unwrap().len(),
+            1,
+            "nothing sent while paused"
+        );
+        let s = queue.stats();
+        assert_eq!(s.spooled, 10, "the paused events never reached the spool");
+        assert_eq!(s.dropped_quota, 200);
+        assert!(api.seen.lock().unwrap().is_empty());
+
+        // Lifted: the buffered batch goes out, and new events are recorded again.
+        lifted.store(true, Ordering::SeqCst);
+        assert!(gate.resume("rules_sync"));
+        queue.push(event("after".to_string()));
+        let seen = api.seen.clone();
+        wait_for(|| {
+            all_seen(&seen, "q", 10) && seen.lock().unwrap().contains(&"after".to_string())
+        })
+        .await;
+        wait_for(|| queue.stats().spooled == 0).await;
+    }
+
+    /// Any other 429 keeps 4.11's backoff and retries: a rate limit, and a quota
+    /// 429 from an API that does not say when the quota resets.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn other_429s_are_retried_without_pausing() {
+        for answer in [
+            Answer::Status(429),
+            Answer::Quota {
+                code: "RATE_LIMIT_EXCEEDED",
+                resets_at: Some("2099-01-01T00:00:00.000Z"),
+                retry_after: Some(60),
+            },
+            Answer::Quota {
+                code: "QUOTA_EXCEEDED",
+                resets_at: None,
+                retry_after: None,
+            },
+        ] {
+            let api = mock_with(
+                Arc::new(move |n, _| if n < 2 { answer } else { Answer::Ok }),
+                Duration::ZERO,
+            )
+            .await;
+            let dir = tempfile::tempdir().unwrap();
+            let cfg = cfg(&api.url, dir.path());
+            let gate = Arc::new(QuotaGate::new());
+            let queue: Arc<dyn EventQueue> =
+                Arc::new(crate::telemetry::quota::QuotaGatedQueue::new(
+                    crate::telemetry::new_queue(&cfg),
+                    gate.clone(),
+                ));
+            tokio::spawn(
+                Reporter::new(cfg, queue.clone())
+                    .with_quota_gate(gate.clone())
+                    .run(),
+            );
+            for i in 0..5 {
+                queue.push(event(format!("r{i}")));
+            }
+            let seen = api.seen.clone();
+            wait_for(|| all_seen(&seen, "r", 5)).await;
+            assert!(!gate.is_paused());
+            assert_eq!(queue.stats().dropped_quota, 0);
+            assert!(api.requests.lock().unwrap().len() >= 3, "retried");
+        }
+    }
+
+    /// Shutdown while paused sends nothing; the spool keeps the events.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shutdown_while_paused_sends_nothing() {
+        let api = mock_ingest(0).await;
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = cfg(&api.url, dir.path());
+        let gate = Arc::new(QuotaGate::new());
+        let queue: Arc<dyn EventQueue> = Arc::from(crate::telemetry::new_queue(&cfg));
+        for i in 0..5 {
+            queue.push(event(format!("z{i}")));
+        }
+        let q = queue.clone();
+        assert!(
+            tokio::task::spawn_blocking(move || q.flush(Duration::from_secs(5)))
+                .await
+                .unwrap()
+        );
+        gate.pause(chrono::Utc::now() + chrono::Duration::hours(1), "ingest");
+        let reporter = Reporter::new(cfg, queue.clone()).with_quota_gate(gate);
+        assert_eq!(reporter.deliver_pending().await, 0);
+        assert!(api.requests.lock().unwrap().is_empty());
+        assert_eq!(queue.stats().spooled, 5);
     }
 
     #[test]

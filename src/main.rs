@@ -84,6 +84,37 @@ async fn main() {
     // built-in default ruleset is already active and protective).
     let readiness = crate::tcp::healthz::Readiness::new();
 
+    // Metrics (4.12.0): `/metrics` on the healthz listener and CloudWatch EMF on
+    // stdout, both opt-in; the healthz bind address; per-task spool directories.
+    let metrics_cfg = telemetry::metrics::MetricsConfig::from_env();
+    let healthz_addr = match crate::tcp::healthz::bind_addr_from(
+        std::env::var("VERICTO_HEALTHZ_ADDR").ok().as_deref(),
+    ) {
+        Ok(addr) => addr,
+        Err(e) => {
+            tracing::error!("{e}");
+            std::process::exit(1);
+        }
+    };
+    let subdir = match telemetry::spool_dir::SubdirConfig::from_env() {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!("{e}");
+            std::process::exit(1);
+        }
+    };
+    // The task id names the EMF `TaskId` dimension and, with
+    // VERICTO_TELEMETRY_SPOOL_SUBDIR=task, the spool directory.
+    let task_id = if metrics_cfg.emf
+        || matches!(
+            subdir.mode,
+            telemetry::spool_dir::SubdirMode::Task | telemetry::spool_dir::SubdirMode::Hostname
+        ) {
+        Some(telemetry::spool_dir::instance_name().await)
+    } else {
+        None
+    };
+
     // Control-plane link (telemetry + rule sync) — optional.
     let control_plane = match config::ControlPlaneConfig::from_env() {
         Ok(cp) => cp,
@@ -93,13 +124,79 @@ async fn main() {
         }
     };
     let mut shutdown_flush: Option<ShutdownFlush> = None;
+    let mut metrics_stats: Option<telemetry::heartbeat::StatsSource> = None;
     let telemetry_sink = match control_plane {
-        Some(cp) => {
+        Some(mut cp) => {
+            // One spool directory per proxy on a shared volume (4.12.0,
+            // telemetry::spool_dir). The rules cache keeps its path, resolved from
+            // the shared directory.
+            let mut layout = None;
+            if cp.buffer_mode == config::BufferMode::Disk {
+                if let Some(name) =
+                    telemetry::spool_dir::resolve_name(&subdir.mode, task_id.as_deref()).await
+                {
+                    match telemetry::spool_dir::SpoolLayout::new(&cp.disk_spool_path, &name)
+                        .prepare(subdir.orphan_after)
+                    {
+                        Ok(l) => {
+                            tracing::info!(
+                                shared = %cp.disk_spool_path,
+                                own = %l.own_dir().display(),
+                                orphan_after_secs = subdir.orphan_after.as_secs(),
+                                "Telemetry spool: one directory per proxy"
+                            );
+                            cp.disk_spool_path = l.own_dir().to_string_lossy().into_owned();
+                            layout = Some(Arc::new(l));
+                        }
+                        Err(e) => tracing::error!(
+                            error = %e,
+                            dir = %cp.disk_spool_path,
+                            "Could not set up this proxy's spool subdirectory; spooling to the shared directory"
+                        ),
+                    }
+                }
+            }
+
             tracing::info!(
                 buffer = ?cp.buffer_mode,
                 rules_sync_secs = cp.rules_sync_interval.as_secs(),
                 "Control-plane link enabled (telemetry + rule sync)"
             );
+
+            // Telemetry reporter: drains the queue and POSTs to /ingest/events. The
+            // queue is gated by the monthly-quota pause it shares with the reporter
+            // and the rule syncer (4.12.0, telemetry::quota).
+            let quota_gate = Arc::new(telemetry::quota::QuotaGate::new());
+            let queue: Arc<dyn telemetry::EventQueue> =
+                Arc::new(telemetry::quota::QuotaGatedQueue::new(
+                    telemetry::new_queue(&cp),
+                    Arc::clone(&quota_gate),
+                ));
+            let reporter =
+                telemetry::Reporter::new(cp.clone(), queue.clone()).with_quota_gate(quota_gate);
+            // Its counters ride on every rule sync (4.12.0).
+            let spool_max_bytes = if queue.spool_dir().is_some() {
+                cp.spool.max_bytes
+            } else {
+                0
+            };
+            let sync_stats = telemetry::heartbeat::StatsSource::new(
+                cp.buffer_mode,
+                queue.clone(),
+                reporter.clone(),
+            )
+            .with_spool_max_bytes(spool_max_bytes);
+            metrics_stats = Some(sync_stats.clone());
+            // Adopt orphaned spools and keep this one's lease (only for a disk
+            // spool that opened: never move another proxy's events into memory).
+            let layout = layout.filter(|_| queue.spool_dir().is_some());
+            if let Some(layout) = &layout {
+                let (layout, queue) = (Arc::clone(layout), queue.clone());
+                let orphan_after = subdir.orphan_after;
+                tokio::spawn(async move {
+                    telemetry::spool_dir::run_maintenance(layout, queue, orphan_after).await
+                });
+            }
 
             // Rule syncer: polls GET /sync/rules and swaps the ruleset and
             // policy in place. Flips `readiness` after its first attempt.
@@ -117,17 +214,16 @@ async fn main() {
                     sync_agent_access,
                     sync_telemetry_mode,
                     sync_readiness,
+                    Some(sync_stats),
                 )
                 .await
             });
 
-            // Telemetry reporter: drains the queue and POSTs to /ingest/events.
-            let queue: Arc<dyn telemetry::EventQueue> = Arc::from(telemetry::new_queue(&cp));
-            let reporter = telemetry::Reporter::new(cp.clone(), queue.clone());
             shutdown_flush = Some(ShutdownFlush {
                 queue: queue.clone(),
                 reporter: reporter.clone(),
                 timeout: cp.spool.shutdown_timeout,
+                layout,
             });
             tokio::spawn(async move { reporter.run().await });
 
@@ -153,12 +249,40 @@ async fn main() {
     // warm-up and succeed afterwards.
     if let Some(healthz_port) = tcp_opts.healthz_port {
         let healthz_readiness = readiness.clone();
+        let extras = crate::tcp::healthz::HealthzExtras {
+            metrics: metrics_cfg.prometheus,
+            stats: metrics_stats.clone(),
+        };
         tokio::spawn(async move {
-            if let Err(e) = crate::tcp::healthz::run_healthz(healthz_port, healthz_readiness).await
+            if let Err(e) = crate::tcp::healthz::run_healthz(
+                healthz_addr,
+                healthz_port,
+                healthz_readiness,
+                extras,
+            )
+            .await
             {
                 tracing::error!(error = %e, port = healthz_port, "healthz listener failed");
             }
         });
+    } else if metrics_cfg.prometheus {
+        tracing::warn!(
+            "VERICTO_METRICS_PROMETHEUS is set but VERICTO_HEALTHZ_PORT is not: /metrics is served on the healthz listener only, so it is off"
+        );
+    }
+
+    // CloudWatch EMF (4.12.0): one line of metrics per interval on stdout.
+    if metrics_cfg.emf {
+        match metrics_stats.clone() {
+            Some(stats) => {
+                let cfg = metrics_cfg.clone();
+                let task_id = task_id.clone();
+                tokio::spawn(async move { telemetry::metrics::run_emf(cfg, stats, task_id).await });
+            }
+            None => tracing::warn!(
+                "VERICTO_METRICS_EMF is set but the control-plane link is off: there is no telemetry pipeline to report"
+            ),
+        }
     }
 
     // Wire protocol selected per deployment (Option A): one protocol per proxy
@@ -223,6 +347,9 @@ struct ShutdownFlush {
     queue: Arc<dyn telemetry::EventQueue>,
     reporter: telemetry::Reporter,
     timeout: std::time::Duration,
+    /// This proxy's spool directory on a shared volume: its lease is released
+    /// after the flush, so another proxy adopts what is left at its next scan.
+    layout: Option<Arc<telemetry::spool_dir::SpoolLayout>>,
 }
 
 impl ShutdownFlush {
@@ -252,6 +379,9 @@ impl ShutdownFlush {
             elapsed_ms = started.elapsed().as_millis() as u64,
             "Telemetry flushed at shutdown"
         );
+        if let Some(layout) = self.layout {
+            let _ = tokio::task::spawn_blocking(move || layout.release()).await;
+        }
     }
 }
 

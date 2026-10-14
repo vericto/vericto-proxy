@@ -84,6 +84,51 @@ struct SyncResponse {
     /// policy fails the whole response, which keeps the last-good one.
     #[serde(default)]
     agent_access: Option<AccessPolicyMap>,
+    /// "ok" | "exceeded": the workspace's monthly query quota (API 4.12-era).
+    /// Absent from an older API: the quota pause is then left as it is.
+    #[serde(default)]
+    telemetry_quota: Option<String>,
+    /// When the quota resets (RFC 3339), with `telemetry_quota`.
+    #[serde(default)]
+    telemetry_quota_resets_at: Option<String>,
+}
+
+/// What a sync says about the monthly quota (see `telemetry::quota`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QuotaWord {
+    Ok,
+    Exceeded(chrono::DateTime<chrono::Utc>),
+}
+
+impl SyncResponse {
+    fn quota_word(&self) -> Option<QuotaWord> {
+        match self.telemetry_quota.as_deref() {
+            Some("ok") => Some(QuotaWord::Ok),
+            Some("exceeded") => self
+                .telemetry_quota_resets_at
+                .as_deref()
+                .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                .map(|t| QuotaWord::Exceeded(t.with_timezone(&chrono::Utc))),
+            _ => None,
+        }
+    }
+}
+
+/// Pauses or resumes telemetry on the API's word. A 304 means the API's state is
+/// still the one of the last body, so the caller applies that one again: a pause
+/// entered meanwhile by an ingest 429 ends if the API says the quota is fine.
+fn apply_quota(word: Option<QuotaWord>, gate: Option<&crate::telemetry::quota::QuotaGate>) {
+    let (Some(word), Some(gate)) = (word, gate) else {
+        return;
+    };
+    match word {
+        QuotaWord::Ok => {
+            gate.resume("rules_sync");
+        }
+        QuotaWord::Exceeded(resets_at) => {
+            gate.pause(resets_at, "rules_sync");
+        }
+    }
 }
 
 /// Settings configurable from the Vericto dashboard, applied without restart.
@@ -226,6 +271,7 @@ struct Applied {
     agent_access: usize,
     mode: TelemetryQueryMode,
     proxy_config: Option<ProxyConfig>,
+    quota: Option<QuotaWord>,
 }
 
 /// Swaps in the ruleset, policy and telemetry mode from one `/sync/rules` response.
@@ -237,6 +283,7 @@ fn apply(
     agent_access: &SharedAccessPolicies,
     telemetry_mode: &SharedTelemetryMode,
 ) -> Applied {
+    let quota = body.quota_word();
     let mode = TelemetryQueryMode::from_api(
         body.policy
             .as_ref()
@@ -260,6 +307,7 @@ fn apply(
         agent_access: access_users,
         mode,
         proxy_config: body.proxy_config,
+        quota,
     }
 }
 
@@ -322,6 +370,10 @@ fn apply_proxy_config(
 /// Runs forever: polls the API on the configured interval and swaps the ruleset
 /// and policy when they change. Failures are logged; the last-good ruleset and
 /// policy stay in effect, and with a rules cache they also survive a restart.
+///
+/// With `stats`, every poll also carries the telemetry pipeline's counters in the
+/// [`STATS_HEADER`](crate::telemetry::heartbeat::STATS_HEADER) header (since
+/// 4.12.0), so the API sees what this proxy delivered and dropped.
 pub async fn run(
     cfg: ControlPlaneConfig,
     ruleset: SharedRuleset,
@@ -329,6 +381,7 @@ pub async fn run(
     agent_access: SharedAccessPolicies,
     telemetry_mode: SharedTelemetryMode,
     readiness: Arc<crate::tcp::healthz::Readiness>,
+    stats: Option<crate::telemetry::heartbeat::StatsSource>,
 ) {
     let mut url = format!("{}/api/v1/sync/rules", cfg.api_url);
     if let Some(ref db_id) = cfg.database_id {
@@ -342,6 +395,9 @@ pub async fn run(
         .expect("failed to build rule-sync HTTP client");
 
     let mut etag: Option<String> = None;
+    // The quota state of the last body applied (re-applied on a 304).
+    let mut last_quota: Option<QuotaWord> = None;
+    let quota_gate = stats.as_ref().map(|s| s.quota_gate());
     let mut sync_interval = cfg.rules_sync_interval;
     let mut ticker = tokio::time::interval(sync_interval);
 
@@ -357,6 +413,8 @@ pub async fn run(
                 if let Some(pc) = &applied.proxy_config {
                     apply_proxy_config(pc, &mut sync_interval, &mut ticker);
                 }
+                last_quota = applied.quota;
+                apply_quota(last_quota, quota_gate.as_deref());
                 etag = cached.etag;
                 tracing::info!(
                     count = applied.count,
@@ -375,6 +433,12 @@ pub async fn run(
         ticker.tick().await;
 
         let mut req = client.get(&url).header("X-API-Key", &cfg.api_key);
+        if let Some(stats) = &stats {
+            req = req.header(
+                crate::telemetry::heartbeat::STATS_HEADER,
+                stats.header_value(),
+            );
+        }
         if let Some(tag) = &etag {
             req = req.header("If-None-Match", tag.clone());
         }
@@ -382,6 +446,7 @@ pub async fn run(
         match req.send().await {
             Ok(res) if res.status().as_u16() == 304 => {
                 tracing::debug!("Ruleset unchanged (304)");
+                apply_quota(last_quota, quota_gate.as_deref());
             }
             Ok(res) if res.status().is_success() => {
                 let new_etag = res
@@ -405,6 +470,8 @@ pub async fn run(
                         if let Some(pc) = &applied.proxy_config {
                             apply_proxy_config(pc, &mut sync_interval, &mut ticker);
                         }
+                        last_quota = applied.quota;
+                        apply_quota(last_quota, quota_gate.as_deref());
                         // Cached only after it parsed and was applied: the file always
                         // holds a response this proxy has enforced, never a bad one.
                         if let Some(cache) = &cache {
@@ -585,6 +652,7 @@ mod tests {
             no_access(),
             mode,
             ready.clone(),
+            None,
         ));
         ready.wait_ready().await;
         first.abort();
@@ -604,6 +672,7 @@ mod tests {
             no_access(),
             mode.clone(),
             ready.clone(),
+            None,
         ));
         ready.wait_ready().await;
         second.abort();
@@ -616,6 +685,199 @@ mod tests {
         assert!(pol.monitor_mode);
         assert_eq!(pol.high, EnforcementAction::Flag);
         assert_eq!(**mode.load(), TelemetryQueryMode::Sanitized);
+    }
+
+    /// Every poll carries the pipeline counters (4.12.0); an API that does not know
+    /// the header answers exactly as before, which is what this stand-in does.
+    #[tokio::test]
+    async fn every_sync_carries_the_telemetry_counters() {
+        use crate::config::BufferMode;
+        use axum::{Router, http::HeaderMap, routing::get};
+        use std::sync::Mutex;
+
+        let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen_by_api = Arc::clone(&seen);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = Router::new().route(
+            "/api/v1/sync/rules",
+            get(move |headers: HeaderMap| {
+                let seen = Arc::clone(&seen_by_api);
+                async move {
+                    if let Some(v) = headers.get(crate::telemetry::heartbeat::STATS_HEADER) {
+                        seen.lock().unwrap().push(v.to_str().unwrap().to_string());
+                    }
+                    r#"{"version": "v1", "rules": []}"#
+                }
+            }),
+        );
+        let server = tokio::spawn(async move { axum::serve(listener, app).await });
+
+        let cfg = ControlPlaneConfig {
+            api_url: format!("http://{addr}"),
+            api_key: "vk_test".into(),
+            database_id: None,
+            rules_sync_interval: Duration::from_secs(3600),
+            rules_cache_path: None,
+            buffer_mode: BufferMode::Memory,
+            disk_spool_path: String::new(),
+            memory_capacity: 10,
+            batch_size: 10,
+            flush_interval: Duration::from_secs(5),
+            spool: crate::config::SpoolTuning::default(),
+            delivery: crate::config::DeliveryTuning::default(),
+        };
+        let queue: Arc<dyn crate::telemetry::EventQueue> =
+            Arc::new(crate::telemetry::queue::MemoryQueue::new(10));
+        let reporter = crate::telemetry::Reporter::new(cfg.clone(), Arc::clone(&queue));
+        let stats =
+            crate::telemetry::heartbeat::StatsSource::new(BufferMode::Memory, queue, reporter);
+        let ready = crate::tcp::healthz::Readiness::new();
+        let sync = tokio::spawn(run(
+            cfg,
+            Arc::new(ArcSwap::from_pointee(Vec::new())),
+            Arc::new(ArcSwap::from_pointee(EnforcementPolicy::default())),
+            Arc::new(ArcSwap::from_pointee(AccessPolicyMap::default())),
+            Arc::new(ArcSwap::from_pointee(TelemetryQueryMode::default())),
+            ready.clone(),
+            Some(stats),
+        ));
+        ready.wait_ready().await;
+        sync.abort();
+        server.abort();
+
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1, "the first sync sends the header");
+        let json: serde_json::Value = serde_json::from_str(&seen[0]).unwrap();
+        assert_eq!(json["v"], 1);
+        assert_eq!(json["buffer"], "memory");
+        assert_eq!(json["enqueued"], 0);
+    }
+
+    #[test]
+    fn the_quota_word_is_read_from_the_body() {
+        let parse = |extra: &str| -> Option<QuotaWord> {
+            serde_json::from_str::<SyncResponse>(&format!(
+                r#"{{"version": "v1", "rules": []{extra}}}"#
+            ))
+            .unwrap()
+            .quota_word()
+        };
+        assert_eq!(parse(""), None, "an older API says nothing");
+        assert_eq!(parse(r#", "telemetry_quota": "ok""#), Some(QuotaWord::Ok));
+        assert_eq!(
+            parse(
+                r#", "telemetry_quota": "exceeded", "telemetry_quota_resets_at": "2026-11-01T00:00:00.000Z""#
+            ),
+            Some(QuotaWord::Exceeded(
+                chrono::DateTime::parse_from_rfc3339("2026-11-01T00:00:00Z")
+                    .unwrap()
+                    .with_timezone(&chrono::Utc)
+            ))
+        );
+        assert_eq!(
+            parse(r#", "telemetry_quota": "exceeded""#),
+            None,
+            "exceeded without a reset time is not acted on"
+        );
+        assert_eq!(parse(r#", "telemetry_quota": "something-new""#), None);
+    }
+
+    /// The rule sync pauses telemetry when the API says the quota is exceeded,
+    /// keeps that state across 304s (re-applying the last body: a pause ended by
+    /// hand comes back while the API still says exceeded), and resumes when the
+    /// API says "ok" again (an upgrade, or the new month).
+    #[tokio::test]
+    async fn the_rule_sync_pauses_and_resumes_telemetry_on_the_apis_word() {
+        use crate::config::BufferMode;
+        use axum::{
+            Router,
+            http::{HeaderMap, StatusCode, header},
+            response::IntoResponse,
+            routing::get,
+        };
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let exceeded = Arc::new(AtomicBool::new(true));
+        let api_state = Arc::clone(&exceeded);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = Router::new().route(
+            "/api/v1/sync/rules",
+            get(move |headers: HeaderMap| {
+                let exceeded = api_state.load(Ordering::SeqCst);
+                async move {
+                    let tag = if exceeded { "\"q-exceeded\"" } else { "\"q-ok\"" };
+                    if headers.get(header::IF_NONE_MATCH).and_then(|v| v.to_str().ok()) == Some(tag) {
+                        return StatusCode::NOT_MODIFIED.into_response();
+                    }
+                    let body = if exceeded {
+                        r#"{"version": "v1", "rules": [], "telemetry_quota": "exceeded", "telemetry_quota_resets_at": "2099-01-01T00:00:00.000Z"}"#
+                    } else {
+                        r#"{"version": "v1", "rules": [], "telemetry_quota": "ok", "telemetry_quota_resets_at": "2099-01-01T00:00:00.000Z"}"#
+                    };
+                    ([(header::ETAG, tag)], body).into_response()
+                }
+            }),
+        );
+        let server = tokio::spawn(async move { axum::serve(listener, app).await });
+
+        let cfg = ControlPlaneConfig {
+            api_url: format!("http://{addr}"),
+            api_key: "vk_test".into(),
+            database_id: None,
+            rules_sync_interval: Duration::from_millis(100),
+            rules_cache_path: None,
+            buffer_mode: BufferMode::Memory,
+            disk_spool_path: String::new(),
+            memory_capacity: 10,
+            batch_size: 10,
+            flush_interval: Duration::from_secs(5),
+            spool: crate::config::SpoolTuning::default(),
+            delivery: crate::config::DeliveryTuning::default(),
+        };
+        let queue: Arc<dyn crate::telemetry::EventQueue> =
+            Arc::new(crate::telemetry::queue::MemoryQueue::new(10));
+        let reporter = crate::telemetry::Reporter::new(cfg.clone(), Arc::clone(&queue));
+        let stats =
+            crate::telemetry::heartbeat::StatsSource::new(BufferMode::Memory, queue, reporter);
+        let gate = stats.quota_gate();
+        let sync = tokio::spawn(run(
+            cfg,
+            Arc::new(ArcSwap::from_pointee(Vec::new())),
+            Arc::new(ArcSwap::from_pointee(EnforcementPolicy::default())),
+            Arc::new(ArcSwap::from_pointee(AccessPolicyMap::default())),
+            Arc::new(ArcSwap::from_pointee(TelemetryQueryMode::default())),
+            crate::tcp::healthz::Readiness::new(),
+            Some(stats),
+        ));
+        let until = |cond: &dyn Fn() -> bool| {
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while !cond() {
+                assert!(std::time::Instant::now() < deadline, "timed out");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        };
+        let g = Arc::clone(&gate);
+        tokio::task::spawn_blocking(move || until(&|| g.is_paused()))
+            .await
+            .unwrap();
+
+        // Resumed by hand; the next 304 re-applies "exceeded".
+        assert!(gate.resume("test"));
+        let g = Arc::clone(&gate);
+        tokio::task::spawn_blocking(move || until(&|| g.is_paused()))
+            .await
+            .unwrap();
+
+        // The API lifts it (new ETag, body "ok"): resumed.
+        exceeded.store(false, Ordering::SeqCst);
+        let g = Arc::clone(&gate);
+        tokio::task::spawn_blocking(move || until(&|| !g.is_paused()))
+            .await
+            .unwrap();
+        sync.abort();
+        server.abort();
     }
 
     fn applied_policy(body: &str) -> EnforcementPolicy {
@@ -758,6 +1020,7 @@ mod tests {
                 Arc::new(ArcSwap::from_pointee(AccessPolicyMap::default())),
                 Arc::new(ArcSwap::from_pointee(TelemetryQueryMode::default())),
                 ready.clone(),
+                None,
             ));
             (pol, ready, task)
         };
@@ -816,6 +1079,7 @@ mod tests {
             Arc::new(ArcSwap::from_pointee(AccessPolicyMap::default())),
             Arc::new(ArcSwap::from_pointee(TelemetryQueryMode::default())),
             ready.clone(),
+            None,
         ));
         ready.wait_ready().await;
         task.abort();
@@ -968,6 +1232,7 @@ mod tests {
                 access.clone(),
                 Arc::new(ArcSwap::from_pointee(TelemetryQueryMode::default())),
                 ready.clone(),
+                None,
             ));
             (access, ready, task)
         };

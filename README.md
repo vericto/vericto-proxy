@@ -315,8 +315,12 @@ buffer), or to an empty value to turn it off.
 | `VERICTO_RULES_SYNC_INTERVAL_SECS`  | `300`   | How often to poll `/sync/rules` (min 30)         |
 | `VERICTO_TELEMETRY_BUFFER`          | `memory`| `memory` or `disk` (survives restarts)           |
 | `VERICTO_TELEMETRY_DISK_PATH`       | `/var/lib/vericto/spool` | Spool dir when buffer=disk        |
+| `VERICTO_TELEMETRY_SPOOL_SUBDIR`    | — (off) | buffer=disk, several proxies on one volume: spool to `<spool dir>/tasks/<name>/`, `<name>` = `task` (ECS task id, else hostname), `hostname`, or a fixed name. See [Several proxies on one volume](#several-proxies-on-one-volume) |
+| `VERICTO_TELEMETRY_SPOOL_ORPHAN_SECS` | `600` | With `VERICTO_TELEMETRY_SPOOL_SUBDIR`: a proxy's directory whose lease is this old is adopted by a live one (min 120) |
 | `VERICTO_RULES_CACHE_PATH`          | `<spool dir>/.rules-cache` with buffer=disk, else off | Last-good ruleset kept for restarts; empty = off |
-| `VERICTO_TELEMETRY_MEMORY_CAPACITY` | `10000` | Max undelivered events: the memory ring buffer, or the disk spool with buffer=disk (oldest dropped past it) |
+| `VERICTO_TELEMETRY_MEMORY_CAPACITY` | `10000` | Max undelivered events in the memory ring buffer (oldest dropped past it). With buffer=disk it also bounds the spool's event count when set, as it did up to 4.11 |
+| `VERICTO_TELEMETRY_SPOOL_MAX_BYTES` | `1073741824` (1 GiB) | buffer=disk: most bytes of spool files kept on disk; past it the oldest are dropped and counted (min 1 MiB). See [Disk spool size](#disk-spool-size) |
+| `VERICTO_TELEMETRY_SPOOL_MAX_EVENTS` | — (bytes only) | buffer=disk: optional event bound on top of the byte bound; unset, `VERICTO_TELEMETRY_MEMORY_CAPACITY` applies if set |
 | `VERICTO_TELEMETRY_BATCH_SIZE`      | `500`   | Max events per POST `/ingest/events` (at most 500, the API's limit); this many pending events trigger a send |
 | `VERICTO_TELEMETRY_FLUSH_SECS`      | `5`     | Longest the oldest pending event waits before a partial batch is sent (whichever comes first with the batch size) |
 | `VERICTO_TELEMETRY_MAX_IN_FLIGHT`   | `4`     | POSTs outstanding at once (1–64)                 |
@@ -346,6 +350,94 @@ the buffer only when the request that carried it is answered 2xx, whatever order
 answers arrive in; a retryable failure (network, 5xx, 429, 401/403) keeps the batch
 for a later attempt with exponential backoff, a 413 splits the batch, and a
 payload the API refuses (400, 415, 422) is dropped and logged at `error`.
+
+Since 4.12.0 every rule sync (`GET /api/v1/sync/rules`, every
+`VERICTO_RULES_SYNC_INTERVAL_SECS`) also sends the pipeline's counters in the
+`X-Vericto-Telemetry-Stats` header, as compact JSON: events enqueued and
+delivered, events dropped by cause (`dropped_queue_full`, `evicted_oldest`,
+`dropped_permanent`, `write_failures`, and `dropped_quota`, see below), the events
+and bytes buffered right now, and whether telemetry is paused for the quota
+(`quota_paused`, `quota_resets_at`). The totals are since the process started, under a random `instance_id`
+drawn at startup, so the Vericto API can tell new drops from a restart and show
+them in the dashboard. No query text, user name or address is in it. An API that
+does not know the header ignores it. The header also says how far behind delivery
+is: `oldest_undelivered_age_s` (seconds since the oldest event still waiting was
+recorded, 0 when none waits), `last_delivery_at` (the last 2xx, `null` before the
+first) and `spool_max_bytes` (the spool's bound, 0 with the memory buffer). The
+same figures are in [Metrics](#metrics).
+
+#### Over the monthly quota
+
+On a plan with a hard monthly query limit the API refuses telemetry past it. Since
+4.12.0, when `/ingest/events` answers 429 with `code: "QUOTA_EXCEEDED"` and the
+reset time (`error.resets_at` or `Retry-After`), or a rule sync says
+`telemetry_quota: "exceeded"`, the proxy **pauses telemetry**: it keeps evaluating
+and enforcing every query exactly as before, but sends and retries nothing, and new
+events are not buffered (counted as `dropped_quota`, so the spool does not fill
+with events the API would refuse). Events buffered before the pause wait. It
+resumes when a rule sync says `telemetry_quota: "ok"` (after an upgrade, or in the
+new month), at the latest one `VERICTO_RULES_SYNC_INTERVAL_SECS` later, or when the
+reset time passes. The log has one WARN when it pauses and one INFO when it
+resumes. Any other 429 keeps the retries with backoff.
+
+#### Disk spool size
+
+Up to 4.11 the spool held at most 10,000 events (`VERICTO_TELEMETRY_MEMORY_CAPACITY`),
+under 7 seconds of an API outage at 1,500 statements per second. Since 4.12.0 it
+is bounded by bytes, `VERICTO_TELEMETRY_SPOOL_MAX_BYTES`, default 1 GiB:
+
+- **Event size.** The test `the_default_spool_bound_covers_minutes_of_an_api_outage`
+  (`src/tcp/postgres.rs`) evaluates a pgbench-style mix (the staging benchmark's
+  traffic) plus statements that break rules, with the built-in ruleset, and
+  measures the spool lines exactly as written: **417 bytes per event on average**.
+- **Outage covered.** 1 GiB / (417 B × 1,500 events/s) ≈ **28 minutes** of API
+  outage before the oldest events are dropped; ~12 minutes if events average
+  1 KiB (long statements, several violations). At lower traffic, proportionally
+  more.
+- **Storage.** 1 GiB is 5% of the 20 GiB of ephemeral storage a Fargate task gets
+  by default, and on EFS (elastic, no size to provision) it is about 1 GiB-month
+  of standard storage at most. Writing at the rate above is ~0.6 MiB/s.
+- **Files.** The spool also keeps at most 100,000 segment files, which bounds the
+  proxy's in-memory index (~200 bytes per file) and the directory it lists at
+  startup when traffic is so low that every file carries a single event.
+
+Raise the bound for longer outages if the volume has room; lower it on a small
+volume. A deployment that set `VERICTO_TELEMETRY_MEMORY_CAPACITY` keeps that
+event bound on the spool as well, so set `VERICTO_TELEMETRY_SPOOL_MAX_EVENTS` (or
+remove the variable) to let the spool grow to the byte bound. Spool files are
+named `seg-<seq>-<count>-<bytes>.jsonl` since 4.12.0; 4.12 reads the files of
+earlier versions, but an earlier version ignores 4.12's (they stay on disk,
+undelivered), so let the spool drain before a downgrade.
+
+#### Several proxies on one volume
+
+A disk spool belongs to one process: it names its files from its own counter,
+bounds them by its own `VERICTO_TELEMETRY_SPOOL_MAX_BYTES`, and deletes each one
+when the API acknowledges it. Replicas that mount one volume at the same path (an
+ECS service with one EFS access point) must not share the directory: each would
+send the others' events too, count them against its own bound and evict them.
+Set `VERICTO_TELEMETRY_SPOOL_SUBDIR=task` (or `hostname`, or a name per replica):
+
+- Each proxy spools to `<spool dir>/tasks/<name>/` and holds a lease there,
+  `.lease`, rewritten every 30 seconds and released on a clean shutdown.
+- At startup and every minute a proxy adopts the directories of the others whose
+  lease is released or older than `VERICTO_TELEMETRY_SPOOL_ORPHAN_SECS` (default
+  10 minutes): it renames each one into its own `adopted/` directory and delivers
+  its events first, within its own byte bound. A task that is stopped or replaced
+  therefore leaves nothing behind for good. The rename is the claim: it is atomic
+  on a local filesystem and on NFSv4 (EFS), so when two proxies race for the same
+  directory exactly one gets it, and nobody reads a directory it did not rename.
+- Spool files at the top of the shared directory (written before the setting was
+  turned on) are claimed the same way, one file at a time.
+- The rules cache stays at `<spool dir>/.rules-cache`, shared: every replica syncs
+  the same rules and writes the file atomically under its own temporary name.
+
+A proxy that is alive but cannot write its lease for the whole orphan window (its
+volume unreachable for ten minutes) can have its directory adopted under it: it
+logs an error and continues in a fresh directory, and the adopter delivers what was
+moved. The API deduplicates events by id, so a batch in flight at that moment that
+is sent twice is stored once. Before a downgrade to a version without the setting,
+let the spool drain: older versions do not read `tasks/`.
 
 ### TLS (optional)
 
@@ -388,9 +480,12 @@ back to the default, also with a warning.
 | Variable               | Default | Description                                   |
 |------------------------|---------|-----------------------------------------------|
 | `VERICTO_HEALTHZ_PORT` | — (off) | TCP port for load-balancer health checks      |
+| `VERICTO_HEALTHZ_ADDR` | `0.0.0.0` | Address the health-check listener binds (an IP; an invalid value stops the proxy at startup). The image's `HEALTHCHECK` probes `127.0.0.1`: with another address, probe that one instead |
 
 The listener accepts each connection and closes it without exchanging any bytes, so
-a probe is a plain TCP connect. It is separate from the traffic port and never
+a probe is a plain TCP connect. (Since 4.12.0 it closes when the peer does, or after
+2 seconds of silence, and answers an HTTP request: `GET /metrics` when enabled, a 404
+otherwise.) It is separate from the traffic port and never
 contacts the database: a database outage does not take the proxy out of rotation.
 
 It opens only once warm-up is done: at startup without the control-plane link, or
@@ -404,6 +499,51 @@ value that is not a valid port number is ignored, and the listener stays off.
 |-----------------|---------|-----------------------------------------------|
 | `RUST_LOG`      | `info`  | Log level (`info`, `debug`, `trace`)          |
 | `RUST_BACKTRACE`| `0`     | Set to `1` to enable backtraces on panic      |
+| `VERICTO_METRICS_PROMETHEUS` | `false` | Serve `GET /metrics` (Prometheus text) on the health-check listener; needs `VERICTO_HEALTHZ_PORT` |
+| `VERICTO_METRICS_EMF` | `false` | Write the metrics as one CloudWatch Embedded Metric Format line on stdout per interval |
+| `VERICTO_METRICS_EMF_NAMESPACE` | `Vericto/Proxy` | CloudWatch namespace of the EMF line |
+| `VERICTO_METRICS_EMF_INTERVAL_SECS` | `60` | Seconds between EMF lines (10–3600) |
+| `VERICTO_METRICS_PROXY_NAME` | `vericto-proxy` | The EMF `ProxyName` dimension |
+| `VERICTO_METRICS_EMF_TASK_DIMENSION` | `true` | Also publish under `[ProxyName, TaskId]` (ECS task id, else hostname) |
+
+#### Metrics
+
+Since 4.12.0 the telemetry pipeline is also visible locally, in two opt-in forms with
+the same figures. All names start with `vericto_proxy_`:
+
+| Metric | Type | Meaning |
+|--------|------|---------|
+| `vericto_proxy_telemetry_oldest_undelivered_age_seconds` | gauge | Age of the oldest event not yet delivered; 0 when none waits |
+| `vericto_proxy_telemetry_seconds_since_last_delivery` | gauge | Seconds without a successful delivery while events wait; 0 when none waits |
+| `vericto_proxy_telemetry_last_delivery_timestamp_seconds` | gauge | Unix time of the last 2xx (Prometheus only; 0 before the first) |
+| `vericto_proxy_telemetry_spool_bytes` / `_spool_events` | gauge | What is buffered now |
+| `vericto_proxy_telemetry_spool_capacity_bytes` / `_spool_used_percent` | gauge | The spool's bound and how full it is (0 with the memory buffer) |
+| `vericto_proxy_telemetry_enqueued_total` / `_delivered_total` | counter | Events accepted and delivered since the process started |
+| `vericto_proxy_telemetry_dropped_total{cause}` | counter | Dropped events; `cause` is `queue_full`, `evicted`, `permanent`, `write_failure` or `quota` (not recorded while over the monthly quota) |
+| `vericto_proxy_telemetry_quota_paused` | gauge | 1 while telemetry is paused for the monthly quota |
+| `vericto_proxy_telemetry_requests_in_flight` | gauge | Telemetry requests outstanding |
+| `vericto_proxy_info{version,buffer}` / `vericto_proxy_telemetry_enabled` | gauge | Build and buffer; whether the control-plane link is on |
+
+- **Prometheus**: `VERICTO_METRICS_PROMETHEUS=true` serves `GET /metrics` on the
+  health-check listener (`VERICTO_HEALTHZ_PORT`), never on the database port.
+- **CloudWatch EMF**: `VERICTO_METRICS_EMF=true` writes one JSON line per
+  `VERICTO_METRICS_EMF_INTERVAL_SECS` to stdout; with the `awslogs` log driver
+  CloudWatch Logs turns it into metrics in `VERICTO_METRICS_EMF_NAMESPACE`, under the
+  dimension sets `[ProxyName]` and `[ProxyName, TaskId]`. Alarm on `[ProxyName]` with
+  the `Maximum` statistic (the worst task): task ids change with every deployment.
+  Counters are sent as what happened during the interval: `vericto_proxy_telemetry_delivered`,
+  `_dropped_queue_full`, `_dropped_evicted`, `_dropped_permanent`,
+  `_dropped_write_failure`, `_dropped_quota`, and `_dropped_loss` (every cause but
+  the quota). Each `TaskId` series is a custom metric; set
+  `VERICTO_METRICS_EMF_TASK_DIMENSION=false` to publish only `[ProxyName]`.
+
+What they never carry: query text, database user names, client addresses, or
+workspace, database or API-key ids. The only labels are `cause` (five fixed values),
+`version` and `buffer` (one value each per process), so the number of series is
+fixed whatever the traffic. The figures are not secret, but they say how busy the
+database is: bind the health-check listener to a private address
+(`VERICTO_HEALTHZ_ADDR`), keep its port reachable only from the load balancer and
+your monitoring, and never expose it to the internet.
 
 ---
 

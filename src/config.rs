@@ -38,8 +38,10 @@ pub struct ControlPlaneConfig {
     pub buffer_mode: BufferMode,
     /// Spool directory when buffer_mode = Disk.
     pub disk_spool_path: String,
-    /// Max undelivered events kept (memory ring, or the disk spool) before the
-    /// oldest are dropped.
+    /// Max undelivered events kept in the memory ring before the oldest are
+    /// dropped. `VERICTO_TELEMETRY_MEMORY_CAPACITY`, default 10,000. The disk spool
+    /// is bounded by [`SpoolTuning::max_bytes`] instead (since 4.12.0), and by this
+    /// count only when the variable is set (see [`SpoolTuning::max_events`]).
     pub memory_capacity: usize,
     /// Max events in one POST /ingest/events batch, and the number of pending
     /// events that triggers a send. `VERICTO_TELEMETRY_BATCH_SIZE`, default 500,
@@ -146,7 +148,21 @@ pub struct SpoolTuning {
     /// queued to the spool and delivering what it can before it exits.
     /// `VERICTO_TELEMETRY_SHUTDOWN_TIMEOUT_MS`, default 5000.
     pub shutdown_timeout: Duration,
+    /// Most bytes of spool files kept on disk before the oldest are dropped
+    /// (since 4.12.0). `VERICTO_TELEMETRY_SPOOL_MAX_BYTES`, default 1 GiB
+    /// ([`crate::telemetry::queue::DEFAULT_SPOOL_MAX_BYTES`]), at least 1 MiB.
+    pub max_bytes: u64,
+    /// Most undelivered events kept on disk, on top of `max_bytes`.
+    /// `VERICTO_TELEMETRY_SPOOL_MAX_EVENTS`; unset, `VERICTO_TELEMETRY_MEMORY_CAPACITY`
+    /// when that is set (it bounded the spool up to 4.11, so a deployment that set
+    /// it keeps its bound); `None` = bounded by bytes only.
+    pub max_events: Option<usize>,
 }
+
+/// The smallest `VERICTO_TELEMETRY_SPOOL_MAX_BYTES` accepted: one full segment of
+/// 1,000 events at the largest event the proxy reports is a few MiB, and a smaller
+/// bound would evict every segment as it is written.
+pub const SPOOL_MIN_BYTES: u64 = 1024 * 1024;
 
 impl Default for SpoolTuning {
     fn default() -> Self {
@@ -155,6 +171,8 @@ impl Default for SpoolTuning {
             flush_every: Duration::from_millis(50),
             segment_max: 1000,
             shutdown_timeout: Duration::from_millis(5000),
+            max_bytes: crate::telemetry::queue::DEFAULT_SPOOL_MAX_BYTES,
+            max_events: None,
         }
     }
 }
@@ -175,8 +193,21 @@ impl SpoolTuning {
             shutdown_timeout: env_u64("VERICTO_TELEMETRY_SHUTDOWN_TIMEOUT_MS")
                 .map(Duration::from_millis)
                 .unwrap_or(d.shutdown_timeout),
+            max_bytes: env_u64("VERICTO_TELEMETRY_SPOOL_MAX_BYTES")
+                .map(|b| b.max(SPOOL_MIN_BYTES))
+                .unwrap_or(d.max_bytes),
+            max_events: spool_max_events(
+                env_usize("VERICTO_TELEMETRY_SPOOL_MAX_EVENTS"),
+                env_usize("VERICTO_TELEMETRY_MEMORY_CAPACITY"),
+            ),
         }
     }
+}
+
+/// The disk spool's event bound: `VERICTO_TELEMETRY_SPOOL_MAX_EVENTS`, else
+/// `VERICTO_TELEMETRY_MEMORY_CAPACITY` when set, else none (bytes only).
+fn spool_max_events(explicit: Option<usize>, memory_capacity: Option<usize>) -> Option<usize> {
+    explicit.or(memory_capacity).map(|n| n.max(1))
 }
 
 impl ControlPlaneConfig {
@@ -373,6 +404,18 @@ mod tests {
         assert_eq!(batch_size_from(Some(100)), 100);
         assert_eq!(batch_size_from(Some(5_000)), MAX_INGEST_BATCH);
         assert_eq!(batch_size_from(Some(0)), 1);
+    }
+
+    #[test]
+    fn spool_is_bounded_by_bytes_unless_an_event_count_is_set() {
+        let d = SpoolTuning::default();
+        assert_eq!(d.max_bytes, 1024 * 1024 * 1024);
+        assert_eq!(d.max_events, None);
+        assert_eq!(spool_max_events(None, None), None);
+        // A deployment that bounded its spool with the memory capacity keeps it.
+        assert_eq!(spool_max_events(None, Some(10_000)), Some(10_000));
+        assert_eq!(spool_max_events(Some(500_000), Some(10_000)), Some(500_000));
+        assert_eq!(spool_max_events(Some(0), None), Some(1));
     }
 
     #[test]
