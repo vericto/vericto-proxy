@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [4.12.1] — 2026-10-15
+
+Requires vericto-engine v4.1.1 (from v4.0.0). No wire-protocol changes, and
+nothing changes for Postgres or MySQL traffic: every verdict of the engine,
+proxy and eval SQL (3,654 statements, Postgres and MySQL, under seven
+policies) is the same with v4.0.0 and v4.1.1. The telemetry pipeline is
+unchanged.
+
+### Changed
+
+- **vericto-engine v4.1.1.** The engine adds the SQLite dialect (4.1.0) and,
+  on SQLite only, finds VERICTO-070's `randomblob(N)` / `zeroblob(N)` probe in
+  every clause (4.1.1). SQLite is a library linked into the application, with
+  no wire protocol for a proxy to front, so none of it is reachable from the
+  Postgres or MySQL protocol this proxy serves. The engine now builds
+  sqlparser with its `visitor` feature (`sqlparser_derive` joins the lock
+  file).
+- **The built-in fallback catalogue lists VERICTO-098 to VERICTO-101**, the
+  engine's SQLite rules (Critical: 100 extension loading or file functions;
+  High: 098 `ATTACH DATABASE`, 099 a `PRAGMA` that turns a safety off, 101
+  `VACUUM INTO`), all `block`, so the list stays the engine's whole catalogue.
+  They read only what the engine's SQLite parser records and never fire on the
+  Postgres or MySQL protocol.
+- The README lists SQLite with the dialects checked through the HTTP API, the
+  CLI or MCP rather than a proxy.
+
 ## [4.12.0] — 2026-10-14
 
 Telemetry loss is visible outside the proxy, the disk spool rides out a longer

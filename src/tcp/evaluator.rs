@@ -446,6 +446,12 @@ pub fn default_ruleset() -> Vec<Rule> {
         ("VERICTO-091", Severity::Critical, EnforcementAction::Block), // Stage unload or file transfer
         ("VERICTO-092", Severity::Critical, EnforcementAction::Block), // External stage or integration
         ("VERICTO-093", Severity::Critical, EnforcementAction::Block), // Share to another account
+        // SQLite rules (VERICTO-098 to VERICTO-101). They read only what the
+        // engine's SQLite parser records, so they never fire on the Postgres or
+        // MySQL wire protocol this proxy serves (SQLite is a library inside the
+        // application: there is no wire protocol to front); listed so the
+        // catalogue is whole.
+        ("VERICTO-100", Severity::Critical, EnforcementAction::Block), // Extension loading or file functions
         // High / BLOCK.
         ("VERICTO-002", Severity::High, EnforcementAction::Block), // DELETE with LIMIT 0 (MySQL)
         ("VERICTO-013", Severity::High, EnforcementAction::Block), // DROP INDEX without IF EXISTS
@@ -473,6 +479,10 @@ pub fn default_ruleset() -> Vec<Rule> {
         ("VERICTO-095", Severity::High, EnforcementAction::Block), // Warehouse cost
         ("VERICTO-096", Severity::High, EnforcementAction::Block), // Code that runs later
         ("VERICTO-097", Severity::High, EnforcementAction::Block), // Role switch
+        // SQLite only (see below).
+        ("VERICTO-098", Severity::High, EnforcementAction::Block), // ATTACH DATABASE
+        ("VERICTO-099", Severity::High, EnforcementAction::Block), // PRAGMA that turns a safety off
+        ("VERICTO-101", Severity::High, EnforcementAction::Block), // VACUUM INTO
         // Medium / FLAG.
         ("VERICTO-050", Severity::Medium, EnforcementAction::Flag), // SELECT without LIMIT
         ("VERICTO-051", Severity::Medium, EnforcementAction::Flag), // SELECT * without WHERE
@@ -515,6 +525,7 @@ mod tests {
         ("VERICTO-091", Severity::Critical, EnforcementAction::Block),
         ("VERICTO-092", Severity::Critical, EnforcementAction::Block),
         ("VERICTO-093", Severity::Critical, EnforcementAction::Block),
+        ("VERICTO-100", Severity::Critical, EnforcementAction::Block),
         ("VERICTO-002", Severity::High, EnforcementAction::Block),
         ("VERICTO-013", Severity::High, EnforcementAction::Block),
         ("VERICTO-015", Severity::High, EnforcementAction::Block),
@@ -535,6 +546,9 @@ mod tests {
         ("VERICTO-095", Severity::High, EnforcementAction::Block),
         ("VERICTO-096", Severity::High, EnforcementAction::Block),
         ("VERICTO-097", Severity::High, EnforcementAction::Block),
+        ("VERICTO-098", Severity::High, EnforcementAction::Block),
+        ("VERICTO-099", Severity::High, EnforcementAction::Block),
+        ("VERICTO-101", Severity::High, EnforcementAction::Block),
         ("VERICTO-050", Severity::Medium, EnforcementAction::Flag),
         ("VERICTO-051", Severity::Medium, EnforcementAction::Flag),
         ("VERICTO-061", Severity::Medium, EnforcementAction::Flag),
@@ -699,6 +713,42 @@ mod tests {
             "severities differ from the engine catalogue"
         );
         assert_eq!(default_ruleset().len(), engine.len(), "no duplicate codes");
+    }
+
+    /// The SQLite rules (and VERICTO-070's SQLite probe) are in the built-in
+    /// catalogue only so it is whole: SQLite has no wire protocol, and on the
+    /// Postgres and MySQL protocols this proxy serves they never fire.
+    #[test]
+    fn sqlite_rules_never_fire_on_the_wire_dialects() {
+        let rules = default_ruleset();
+        let policy = EnforcementPolicy::default();
+        for sql in [
+            "ATTACH DATABASE '/tmp/x.db' AS x",
+            "PRAGMA foreign_keys = OFF",
+            "PRAGMA writable_schema = ON",
+            "SELECT load_extension('/tmp/x.so')",
+            "VACUUM INTO '/tmp/copy.db'",
+            "SELECT 1 WHERE randomblob(1000000000) IS NOT NULL",
+            "UPDATE docs SET body = zeroblob(1000000000) WHERE id = 1",
+        ] {
+            for dialect in [Dialect::Postgres, Dialect::Mysql] {
+                let violations = match evaluate(sql, dialect, &rules, &policy) {
+                    TcpDecision::Forward { violations, .. } => violations,
+                    TcpDecision::Block { violations, .. } => violations,
+                };
+                assert!(
+                    !violations.iter().any(|v| matches!(
+                        v.rule_code.as_str(),
+                        "VERICTO-070"
+                            | "VERICTO-098"
+                            | "VERICTO-099"
+                            | "VERICTO-100"
+                            | "VERICTO-101"
+                    )),
+                    "{dialect:?} {sql}: {violations:?}"
+                );
+            }
+        }
     }
 
     #[test]
