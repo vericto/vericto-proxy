@@ -185,6 +185,7 @@ mod tests {
             Dialect::Oracle,
             Dialect::MsSql,
             Dialect::Snowflake,
+            Dialect::Sqlite,
         ] {
             assert!(
                 DEFAULT_MAX_QUERY_BYTES <= dialect_cap(dialect),
