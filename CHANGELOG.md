@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Documentation
+
+- The `Cargo.toml` comment on the `vericto-engine` dependency called the engine
+  an "open-core" library. It is under the Elastic License 2.0, which is
+  source-available, not open source; the comment now says so. No code or
+  dependency change.
+
 ## [4.12.1] — 2026-10-15
 
 Requires vericto-engine v4.1.1 (from v4.0.0). No wire-protocol changes, and

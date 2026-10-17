@@ -13,7 +13,7 @@ name = "vericto-proxy"
 path = "src/main.rs"
 
 [dependencies]
-# AST engine (open-core shared library)
+# AST engine (source-available shared library, Elastic License 2.0)
 vericto-engine = { git = "https://github.com/vericto/vericto-engine", tag = "v4.1.1" }
 
 # PostgreSQL query normalization for sanitized telemetry (literals → $1, $2…).
