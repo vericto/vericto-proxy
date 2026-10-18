@@ -11,11 +11,11 @@ package does not include.
 Refresh this file when pg_query changes version: the image build stops if the
 version below does not match Cargo.lock.
 
-pg_query version: 6.2.0
+pg_query version: 6.2.1
 
 ================================================================================
-pg_query (Rust crate) 6.2.0 - MIT License
-Source: https://github.com/pganalyze/pg_query.rs/blob/v6.2.0/LICENSE
+pg_query (Rust crate) 6.2.1 - MIT License
+Source: https://github.com/pganalyze/pg_query.rs/blob/v6.2.1/LICENSE
 
 MIT License
 
@@ -42,8 +42,8 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 
 ================================================================================
-libpg_query 17-6.2.2 - BSD 3-Clause License
-Source: https://github.com/pganalyze/libpg_query/blob/17-6.2.2/LICENSE
+libpg_query 17-6.2.5 - BSD 3-Clause License
+Source: https://github.com/pganalyze/libpg_query/blob/17-6.2.5/LICENSE
 
 Copyright (c) 2015, Lukas Fittl <lukas@fittl.com>
 Copyright (c) 2016-2023, Duboce Labs, Inc. (pganalyze) <team@pganalyze.com>

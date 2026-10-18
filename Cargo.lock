@@ -1482,9 +1482,9 @@ dependencies = [
 
 [[package]]
 name = "pg_query"
-version = "6.2.0"
+version = "6.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "42a66643c4aa9c929b68b2c9e30d6c4d955bfd1e87e255ce6c5d0c026082436c"
+checksum = "da43168013d137b3ca49b0044c1108ec09ff596a0626d4db89209c0a1d450cd2"
 dependencies = [
  "bindgen",
  "cc",
@@ -2742,8 +2742,8 @@ checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
 
 [[package]]
 name = "vericto-engine"
-version = "4.1.3"
-source = "git+https://github.com/vericto/vericto-engine?tag=v4.1.3#7d921b62e843e0b89e9962480bff06f0fa1ddf85"
+version = "4.2.0"
+source = "git+https://github.com/vericto/vericto-engine?tag=v4.2.0#ca74c79b19df61e8f9b1f5257c89bcb5ab293c4f"
 dependencies = [
  "pg_query",
  "serde",
@@ -2756,7 +2756,7 @@ dependencies = [
 
 [[package]]
 name = "vericto-proxy"
-version = "4.12.3"
+version = "4.13.0"
 dependencies = [
  "arc-swap",
  "async-trait",
