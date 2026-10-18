@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### CI
+
+- **The CLA check runs in GitHub Actions** instead of cla-assistant.io, whose
+  webhook failed on every delivery on 2026-10-17 and 2026-10-18 and left pull
+  requests without a status. `.github/workflows/cla.yml` (CLA Assistant Lite,
+  pinned by commit SHA) reports the `CLA` check. The agreement is unchanged
+  (ICLA v1.0, now also in `CLA.md`). Contributors sign it by commenting
+  `I have read the CLA Document and I hereby sign the CLA` on their pull
+  request, and `recheck` reruns the check. Signatures are kept on the
+  `cla-signatures` branch. The workflow never checks out pull request code.
+  No code change.
+
 ## [4.12.3] — 2026-10-18
 
 Requires vericto-engine v4.1.3 (from v4.1.1): fewer false positives, short
