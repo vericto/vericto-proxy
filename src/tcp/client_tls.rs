@@ -39,11 +39,20 @@ pub enum ClientTlsMode {
 }
 
 impl ClientTlsMode {
-    /// Parses the `PROXY_TLS_MODE` token. Unknown/empty → `Disable`.
-    pub fn from_env_str(s: &str) -> Self {
-        match s.trim().to_ascii_lowercase().as_str() {
-            "require" => ClientTlsMode::Require,
-            _ => ClientTlsMode::Disable,
+    /// Parses `PROXY_TLS_MODE`, in any case and with surrounding whitespace
+    /// ignored. Unset or empty is `disable`, the documented default.
+    ///
+    /// Any other value is an error. Up to 4.12.2 it silently meant `disable`, so
+    /// a typo such as `required` left the client hop in plaintext.
+    pub fn parse(raw: Option<&str>) -> Result<Self, String> {
+        match raw.map(str::trim) {
+            None | Some("") => Ok(ClientTlsMode::Disable),
+            Some(v) if v.eq_ignore_ascii_case("disable") => Ok(ClientTlsMode::Disable),
+            Some(v) if v.eq_ignore_ascii_case("require") => Ok(ClientTlsMode::Require),
+            Some(v) => Err(format!(
+                "PROXY_TLS_MODE={v:?} is not supported: use `disable` (the default) or \
+                 `require` (terminate client TLS with PROXY_TLS_CERT and PROXY_TLS_KEY)"
+            )),
         }
     }
 }
@@ -153,22 +162,35 @@ mod tests {
     use super::*;
 
     #[test]
-    fn tls_mode_parses_from_env() {
-        assert_eq!(
-            ClientTlsMode::from_env_str("require"),
-            ClientTlsMode::Require
-        );
-        assert_eq!(
-            ClientTlsMode::from_env_str("REQUIRE"),
-            ClientTlsMode::Require
-        );
-        assert_eq!(
-            ClientTlsMode::from_env_str("disable"),
-            ClientTlsMode::Disable
-        );
-        assert_eq!(ClientTlsMode::from_env_str(""), ClientTlsMode::Disable);
-        assert_eq!(ClientTlsMode::from_env_str("bogus"), ClientTlsMode::Disable);
+    fn tls_mode_parses_case_insensitively_and_unset_is_disable() {
+        for (raw, want) in [
+            (None, ClientTlsMode::Disable),
+            (Some(""), ClientTlsMode::Disable),
+            (Some("  "), ClientTlsMode::Disable),
+            (Some("disable"), ClientTlsMode::Disable),
+            (Some(" Disable\n"), ClientTlsMode::Disable),
+            (Some("require"), ClientTlsMode::Require),
+            (Some("REQUIRE"), ClientTlsMode::Require),
+            (Some(" Require "), ClientTlsMode::Require),
+        ] {
+            assert_eq!(ClientTlsMode::parse(raw), Ok(want), "{raw:?}");
+        }
         assert_eq!(ClientTlsMode::default(), ClientTlsMode::Disable);
+    }
+
+    /// An unknown value used to decline client TLS silently; it is now an error
+    /// naming the variable, the value and the accepted values.
+    #[test]
+    fn an_unknown_client_tls_mode_is_an_error() {
+        for raw in ["bogus", "required", "on", "true", "verify-full", "prefer"] {
+            let err = ClientTlsMode::parse(Some(raw)).expect_err(raw);
+            assert!(err.contains("PROXY_TLS_MODE"), "{err}");
+            assert!(err.contains(&format!("{raw:?}")), "{err}");
+            assert!(
+                err.contains("`disable`") && err.contains("`require`"),
+                "{err}"
+            );
+        }
     }
 
     /// A syntactically valid but meaningless PEM block, enough to exercise the

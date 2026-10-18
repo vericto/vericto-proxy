@@ -1218,9 +1218,10 @@ where
     let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
     let admin = mysql_async::Opts::from_url(&url).expect("VERICTO_TEST_MYSQL_URL");
     let upstream = (admin.ip_or_hostname().to_string(), admin.tcp_port());
-    let tls = crate::tcp::upstream::UpstreamTlsMode::from_env_str(
-        &std::env::var("VERICTO_TEST_MYSQL_SSLMODE").unwrap_or_default(),
-    );
+    let tls = crate::tcp::upstream::UpstreamTlsMode::parse(
+        std::env::var("VERICTO_TEST_MYSQL_SSLMODE").ok().as_deref(),
+    )
+    .expect("VERICTO_TEST_MYSQL_SSLMODE");
     let (plain, _) = config_with(
         (&upstream.0, upstream.1),
         EnforcementPolicy::default(),

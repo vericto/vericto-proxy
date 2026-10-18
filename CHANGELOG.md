@@ -7,6 +7,107 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [4.12.3] — 2026-10-18
+
+Requires vericto-engine v4.1.3 (from v4.1.1): fewer false positives, short
+`last4` values no longer shown, and `-1 < 0`-style tautologies now caught on
+MySQL. Two upstream TLS fixes: a TLS mode the proxy does not recognise no
+longer turns TLS off, and the MySQL path honours the CA bundle and client
+certificate. No wire-protocol changes.
+
+### Changed
+
+- **vericto-engine v4.1.3** (4.1.2 and 4.1.3). What changes for traffic
+  through the proxy:
+  - **`last4` masks no longer return short values in clear.** A value of 8
+    characters or fewer under a `last4` tag is now returned as `'[redacted]'`,
+    like `full`; longer values keep `'****'` and their last four characters.
+    Up to 4.1.1, `'1234'` came back as `'****1234'`. Only the rewritten SQL
+    changes: which queries are allowed, flagged or blocked does not.
+  - **Fewer false positives on tautology rules** (VERICTO-003, -030, -040,
+    -042, -090). A comparison with `NULL` (`WHERE NULL = NULL`,
+    `WHERE NOT (NULL = 1)`), a string comparison a collation can decide either
+    way (`NOT ('a' < 'b')`, `'a' <> 'A'`), literals of different kinds
+    (`NOT (1 = '1')`) and bind parameters compared by their text (`? = ?`) are
+    no longer reported as always true, so such a `DELETE` or `UPDATE` is no
+    longer blocked. Real tautologies (`'a' = 'a'`, `1 = 1`, `' OR 'a'='a`)
+    still are.
+  - **`-1 < 0` is now detected on MySQL.** Negative literals were decided only
+    on PostgreSQL, so `DELETE … WHERE -1 < 0` (VERICTO-003) and `… OR -1 < 0`
+    (VERICTO-090) passed the MySQL proxy. They are now blocked there, as they
+    already were on Postgres. This is the one change that can block a query
+    4.12.2 allowed.
+  - Snowflake `ORDER BY ALL` is read correctly. Snowflake has no wire protocol
+    for this proxy, so it does not reach the proxy.
+  - No API used by the proxy changed. 4.1.3 makes the engine's constant
+    comparison three-valued (`parser::mod`'s `Truth`, replacing
+    `is_always_true` / `is_always_false`), but all of it is crate-private and
+    the proxy never called it.
+- **`rcgen` joins the dev-dependencies**, to generate throwaway CAs and
+  certificates for the new TLS handshake tests. It is not in the binary, and
+  no private key is committed.
+
+### Fixed
+
+- **An unknown `UPSTREAM_SSLMODE` or `PROXY_TLS_MODE` no longer disables TLS.**
+  Up to 4.12.2, any value the proxy did not recognise (`verify-ca`, `prefer`,
+  `required`, a typo) silently meant `disable`, so traffic on that hop went out
+  in plaintext. Both variables are now read in any case with surrounding
+  whitespace ignored, and any other value stops the proxy at startup with an
+  error naming the variable and the accepted values, as 4.12.2 did for
+  `VERICTO_TELEMETRY_BUFFER`. Unset or empty is still `disable` for both.
+- **`UPSTREAM_SSLMODE=verify-ca` is supported**, with libpq's meaning: the
+  database certificate must chain to the CA in `UPSTREAM_SSLROOTCERT` and be
+  valid, but its name is not compared with `UPSTREAM_HOST`. It is common in
+  libpq configurations, where the database is reached through an address its
+  certificate does not name (an IP, a load balancer, a tunnel). Like libpq,
+  it needs `UPSTREAM_SSLROOTCERT`: against the public web roots, a chain check
+  without a name check would accept any publicly trusted certificate and
+  authenticate nothing.
+- **`prefer` and `allow` are refused, not mapped to another mode.** In libpq
+  both connect in plaintext when the server does not offer TLS. A firewall
+  proxy must not fall back to plaintext on its own, and mapping them to
+  `require` would silently change what the operator wrote, so the error says
+  why and lists `require`, `verify-ca` and `verify-full`.
+- **The MySQL upstream path honours `UPSTREAM_SSLROOTCERT`.** It verified
+  against the public web roots only, so with `verify-full` a MySQL server whose
+  certificate a private CA issued failed every handshake. It now uses the same
+  CA bundle as Postgres, and presents `UPSTREAM_SSLCERT` / `UPSTREAM_SSLKEY`
+  for mutual TLS (MySQL `REQUIRE X509`) when they are set. The MySQL proxy
+  also loads this material at startup, as the Postgres proxy has since 4.12.2:
+  a missing, empty or unparseable file, or half a pair, stops it before it
+  listens.
+
+### Upgrade notes
+
+- **Behaviour change: an unsupported TLS mode now fails startup.** A
+  deployment with an `UPSTREAM_SSLMODE` other than `disable`, `require`,
+  `verify-ca` or `verify-full`, or a `PROXY_TLS_MODE` other than `disable` or
+  `require`, ran in plaintext on that hop and now exits with, for example,
+  `UPSTREAM_SSLMODE="prefer" is not supported: …`. Check both values before
+  upgrading. A deployment with `verify-ca` used to run in plaintext: it now
+  encrypts and verifies, and needs `UPSTREAM_SSLROOTCERT`.
+- **Behaviour change on MySQL with upstream TLS.** `UPSTREAM_SSLROOTCERT`,
+  `UPSTREAM_SSLCERT` and `UPSTREAM_SSLKEY` were ignored on MySQL and are now
+  used, and checked at startup. A MySQL deployment that sets them to a file
+  that is missing or does not parse now exits at startup, and one with
+  `verify-full` whose bundle does not hold the CA of a publicly trusted server
+  certificate now fails the handshake: remove the variable, or point it at the
+  right CA.
+- **The engine's MySQL tautology fix can block queries that passed before**
+  (`WHERE -1 < 0` and the like). Run the new version under `monitor_mode`
+  first if your application issues such statements.
+
+### Tests
+
+- New tests for both fixes, written first and failing on 4.12.2: every
+  accepted spelling of both TLS modes, unknown values and `prefer`/`allow` as
+  startup errors, real handshakes against a private CA on the Postgres and
+  MySQL paths (`verify-full` with the bundle, refused without it or with
+  another CA; `verify-ca` accepting another name but not another CA;
+  mutual TLS on both paths), a full MySQL connection phase through the proxy
+  to a private-CA server, and the startup checks of the MySQL proxy.
+
 ## [4.12.2] — 2026-10-18
 
 Two configuration mistakes that used to pass silently now stop the proxy at
