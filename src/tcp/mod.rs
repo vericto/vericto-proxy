@@ -142,6 +142,16 @@ pub async fn run_pg_proxy(
     };
     let client_tls_enabled = client_tls_acceptor.is_some();
 
+    // Same for proxy→database TLS: each connection loads the CA bundle and the
+    // mutual-TLS pair, so load them once here and fail fast if one is missing,
+    // empty or unparseable, rather than on every connection.
+    crate::tcp::upstream::validate_upstream_tls(
+        opts.upstream_tls,
+        opts.upstream_ca_path.as_deref(),
+        opts.upstream_client_cert.as_deref(),
+        opts.upstream_client_key.as_deref(),
+    )?;
+
     let config = Arc::new(PgProxyConfig {
         upstream_host: opts.upstream_host.clone(),
         upstream_port: opts.upstream_port,
@@ -427,6 +437,57 @@ mod tests {
             let err = run(protocol, missing).await;
             assert!(err.to_string().contains("/nonexistent/vericto"), "{err}");
         }
+    }
+
+    /// Postgres upstream TLS material is loaded at startup: a verify-full CA
+    /// bundle without a certificate, a missing one, or half a mutual-TLS pair
+    /// stops the proxy before it listens. A usable bundle gets as far as the
+    /// listener (here: a taken port).
+    #[tokio::test]
+    async fn bad_upstream_tls_material_fails_at_startup() {
+        let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
+        let dir = tempfile::tempdir().unwrap();
+        let empty = dir.path().join("empty-ca.pem");
+        std::fs::write(&empty, "").unwrap();
+        let empty = empty.to_str().unwrap().to_string();
+
+        let mut no_cert_in_ca = base(0);
+        no_cert_in_ca.upstream_tls = UpstreamTlsMode::VerifyFull;
+        no_cert_in_ca.upstream_ca_path = Some(empty.clone());
+        let err = run("postgres", no_cert_in_ca).await;
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(
+            err.to_string()
+                .contains("no certificates found in UPSTREAM_SSLROOTCERT"),
+            "{err}"
+        );
+        assert!(err.to_string().contains(&empty), "{err}");
+
+        let mut missing_ca = base(0);
+        missing_ca.upstream_tls = UpstreamTlsMode::VerifyFull;
+        missing_ca.upstream_ca_path = Some("/nonexistent/vericto/ca.pem".into());
+        let err = run("postgres", missing_ca).await;
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+        assert!(
+            err.to_string().contains("/nonexistent/vericto/ca.pem"),
+            "{err}"
+        );
+
+        let mut half_pair = base(0);
+        half_pair.upstream_tls = UpstreamTlsMode::Require;
+        half_pair.upstream_client_cert = Some("/etc/vericto/client.pem".into());
+        let err = run("postgres", half_pair).await;
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("UPSTREAM_SSLKEY"), "{err}");
+
+        let ca = dir.path().join("ca.pem");
+        std::fs::write(&ca, crate::tcp::upstream::TEST_CA_CERT).unwrap();
+        let taken = TcpListener::bind("0.0.0.0:0").await.unwrap();
+        let mut good = base(taken.local_addr().unwrap().port());
+        good.upstream_tls = UpstreamTlsMode::VerifyFull;
+        good.upstream_ca_path = Some(ca.to_str().unwrap().into());
+        let err = run("postgres", good).await;
+        assert_eq!(err.kind(), std::io::ErrorKind::AddrInUse, "{err}");
     }
 
     /// A listen port already taken is a startup error, not a silent hang.

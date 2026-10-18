@@ -252,10 +252,7 @@ impl ControlPlaneConfig {
                 .unwrap_or(300), // default: 5 min
         );
 
-        let buffer_mode = match env("VERICTO_TELEMETRY_BUFFER").as_deref() {
-            Some("disk") => BufferMode::Disk,
-            _ => BufferMode::Memory,
-        };
+        let buffer_mode = buffer_mode_from(env("VERICTO_TELEMETRY_BUFFER").as_deref())?;
 
         let disk_spool_path = env("VERICTO_TELEMETRY_DISK_PATH")
             .unwrap_or_else(|| "/var/lib/vericto/spool".to_string());
@@ -284,6 +281,25 @@ impl ControlPlaneConfig {
             spool: SpoolTuning::from_lookup(env),
             delivery: DeliveryTuning::from_lookup(env),
         }))
+    }
+}
+
+/// Parses `VERICTO_TELEMETRY_BUFFER`: `memory` (the default, also when unset or
+/// empty) or `disk`, in any case and with surrounding whitespace ignored.
+///
+/// Any other value is a startup error, as for `VERICTO_TELEMETRY_SPOOL_SUBDIR`:
+/// up to 4.12.1 a value other than exactly `disk` (`DISK`, `Disk`, `disc`)
+/// silently selected the memory buffer, so an operator who asked for a durable
+/// spool got none, and no rules cache either, with nothing in the log.
+fn buffer_mode_from(raw: Option<&str>) -> Result<BufferMode, String> {
+    match raw.map(str::trim) {
+        None | Some("") => Ok(BufferMode::Memory),
+        Some(v) if v.eq_ignore_ascii_case("memory") => Ok(BufferMode::Memory),
+        Some(v) if v.eq_ignore_ascii_case("disk") => Ok(BufferMode::Disk),
+        Some(v) => Err(format!(
+            "VERICTO_TELEMETRY_BUFFER={v:?} is not supported: use `memory` (the default) \
+             or `disk` (a durable spool at VERICTO_TELEMETRY_DISK_PATH)"
+        )),
     }
 }
 
@@ -667,7 +683,6 @@ mod tests {
         let mut vars = LINK.to_vec();
         vars.extend([
             ("VERICTO_RULES_SYNC_INTERVAL_SECS", "1"),
-            ("VERICTO_TELEMETRY_BUFFER", "DISK"),
             ("VERICTO_TELEMETRY_BATCH_SIZE", "100000"),
             ("VERICTO_TELEMETRY_FLUSH_SECS", "0"),
             ("VERICTO_TELEMETRY_QUEUE_CAPACITY", "0"),
@@ -686,11 +701,6 @@ mod tests {
             cfg.rules_sync_interval,
             Duration::from_secs(RULES_SYNC_MIN_SECS)
         );
-        assert_eq!(
-            cfg.buffer_mode,
-            BufferMode::Memory,
-            "the buffer value is case-sensitive"
-        );
         assert_eq!(cfg.batch_size, MAX_INGEST_BATCH);
         assert_eq!(cfg.flush_interval, Duration::from_secs(1));
         assert_eq!(cfg.spool.queue_capacity, 1);
@@ -708,6 +718,60 @@ mod tests {
             "the longest wait is never below the first one"
         );
         assert_eq!(cfg.rules_cache_path, None);
+    }
+
+    /// The buffer is chosen case-insensitively, with whitespace trimmed; unset or
+    /// empty is the documented default (memory).
+    #[test]
+    fn the_buffer_mode_ignores_case_and_whitespace() {
+        for (raw, want) in [
+            ("disk", BufferMode::Disk),
+            ("DISK", BufferMode::Disk),
+            ("Disk", BufferMode::Disk),
+            ("  disk\n", BufferMode::Disk),
+            ("memory", BufferMode::Memory),
+            ("MEMORY", BufferMode::Memory),
+            (" Memory ", BufferMode::Memory),
+            ("", BufferMode::Memory),
+            ("   ", BufferMode::Memory),
+        ] {
+            let mut vars = LINK.to_vec();
+            vars.push(("VERICTO_TELEMETRY_BUFFER", raw));
+            let cfg = from_vars(&vars).unwrap().unwrap();
+            assert_eq!(cfg.buffer_mode, want, "VERICTO_TELEMETRY_BUFFER={raw:?}");
+        }
+        assert_eq!(buffer_mode_from(None), Ok(BufferMode::Memory));
+
+        // DISK used to select memory silently: no spool and no rules cache.
+        let mut vars = LINK.to_vec();
+        vars.push(("VERICTO_TELEMETRY_BUFFER", "DISK"));
+        let cfg = from_vars(&vars).unwrap().unwrap();
+        assert_eq!(
+            cfg.rules_cache_path,
+            Some(PathBuf::from("/var/lib/vericto/spool").join(RULES_CACHE_FILE)),
+            "an upper-case DISK turns the rules cache on too"
+        );
+    }
+
+    /// A buffer value the proxy cannot honour fails startup with the variable and
+    /// the accepted values named, instead of silently using the memory buffer.
+    #[test]
+    fn an_unknown_buffer_mode_is_a_startup_error() {
+        for raw in ["disc", "file", "durable", "disk,memory", "1"] {
+            let mut vars = LINK.to_vec();
+            vars.push(("VERICTO_TELEMETRY_BUFFER", raw));
+            let err = from_vars(&vars).expect_err(raw);
+            assert!(err.contains("VERICTO_TELEMETRY_BUFFER"), "{err}");
+            assert!(err.contains(&format!("{raw:?}")), "{err}");
+            assert!(err.contains("`memory`") && err.contains("`disk`"), "{err}");
+        }
+        // Without the control-plane link there is no telemetry, so the buffer
+        // setting is not read and cannot fail startup.
+        assert!(
+            from_vars(&[("VERICTO_TELEMETRY_BUFFER", "disc")])
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]

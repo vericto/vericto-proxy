@@ -129,6 +129,25 @@ pub async fn upgrade_to_tls_client(
     Ok((Box::new(r), Box::new(w)))
 }
 
+/// Loads the upstream TLS material once, exactly as [`connect_upstream`] does for
+/// every connection, so that a missing or unreadable CA bundle, one without a
+/// certificate, half a mutual-TLS pair, or a client certificate or key that does
+/// not parse fails the proxy at startup instead of every connection.
+///
+/// `Disable` reads nothing: the files are not used in that mode.
+pub fn validate_upstream_tls(
+    mode: UpstreamTlsMode,
+    ca_path: Option<&str>,
+    client_cert_path: Option<&str>,
+    client_key_path: Option<&str>,
+) -> io::Result<()> {
+    if mode == UpstreamTlsMode::Disable {
+        return Ok(());
+    }
+    let client_auth = load_client_auth(client_cert_path, client_key_path)?;
+    build_client_config(mode, ca_path, client_auth).map(drop)
+}
+
 /// Optional client certificate chain + private key for upstream mutual TLS.
 type ClientAuth = (Vec<CertificateDer<'static>>, PrivateKeyDer<'static>);
 
@@ -185,12 +204,33 @@ fn build_client_config(
         UpstreamTlsMode::VerifyFull => {
             let mut roots = RootCertStore::empty();
             if let Some(path) = ca_path {
-                let pem = std::fs::read(path)?;
+                let pem = std::fs::read(path).map_err(|e| {
+                    io::Error::new(
+                        e.kind(),
+                        format!("reading UPSTREAM_SSLROOTCERT {path}: {e}"),
+                    )
+                })?;
                 for cert in CertificateDer::pem_slice_iter(&pem) {
-                    let cert = cert.map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-                    roots
-                        .add(cert)
-                        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+                    let cert = cert.map_err(|e| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("UPSTREAM_SSLROOTCERT {path}: {e}"),
+                        )
+                    })?;
+                    roots.add(cert).map_err(|e| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("UPSTREAM_SSLROOTCERT {path}: {e}"),
+                        )
+                    })?;
+                }
+                // An empty trust store would verify no server at all: refuse it
+                // here rather than let every handshake fail.
+                if roots.is_empty() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("no certificates found in UPSTREAM_SSLROOTCERT {path}"),
+                    ));
                 }
             } else {
                 roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
@@ -271,6 +311,22 @@ mod danger {
         }
     }
 }
+
+/// A real self-signed CA certificate (P-256, valid to 2126) for the tests of the
+/// CA-bundle paths. Public material only: its private key was discarded when it
+/// was made.
+#[cfg(test)]
+pub(crate) const TEST_CA_CERT: &str = "-----BEGIN CERTIFICATE-----
+MIIBXTCCAQKgAwIBAgIJAJdPKbgINA48MAoGCCqGSM49BAMCMCAxHjAcBgNVBAMM
+FXZlcmljdG8tcHJveHkgdGVzdCBDQTAgFw0yNjEwMTgxNDUxMzhaGA8yMTI2MDky
+NDE0NTEzOFowIDEeMBwGA1UEAwwVdmVyaWN0by1wcm94eSB0ZXN0IENBMFkwEwYH
+KoZIzj0CAQYIKoZIzj0DAQcDQgAE0I6tKlB+c4RfpGe9rBPuLLscbjxB0f54Rspp
+U7owxypSi1D+iSEHdVgOZWEC8OoynzLfJNGrYDhomsYOp3DESKMjMCEwDwYDVR0T
+AQH/BAUwAwEB/zAOBgNVHQ8BAf8EBAMCAgQwCgYIKoZIzj0EAwIDSQAwRgIhALtA
+TotCZD3smB3uTGweITE7Il0dx2Q83QfowDasHcjrAiEAw69sVopqr/ZrT/QIBfAt
+lePoXdsR2KkNAfC6Nz6Bdes=
+-----END CERTIFICATE-----
+";
 
 #[cfg(test)]
 mod tests {
@@ -590,11 +646,25 @@ mod tests {
             .expect_err("unparseable CA");
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
 
-        // A CA file with no certificate at all builds a config with an empty
-        // trust store: it fails closed (no server certificate verifies), but only
-        // at the first handshake, not at startup.
-        let empty = TempPem::new("");
-        assert!(build_client_config(UpstreamTlsMode::VerifyFull, Some(empty.path()), None).is_ok());
+        // A CA file with no certificate at all is refused when the config is
+        // built (at startup, through validate_upstream_tls), not left to build an
+        // empty trust store that fails every handshake.
+        for body in ["", "no PEM here\n", FAKE_KEY] {
+            let empty = TempPem::new(body);
+            let err = build_client_config(UpstreamTlsMode::VerifyFull, Some(empty.path()), None)
+                .expect_err("a CA bundle without a certificate");
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+            assert!(
+                err.to_string()
+                    .contains("no certificates found in UPSTREAM_SSLROOTCERT"),
+                "{err}"
+            );
+            assert!(err.to_string().contains(empty.path()), "{err}");
+        }
+
+        // A real CA certificate builds a verify-full config.
+        let ca = TempPem::new(TEST_CA_CERT);
+        assert!(build_client_config(UpstreamTlsMode::VerifyFull, Some(ca.path()), None).is_ok());
 
         // A client key that does not parse is refused when the config is built.
         let cert = TempPem::new(FAKE_CERT);
@@ -603,6 +673,62 @@ mod tests {
         let err =
             build_client_config(UpstreamTlsMode::Require, None, auth).expect_err("meaningless key");
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    /// The startup check loads what each connection will load, and reads nothing
+    /// in `disable` mode, where the files are unused.
+    #[test]
+    fn validate_upstream_tls_checks_the_material_each_mode_uses() {
+        install_provider();
+        let missing = Some("/nonexistent/vericto/x.pem");
+        validate_upstream_tls(UpstreamTlsMode::Disable, missing, missing, None)
+            .expect("disable reads no file");
+        validate_upstream_tls(UpstreamTlsMode::VerifyFull, None, None, None)
+            .expect("verify-full on the public roots");
+        validate_upstream_tls(UpstreamTlsMode::Require, None, None, None).expect("require");
+
+        let ca = TempPem::new(TEST_CA_CERT);
+        validate_upstream_tls(UpstreamTlsMode::VerifyFull, Some(ca.path()), None, None)
+            .expect("a CA bundle with a certificate");
+
+        let empty = TempPem::new("");
+        let err =
+            validate_upstream_tls(UpstreamTlsMode::VerifyFull, Some(empty.path()), None, None)
+                .expect_err("an empty CA bundle");
+        assert!(
+            err.to_string()
+                .contains("no certificates found in UPSTREAM_SSLROOTCERT"),
+            "{err}"
+        );
+
+        let err = validate_upstream_tls(UpstreamTlsMode::VerifyFull, missing, None, None)
+            .expect_err("a missing CA bundle");
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+        assert!(
+            err.to_string()
+                .contains("UPSTREAM_SSLROOTCERT /nonexistent/vericto/x.pem"),
+            "{err}"
+        );
+
+        for mode in [UpstreamTlsMode::Require, UpstreamTlsMode::VerifyFull] {
+            let err = validate_upstream_tls(mode, None, missing, None).expect_err("half a pair");
+            assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+            assert!(err.to_string().contains("UPSTREAM_SSLKEY"), "{err}");
+
+            let err =
+                validate_upstream_tls(mode, None, missing, missing).expect_err("missing files");
+            assert_eq!(err.kind(), io::ErrorKind::NotFound);
+            assert!(
+                err.to_string().contains("/nonexistent/vericto/x.pem"),
+                "{err}"
+            );
+
+            let cert = TempPem::new(FAKE_CERT);
+            let key = TempPem::new(FAKE_KEY);
+            let err = validate_upstream_tls(mode, None, Some(cert.path()), Some(key.path()))
+                .expect_err("a client key that does not parse");
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        }
     }
 
     /// The `require` verifier accepts any certificate (libpq `sslmode=require`)
