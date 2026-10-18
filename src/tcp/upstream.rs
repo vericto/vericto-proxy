@@ -2,9 +2,10 @@
 //!
 //! The proxy→database hop is the one that typically crosses an untrusted /
 //! remote network (e.g. a managed RDS instance). When `UPSTREAM_SSLMODE` is
-//! `require` or `verify-full`, the proxy performs the PostgreSQL SSL negotiation
-//! (an `SSLRequest` followed by a rustls handshake) and tunnels the rest of the
-//! session through TLS.
+//! `require`, `verify-ca` or `verify-full`, the proxy performs the PostgreSQL SSL
+//! negotiation (an `SSLRequest` followed by a rustls handshake) and tunnels the
+//! rest of the session through TLS. MySQL upgrades mid-handshake through
+//! [`upgrade_to_tls_client`], with the same verification and client certificate.
 //!
 //! The app→proxy hop is intentionally NOT terminated here: the proxy is meant to
 //! be deployed inside the same trusted boundary as the application (sidecar /
@@ -26,7 +27,8 @@ pub type UpstreamRead = Box<dyn AsyncRead + Send + Unpin>;
 /// Boxed upstream write half (plaintext TCP or TLS).
 pub type UpstreamWrite = Box<dyn AsyncWrite + Send + Unpin>;
 
-/// TLS mode for the proxy→database connection. Mirrors libpq `sslmode`.
+/// TLS mode for the proxy→database connection. Mirrors libpq `sslmode`, minus
+/// the two modes that may connect in plaintext (`allow`, `prefer`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum UpstreamTlsMode {
     /// Plaintext (default): the trusted-network deployment assumption.
@@ -34,17 +36,39 @@ pub enum UpstreamTlsMode {
     Disable,
     /// Encrypt, but do not verify the server certificate (libpq `require`).
     Require,
+    /// Encrypt and verify the certificate chain against `UPSTREAM_SSLROOTCERT`,
+    /// but not the hostname (libpq `verify-ca`).
+    VerifyCa,
     /// Encrypt and verify the certificate chain + hostname (libpq `verify-full`).
     VerifyFull,
 }
 
 impl UpstreamTlsMode {
-    /// Parses the `UPSTREAM_SSLMODE` token. Unknown/empty → `Disable`.
-    pub fn from_env_str(s: &str) -> Self {
-        match s.trim().to_ascii_lowercase().as_str() {
-            "require" => UpstreamTlsMode::Require,
-            "verify-full" | "verify_full" | "verifyfull" => UpstreamTlsMode::VerifyFull,
-            _ => UpstreamTlsMode::Disable,
+    /// Parses `UPSTREAM_SSLMODE`, in any case and with surrounding whitespace
+    /// ignored. Unset or empty is `disable`, the documented default.
+    ///
+    /// Any other value is an error, so a typo or an unsupported libpq mode stops
+    /// the proxy at startup. Up to 4.12.2 it silently meant `disable`, which sent
+    /// the database hop in plaintext.
+    pub fn parse(raw: Option<&str>) -> Result<Self, String> {
+        let Some(v) = raw.map(str::trim).filter(|v| !v.is_empty()) else {
+            return Ok(UpstreamTlsMode::Disable);
+        };
+        match v.to_ascii_lowercase().as_str() {
+            "disable" => Ok(UpstreamTlsMode::Disable),
+            "require" => Ok(UpstreamTlsMode::Require),
+            "verify-ca" | "verify_ca" | "verifyca" => Ok(UpstreamTlsMode::VerifyCa),
+            "verify-full" | "verify_full" | "verifyfull" => Ok(UpstreamTlsMode::VerifyFull),
+            "prefer" | "allow" => Err(format!(
+                "UPSTREAM_SSLMODE={v:?} is not supported: libpq's `prefer` and `allow` \
+                 connect in plaintext when the server does not offer TLS, and this proxy \
+                 never falls back to plaintext. Use `require`, `verify-ca` or `verify-full` \
+                 to encrypt the database hop, or `disable` (the default) for plaintext"
+            )),
+            _ => Err(format!(
+                "UPSTREAM_SSLMODE={v:?} is not supported: use `disable` (the default), \
+                 `require`, `verify-ca` (needs UPSTREAM_SSLROOTCERT) or `verify-full`"
+            )),
         }
     }
 }
@@ -111,12 +135,20 @@ pub async fn connect_upstream(
 /// login packet sent over the already-open TCP connection before TLS begins.
 /// The MySQL-specific packet exchange stays in the session; this only performs
 /// the rustls client handshake and returns the boxed halves.
+///
+/// It verifies and authenticates exactly as [`connect_upstream`] does: the CA
+/// bundle (`UPSTREAM_SSLROOTCERT`) and the mutual-TLS pair (`UPSTREAM_SSLCERT`
+/// / `UPSTREAM_SSLKEY`) apply to MySQL too. Up to 4.12.2 both were ignored here.
 pub async fn upgrade_to_tls_client(
     tcp: TcpStream,
     host: &str,
     mode: UpstreamTlsMode,
+    ca_path: Option<&str>,
+    client_cert_path: Option<&str>,
+    client_key_path: Option<&str>,
 ) -> io::Result<(UpstreamRead, UpstreamWrite)> {
-    let config = build_client_config(mode, None, None)?;
+    let client_auth = load_client_auth(client_cert_path, client_key_path)?;
+    let config = build_client_config(mode, ca_path, client_auth)?;
     let connector = TlsConnector::from(Arc::new(config));
     let server_name = ServerName::try_from(host.to_string()).map_err(|_| {
         io::Error::new(
@@ -198,44 +230,35 @@ fn build_client_config(
     ca_path: Option<&str>,
     client_auth: Option<ClientAuth>,
 ) -> io::Result<ClientConfig> {
-    // Both arms converge on the `WantsClientCert` builder state, so the
+    // Every arm converges on the `WantsClientCert` builder state, so the
     // client-auth choice is applied once below.
     let builder = match mode {
         UpstreamTlsMode::VerifyFull => {
-            let mut roots = RootCertStore::empty();
-            if let Some(path) = ca_path {
-                let pem = std::fs::read(path).map_err(|e| {
-                    io::Error::new(
-                        e.kind(),
-                        format!("reading UPSTREAM_SSLROOTCERT {path}: {e}"),
-                    )
-                })?;
-                for cert in CertificateDer::pem_slice_iter(&pem) {
-                    let cert = cert.map_err(|e| {
-                        io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            format!("UPSTREAM_SSLROOTCERT {path}: {e}"),
-                        )
-                    })?;
-                    roots.add(cert).map_err(|e| {
-                        io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            format!("UPSTREAM_SSLROOTCERT {path}: {e}"),
-                        )
-                    })?;
+            let roots = match ca_path {
+                Some(path) => load_ca_bundle(path)?,
+                None => {
+                    let mut roots = RootCertStore::empty();
+                    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+                    roots
                 }
-                // An empty trust store would verify no server at all: refuse it
-                // here rather than let every handshake fail.
-                if roots.is_empty() {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!("no certificates found in UPSTREAM_SSLROOTCERT {path}"),
-                    ));
-                }
-            } else {
-                roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-            }
+            };
             ClientConfig::builder().with_root_certificates(roots)
+        }
+        UpstreamTlsMode::VerifyCa => {
+            // Without a bundle, verify-ca would accept any publicly trusted
+            // certificate issued for any name, which authenticates nothing.
+            // libpq refuses verify-ca without a root certificate too.
+            let path = ca_path.ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "UPSTREAM_SSLMODE=verify-ca requires UPSTREAM_SSLROOTCERT \
+                     (the CA bundle that issued the database certificate)",
+                )
+            })?;
+            let verifier = danger::ChainOnlyVerification::new(load_ca_bundle(path)?);
+            ClientConfig::builder()
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(verifier))
         }
         UpstreamTlsMode::Require => ClientConfig::builder()
             .dangerous()
@@ -251,16 +274,130 @@ fn build_client_config(
     }
 }
 
-/// Certificate verifier that accepts any server certificate. Used only for
-/// `require` mode, which provides encryption-in-transit without authenticating
-/// the server (matching libpq `sslmode=require` semantics). For authentication,
-/// use `verify-full`.
+/// Reads the `UPSTREAM_SSLROOTCERT` bundle into a trust store. A file that
+/// cannot be read, holds a certificate that does not parse, or holds no
+/// certificate at all is an error naming the variable and the path.
+fn load_ca_bundle(path: &str) -> io::Result<RootCertStore> {
+    let invalid = |e: &dyn std::fmt::Display| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("UPSTREAM_SSLROOTCERT {path}: {e}"),
+        )
+    };
+    let pem = std::fs::read(path).map_err(|e| {
+        io::Error::new(
+            e.kind(),
+            format!("reading UPSTREAM_SSLROOTCERT {path}: {e}"),
+        )
+    })?;
+    let mut roots = RootCertStore::empty();
+    for cert in CertificateDer::pem_slice_iter(&pem) {
+        let cert = cert.map_err(|e| invalid(&e))?;
+        roots.add(cert).map_err(|e| invalid(&e))?;
+    }
+    // An empty trust store would verify no server at all: refuse it here rather
+    // than let every handshake fail.
+    if roots.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("no certificates found in UPSTREAM_SSLROOTCERT {path}"),
+        ));
+    }
+    Ok(roots)
+}
+
+/// Custom server-certificate verifiers.
+///
+/// `NoCertVerification` accepts any server certificate. Used only for `require`
+/// mode, which provides encryption-in-transit without authenticating the server
+/// (matching libpq `sslmode=require` semantics).
+///
+/// `ChainOnlyVerification` is `verify-ca`: the certificate must chain to the
+/// configured CA bundle, be within its validity period and carry valid
+/// signatures, but the name it was issued for is not compared with
+/// `UPSTREAM_HOST` (libpq `sslmode=verify-ca`). For both, use `verify-full`.
 mod danger {
+    use std::sync::Arc;
+
     use tokio_rustls::rustls::client::danger::{
         HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier,
     };
+    use tokio_rustls::rustls::client::verify_server_cert_signed_by_trust_anchor;
+    use tokio_rustls::rustls::crypto::{
+        CryptoProvider, WebPkiSupportedAlgorithms, verify_tls12_signature, verify_tls13_signature,
+    };
     use tokio_rustls::rustls::pki_types::{CertificateDer, ServerName, UnixTime};
-    use tokio_rustls::rustls::{DigitallySignedStruct, Error, SignatureScheme};
+    use tokio_rustls::rustls::server::ParsedCertificate;
+    use tokio_rustls::rustls::{DigitallySignedStruct, Error, RootCertStore, SignatureScheme};
+
+    #[derive(Debug)]
+    pub struct ChainOnlyVerification {
+        roots: Arc<RootCertStore>,
+        algorithms: WebPkiSupportedAlgorithms,
+    }
+
+    impl ChainOnlyVerification {
+        /// Verifies against `roots` with the signature algorithms of the
+        /// process-default crypto provider (ring, installed by `main`), the one
+        /// `ClientConfig::builder()` uses for `verify-full`.
+        pub fn new(roots: RootCertStore) -> Self {
+            let algorithms = CryptoProvider::get_default()
+                .map(|p| p.signature_verification_algorithms)
+                .unwrap_or_else(|| {
+                    tokio_rustls::rustls::crypto::ring::default_provider()
+                        .signature_verification_algorithms
+                });
+            Self {
+                roots: Arc::new(roots),
+                algorithms,
+            }
+        }
+    }
+
+    impl ServerCertVerifier for ChainOnlyVerification {
+        fn verify_server_cert(
+            &self,
+            end_entity: &CertificateDer<'_>,
+            intermediates: &[CertificateDer<'_>],
+            _server_name: &ServerName<'_>,
+            _ocsp_response: &[u8],
+            now: UnixTime,
+        ) -> Result<ServerCertVerified, Error> {
+            // The same chain check verify-full runs (WebPkiServerVerifier), minus
+            // its final step, the server-name comparison.
+            let cert = ParsedCertificate::try_from(end_entity)?;
+            verify_server_cert_signed_by_trust_anchor(
+                &cert,
+                &self.roots,
+                intermediates,
+                now,
+                self.algorithms.all,
+            )?;
+            Ok(ServerCertVerified::assertion())
+        }
+
+        fn verify_tls12_signature(
+            &self,
+            message: &[u8],
+            cert: &CertificateDer<'_>,
+            dss: &DigitallySignedStruct,
+        ) -> Result<HandshakeSignatureValid, Error> {
+            verify_tls12_signature(message, cert, dss, &self.algorithms)
+        }
+
+        fn verify_tls13_signature(
+            &self,
+            message: &[u8],
+            cert: &CertificateDer<'_>,
+            dss: &DigitallySignedStruct,
+        ) -> Result<HandshakeSignatureValid, Error> {
+            verify_tls13_signature(message, cert, dss, &self.algorithms)
+        }
+
+        fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+            self.algorithms.supported_schemes()
+        }
+    }
 
     #[derive(Debug)]
     pub struct NoCertVerification;
@@ -354,30 +491,65 @@ mod tests {
         );
     }
 
+    /// Every accepted spelling, in any case and with surrounding whitespace;
+    /// unset or empty keeps the documented default, `disable`.
     #[test]
-    fn tls_mode_parses_from_env() {
-        assert_eq!(
-            UpstreamTlsMode::from_env_str("require"),
-            UpstreamTlsMode::Require
-        );
-        assert_eq!(
-            UpstreamTlsMode::from_env_str("VERIFY-FULL"),
-            UpstreamTlsMode::VerifyFull
-        );
-        assert_eq!(
-            UpstreamTlsMode::from_env_str("verify_full"),
-            UpstreamTlsMode::VerifyFull
-        );
-        assert_eq!(
-            UpstreamTlsMode::from_env_str("disable"),
-            UpstreamTlsMode::Disable
-        );
-        assert_eq!(UpstreamTlsMode::from_env_str(""), UpstreamTlsMode::Disable);
-        assert_eq!(
-            UpstreamTlsMode::from_env_str("bogus"),
-            UpstreamTlsMode::Disable
-        );
-        assert_eq!(UpstreamTlsMode::default(), UpstreamTlsMode::Disable);
+    fn tls_mode_parses_case_insensitively_and_unset_is_disable() {
+        use UpstreamTlsMode::*;
+        for (raw, want) in [
+            (None, Disable),
+            (Some(""), Disable),
+            (Some("   "), Disable),
+            (Some("disable"), Disable),
+            (Some(" DISABLE "), Disable),
+            (Some("require"), Require),
+            (Some("Require\n"), Require),
+            (Some("verify-ca"), VerifyCa),
+            (Some(" VERIFY_CA"), VerifyCa),
+            (Some("verifyca"), VerifyCa),
+            (Some("verify-full"), VerifyFull),
+            (Some("VERIFY-FULL"), VerifyFull),
+            (Some("verify_full"), VerifyFull),
+            (Some("\tVerifyFull "), VerifyFull),
+        ] {
+            assert_eq!(UpstreamTlsMode::parse(raw), Ok(want), "{raw:?}");
+        }
+        assert_eq!(UpstreamTlsMode::default(), Disable);
+    }
+
+    /// A value the proxy does not recognise used to mean plaintext. It is now an
+    /// error naming the variable, the value and every accepted value.
+    #[test]
+    fn an_unknown_upstream_tls_mode_is_an_error_not_plaintext() {
+        for raw in [
+            "bogus",
+            "required",
+            "verify",
+            "verify-fulll",
+            "true",
+            "on",
+            "ssl",
+        ] {
+            let err = UpstreamTlsMode::parse(Some(raw)).expect_err(raw);
+            assert!(err.contains("UPSTREAM_SSLMODE"), "{err}");
+            assert!(err.contains(&format!("{raw:?}")), "{err}");
+            for accepted in ["`disable`", "`require`", "`verify-ca`", "`verify-full`"] {
+                assert!(err.contains(accepted), "{accepted} missing: {err}");
+            }
+        }
+    }
+
+    /// libpq's `prefer` and `allow` connect in plaintext when the server does not
+    /// offer TLS. A firewall proxy must not do that, so they are refused with
+    /// that reason rather than mapped to `require` or to `disable`.
+    #[test]
+    fn prefer_and_allow_are_refused_because_they_fall_back_to_plaintext() {
+        for raw in ["prefer", "allow", " PREFER ", "Allow"] {
+            let err = UpstreamTlsMode::parse(Some(raw)).expect_err(raw);
+            assert!(err.contains("UPSTREAM_SSLMODE"), "{err}");
+            assert!(err.contains("plaintext"), "{err}");
+            assert!(err.contains("`verify-ca`"), "{err}");
+        }
     }
 
     use tokio::net::TcpListener;
@@ -760,8 +932,402 @@ mod tests {
             tcp,
             "127.0.0.1",
             UpstreamTlsMode::Require,
+            None,
+            None,
+            None,
         ))
         .await;
         assert!(res.is_err());
+    }
+
+    // ── Real handshakes against a private CA ─────────────────────────────────
+
+    use super::test_pki::{Leaf, TestCa, server_config};
+    use tokio_rustls::rustls::ServerConfig;
+
+    /// Which upstream path a handshake test drives.
+    #[derive(Clone, Copy, Debug)]
+    enum Path {
+        /// `connect_upstream`: SSLRequest, then TLS.
+        Postgres,
+        /// `upgrade_to_tls_client`: TLS on an open socket (MySQL's SSL Request
+        /// is the session's job).
+        Mysql,
+    }
+
+    /// The material one handshake uses, by path.
+    struct Material<'a> {
+        ca: Option<&'a str>,
+        cert: Option<&'a str>,
+        key: Option<&'a str>,
+    }
+
+    const NO_FILES: Material<'static> = Material {
+        ca: None,
+        cert: None,
+        key: None,
+    };
+
+    /// A one-connection TLS database on 127.0.0.1 presenting `server`. Resolves
+    /// to the client certificates it was shown, or to the handshake error.
+    async fn tls_db(
+        path: Path,
+        server: Arc<ServerConfig>,
+    ) -> (
+        u16,
+        tokio::task::JoinHandle<io::Result<Option<Vec<CertificateDer<'static>>>>>,
+    ) {
+        fake_db(move |mut s| async move {
+            if let Path::Postgres = path {
+                let mut req = [0u8; 8];
+                s.read_exact(&mut req).await?;
+                s.write_all(b"S").await?;
+            }
+            let mut tls = tokio_rustls::TlsAcceptor::from(server).accept(s).await?;
+            // One byte each way: the handshake is complete on both sides,
+            // client certificate included, before either end returns.
+            let mut b = [0u8; 1];
+            tls.read_exact(&mut b).await?;
+            tls.write_all(b"!").await?;
+            tls.flush().await?;
+            Ok(tls
+                .get_ref()
+                .1
+                .peer_certificates()
+                .map(|c| c.iter().map(|c| c.clone().into_owned()).collect()))
+        })
+        .await
+    }
+
+    /// Runs one handshake through `path` with `mode` and `files`, against a
+    /// database presenting `leaf` (and requiring a client certificate signed by
+    /// `client_ca`, if given). Returns the client's result and the server's.
+    async fn handshake(
+        path: Path,
+        mode: UpstreamTlsMode,
+        host: &str,
+        files: Material<'_>,
+        leaf: &Leaf,
+        client_ca: Option<&TestCa>,
+    ) -> (
+        io::Result<()>,
+        io::Result<Option<Vec<CertificateDer<'static>>>>,
+    ) {
+        install_provider();
+        let (port, db) = tls_db(path, server_config(leaf, client_ca)).await;
+        let client = async {
+            let (mut r, mut w) = match path {
+                Path::Postgres => {
+                    connect_upstream(host, port, mode, files.ca, files.cert, files.key).await?
+                }
+                Path::Mysql => {
+                    let tcp = TcpStream::connect(("127.0.0.1", port)).await?;
+                    upgrade_to_tls_client(tcp, host, mode, files.ca, files.cert, files.key).await?
+                }
+            };
+            w.write_all(b"?").await?;
+            w.flush().await?;
+            let mut b = [0u8; 1];
+            r.read_exact(&mut b).await?;
+            Ok(())
+        };
+        let client = within(client).await;
+        let server = within(db).await.unwrap();
+        (client, server)
+    }
+
+    /// The bug this release fixes on MySQL, and the behaviour Postgres already
+    /// had: verify-full trusts the CA in UPSTREAM_SSLROOTCERT, so a database
+    /// whose certificate a private CA issued is accepted.
+    #[tokio::test]
+    async fn verify_full_trusts_the_private_ca_in_upstream_sslrootcert() {
+        let ca = TestCa::new("vericto test private CA");
+        let ca_file = TempPem::new(&ca.pem());
+        let leaf = ca.issue(&["localhost", "127.0.0.1"]);
+        for path in [Path::Postgres, Path::Mysql] {
+            let files = Material {
+                ca: Some(ca_file.path()),
+                ..NO_FILES
+            };
+            let (client, server) = handshake(
+                path,
+                UpstreamTlsMode::VerifyFull,
+                "127.0.0.1",
+                files,
+                &leaf,
+                None,
+            )
+            .await;
+            client.unwrap_or_else(|e| panic!("{path:?}: {e}"));
+            server.unwrap_or_else(|e| panic!("{path:?}: {e}"));
+        }
+    }
+
+    /// Without UPSTREAM_SSLROOTCERT, verify-full trusts the public web roots
+    /// only, so the same private-CA database is refused (fail closed), and a
+    /// bundle holding another CA is refused too, on both paths.
+    #[tokio::test]
+    async fn verify_full_refuses_a_ca_it_was_not_given() {
+        let ca = TestCa::new("vericto test private CA");
+        let other = TestCa::new("someone else's CA");
+        let other_file = TempPem::new(&other.pem());
+        let leaf = ca.issue(&["127.0.0.1"]);
+        for path in [Path::Postgres, Path::Mysql] {
+            for ca_path in [None, Some(other_file.path())] {
+                let files = Material {
+                    ca: ca_path,
+                    ..NO_FILES
+                };
+                let (client, _) = handshake(
+                    path,
+                    UpstreamTlsMode::VerifyFull,
+                    "127.0.0.1",
+                    files,
+                    &leaf,
+                    None,
+                )
+                .await;
+                let err = client.expect_err("an unknown issuer must be refused");
+                assert!(
+                    err.to_string().contains("UnknownIssuer"),
+                    "{path:?} {ca_path:?}: {err}"
+                );
+            }
+        }
+    }
+
+    /// verify-ca (libpq semantics): the chain must lead to the configured CA,
+    /// the name in the certificate is not checked. verify-full, given the same
+    /// certificate for another name, refuses it.
+    #[tokio::test]
+    async fn verify_ca_checks_the_chain_but_not_the_hostname() {
+        let ca = TestCa::new("vericto test private CA");
+        let ca_file = TempPem::new(&ca.pem());
+        let leaf = ca.issue(&["db-primary.internal"]);
+        for path in [Path::Postgres, Path::Mysql] {
+            let files = || Material {
+                ca: Some(ca_file.path()),
+                ..NO_FILES
+            };
+            let (client, server) = handshake(
+                path,
+                UpstreamTlsMode::VerifyCa,
+                "127.0.0.1",
+                files(),
+                &leaf,
+                None,
+            )
+            .await;
+            client.unwrap_or_else(|e| panic!("{path:?} verify-ca: {e}"));
+            server.unwrap_or_else(|e| panic!("{path:?} verify-ca: {e}"));
+
+            let (client, _) = handshake(
+                path,
+                UpstreamTlsMode::VerifyFull,
+                "127.0.0.1",
+                files(),
+                &leaf,
+                None,
+            )
+            .await;
+            let err = client.expect_err("verify-full checks the name");
+            assert!(
+                err.to_string().contains("not valid for name"),
+                "{path:?}: {err}"
+            );
+        }
+    }
+
+    /// verify-ca still verifies the chain: a certificate from another CA, or a
+    /// self-signed one, is refused even though the name is not checked.
+    #[tokio::test]
+    async fn verify_ca_refuses_a_certificate_from_another_ca() {
+        let ca = TestCa::new("vericto test private CA");
+        let ca_file = TempPem::new(&ca.pem());
+        let rogue = TestCa::new("rogue CA").issue(&["127.0.0.1"]);
+        for path in [Path::Postgres, Path::Mysql] {
+            let files = Material {
+                ca: Some(ca_file.path()),
+                ..NO_FILES
+            };
+            let (client, _) = handshake(
+                path,
+                UpstreamTlsMode::VerifyCa,
+                "127.0.0.1",
+                files,
+                &rogue,
+                None,
+            )
+            .await;
+            let err = client.expect_err("another CA's certificate");
+            assert!(err.to_string().contains("UnknownIssuer"), "{path:?}: {err}");
+        }
+    }
+
+    /// verify-ca without a CA bundle would accept any publicly trusted
+    /// certificate for any name, which authenticates nothing. Like libpq, it
+    /// needs a root certificate: refused when the config is built, so at startup.
+    #[test]
+    fn verify_ca_requires_upstream_sslrootcert() {
+        install_provider();
+        let err = validate_upstream_tls(UpstreamTlsMode::VerifyCa, None, None, None)
+            .expect_err("verify-ca without a CA bundle");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("UPSTREAM_SSLROOTCERT"), "{err}");
+        assert!(err.to_string().contains("verify-ca"), "{err}");
+
+        let empty = TempPem::new("");
+        let err = validate_upstream_tls(UpstreamTlsMode::VerifyCa, Some(empty.path()), None, None)
+            .expect_err("an empty CA bundle");
+        assert!(
+            err.to_string()
+                .contains("no certificates found in UPSTREAM_SSLROOTCERT"),
+            "{err}"
+        );
+
+        let ca = TempPem::new(TEST_CA_CERT);
+        validate_upstream_tls(UpstreamTlsMode::VerifyCa, Some(ca.path()), None, None)
+            .expect("a CA bundle with a certificate");
+    }
+
+    /// The MySQL path presents UPSTREAM_SSLCERT / UPSTREAM_SSLKEY for mutual
+    /// TLS, as the Postgres path does; a server that requires a client
+    /// certificate refuses a handshake without one.
+    #[tokio::test]
+    async fn both_paths_present_the_client_certificate_for_mutual_tls() {
+        let ca = TestCa::new("vericto test private CA");
+        let ca_file = TempPem::new(&ca.pem());
+        let leaf = ca.issue(&["127.0.0.1"]);
+        let client_leaf = ca.issue(&["vericto-proxy"]);
+        let cert_file = TempPem::new(&client_leaf.cert_pem);
+        let key_file = TempPem::new(&client_leaf.key_pem);
+        for path in [Path::Postgres, Path::Mysql] {
+            let files = Material {
+                ca: Some(ca_file.path()),
+                cert: Some(cert_file.path()),
+                key: Some(key_file.path()),
+            };
+            let (client, server) = handshake(
+                path,
+                UpstreamTlsMode::VerifyFull,
+                "127.0.0.1",
+                files,
+                &leaf,
+                Some(&ca),
+            )
+            .await;
+            client.unwrap_or_else(|e| panic!("{path:?}: {e}"));
+            let shown = server
+                .unwrap_or_else(|e| panic!("{path:?}: {e}"))
+                .expect("a client certificate");
+            assert_eq!(shown, vec![client_leaf.cert.clone()], "{path:?}");
+
+            let files = Material {
+                ca: Some(ca_file.path()),
+                ..NO_FILES
+            };
+            let (_, server) = handshake(
+                path,
+                UpstreamTlsMode::VerifyFull,
+                "127.0.0.1",
+                files,
+                &leaf,
+                Some(&ca),
+            )
+            .await;
+            assert!(server.is_err(), "{path:?}: no client certificate");
+        }
+    }
+}
+
+/// Throwaway PKI for the handshake tests: a private CA and the certificates it
+/// issues, generated per run with rcgen, so no private key is ever committed.
+#[cfg(test)]
+pub(crate) mod test_pki {
+    use std::sync::Arc;
+
+    use rcgen::{
+        BasicConstraints, CertificateParams, CertifiedIssuer, DnType, IsCa, KeyPair,
+        KeyUsagePurpose,
+    };
+    use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+    use tokio_rustls::rustls::server::WebPkiClientVerifier;
+    use tokio_rustls::rustls::{RootCertStore, ServerConfig};
+
+    /// A self-signed CA, valid for the test run.
+    pub(crate) struct TestCa {
+        issuer: CertifiedIssuer<'static, KeyPair>,
+    }
+
+    /// A certificate a [`TestCa`] issued, with its private key.
+    pub(crate) struct Leaf {
+        pub(crate) cert: CertificateDer<'static>,
+        pub(crate) cert_pem: String,
+        pub(crate) key_pem: String,
+        key_der: Vec<u8>,
+    }
+
+    impl TestCa {
+        pub(crate) fn new(common_name: &str) -> Self {
+            let mut params = CertificateParams::new(Vec::<String>::new()).unwrap();
+            params
+                .distinguished_name
+                .push(DnType::CommonName, common_name);
+            params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+            params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+            let issuer =
+                CertifiedIssuer::self_signed(params, KeyPair::generate().unwrap()).unwrap();
+            Self { issuer }
+        }
+
+        /// The CA certificate, PEM: what UPSTREAM_SSLROOTCERT holds.
+        pub(crate) fn pem(&self) -> String {
+            self.issuer.pem()
+        }
+
+        /// Issues a certificate for `names` (DNS names or IP addresses).
+        pub(crate) fn issue(&self, names: &[&str]) -> Leaf {
+            let names: Vec<String> = names.iter().map(|n| n.to_string()).collect();
+            let params = CertificateParams::new(names).unwrap();
+            let key = KeyPair::generate().unwrap();
+            let cert = params.signed_by(&key, &self.issuer).unwrap();
+            Leaf {
+                cert: cert.der().clone(),
+                cert_pem: cert.pem(),
+                key_pem: key.serialize_pem(),
+                key_der: key.serialize_der(),
+            }
+        }
+
+        fn roots(&self) -> RootCertStore {
+            let mut roots = RootCertStore::empty();
+            roots.add(self.issuer.der().clone()).unwrap();
+            roots
+        }
+    }
+
+    impl Leaf {
+        fn key(&self) -> PrivateKeyDer<'static> {
+            PrivatePkcs8KeyDer::from(self.key_der.clone()).into()
+        }
+    }
+
+    /// A server presenting `leaf`, requiring a client certificate issued by
+    /// `client_ca` when one is given.
+    pub(crate) fn server_config(leaf: &Leaf, client_ca: Option<&TestCa>) -> Arc<ServerConfig> {
+        let builder = ServerConfig::builder();
+        let builder = match client_ca {
+            Some(ca) => builder.with_client_cert_verifier(
+                WebPkiClientVerifier::builder(Arc::new(ca.roots()))
+                    .build()
+                    .unwrap(),
+            ),
+            None => builder.with_no_client_auth(),
+        };
+        Arc::new(
+            builder
+                .with_single_cert(vec![leaf.cert.clone()], leaf.key())
+                .unwrap(),
+        )
     }
 }

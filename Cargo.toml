@@ -1,6 +1,6 @@
 [package]
 name = "vericto-proxy"
-version = "4.12.2"
+version = "4.12.3"
 edition = "2024"
 rust-version = "1.88"
 description = "Vericto — Deterministic SQL firewall — TCP wire-protocol proxy for customer infrastructure"
@@ -14,7 +14,7 @@ path = "src/main.rs"
 
 [dependencies]
 # AST engine (source-available shared library, Elastic License 2.0)
-vericto-engine = { git = "https://github.com/vericto/vericto-engine", tag = "v4.1.1" }
+vericto-engine = { git = "https://github.com/vericto/vericto-engine", tag = "v4.1.3" }
 
 # PostgreSQL query normalization for sanitized telemetry (literals → $1, $2…).
 # Same major version the engine uses, so libpg_query resolves to a single build.
@@ -45,8 +45,9 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 # gzip request bodies for /api/v1/ingest/events (telemetry reporter, 4.11.0).
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 
-# Upstream TLS client: encrypts the proxy→database hop (PostgreSQL SSLRequest +
-# rustls handshake) when UPSTREAM_SSLMODE is require/verify-full.
+# Upstream TLS client: encrypts the proxy→database hop (PostgreSQL SSLRequest or
+# MySQL SSL Request + rustls handshake) when UPSTREAM_SSLMODE is
+# require/verify-ca/verify-full.
 tokio-rustls = "0.26"
 webpki-roots = "0.26"
 # PEM parsing comes from rustls-pki-types (re-exported by tokio-rustls as
@@ -81,6 +82,11 @@ tokio-postgres = "0.7"
 # VERICTO_TEST_MYSQL_URL is set. rustls on ring (already in the tree) for the
 # both-hops-TLS run; no C zlib.
 mysql_async = { version = "0.37", default-features = false, features = ["default-rustls-ring"] }
+# Throwaway CAs and server/client certificates for the upstream TLS handshake
+# tests (src/tcp/upstream.rs): a private CA, verify-ca against a certificate for
+# another name, mutual TLS on the MySQL path. Generated per test run, so no
+# private key is ever committed. ring only, already in the tree.
+rcgen = { version = "0.14", default-features = false, features = ["ring", "pem"] }
 
 [profile.release]
 opt-level = 3

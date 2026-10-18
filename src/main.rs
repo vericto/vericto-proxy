@@ -50,12 +50,21 @@ async fn main() {
         std::process::exit(1);
     }
 
-    let Some(tcp_opts) = tcp::TcpProxyOptions::from_env() else {
-        tracing::error!(
-            "UPSTREAM_HOST is not set — vericto-proxy requires a database upstream to proxy to. \
-             Set UPSTREAM_HOST to the hostname of your production database."
-        );
-        std::process::exit(1);
+    let tcp_opts = match tcp::TcpProxyOptions::from_env() {
+        Ok(Some(opts)) => opts,
+        Ok(None) => {
+            tracing::error!(
+                "UPSTREAM_HOST is not set — vericto-proxy requires a database upstream to proxy to. \
+                 Set UPSTREAM_HOST to the hostname of your production database."
+            );
+            std::process::exit(1);
+        }
+        // An unsupported UPSTREAM_SSLMODE / PROXY_TLS_MODE: never start that hop
+        // in plaintext by mistake.
+        Err(e) => {
+            tracing::error!("{e}");
+            std::process::exit(1);
+        }
     };
 
     // Shared, hot-swappable ruleset seeded with the built-in critical rules.

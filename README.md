@@ -448,17 +448,18 @@ hop; `PROXY_TLS_MODE` covers the client→proxy hop.
 
 | Variable             | Values / Default | Description                              |
 |----------------------|------------------|------------------------------------------|
-| `UPSTREAM_SSLMODE`   | `disable` (def) \| `require` \| `verify-full` | TLS to the database |
-| `UPSTREAM_SSLROOTCERT`| —               | CA bundle (PEM) for `verify-full` (Postgres). Read at startup: a missing file, or one without a certificate, fails startup |
-| `UPSTREAM_SSLCERT` / `UPSTREAM_SSLKEY` | —  | Client cert for upstream mutual TLS (Postgres). Read at startup when `UPSTREAM_SSLMODE` is not `disable`: half a pair, a missing file or one without a certificate/key fails startup |
-| `PROXY_TLS_MODE`     | `disable` (def) \| `require` | Terminate client-side TLS. With `require`, a client that does not request TLS is refused (Postgres: SQLSTATE 28000) |
+| `UPSTREAM_SSLMODE`   | `disable` (def) \| `require` \| `verify-ca` \| `verify-full` | TLS to the database, as libpq's `sslmode`: `require` encrypts without verifying the server; `verify-ca` verifies the certificate chain against `UPSTREAM_SSLROOTCERT` but not the hostname; `verify-full` verifies both. Any case; any other value fails startup. `prefer` and `allow` are refused: they connect in plaintext when the server offers no TLS, and the proxy never falls back to plaintext |
+| `UPSTREAM_SSLROOTCERT`| —               | CA bundle (PEM) for `verify-ca` (required) and `verify-full` (optional: without it, the public web roots), on Postgres and MySQL. Read at startup: a missing file, or one without a certificate, fails startup |
+| `UPSTREAM_SSLCERT` / `UPSTREAM_SSLKEY` | —  | Client cert for upstream mutual TLS, on Postgres and MySQL. Read at startup when `UPSTREAM_SSLMODE` is not `disable`: half a pair, a missing file or one without a certificate/key fails startup |
+| `PROXY_TLS_MODE`     | `disable` (def) \| `require` | Terminate client-side TLS. With `require`, a client that does not request TLS is refused (Postgres: SQLSTATE 28000). Any case; any other value fails startup |
 | `PROXY_TLS_CERT` / `PROXY_TLS_KEY` | —  | Server cert/key presented to clients. Either a **path** to a PEM file or the **PEM contents inline** — inline lets a secrets manager deliver the key, so it never has to be baked into the image |
 
 > **MySQL TLS caveat:** TLS must be on **both** hops or neither — never one. The
 > proxy participates in the handshake, and MySQL derives its auth scramble from
 > the "secure connection" state, so a plaintext hop paired with a TLS hop breaks
 > authentication by protocol design. Set `PROXY_TLS_MODE=require` **and**
-> `UPSTREAM_SSLMODE=require` together (or leave both off). See
+> `UPSTREAM_SSLMODE=require` (or `verify-ca` / `verify-full`) together (or
+> leave both off). See
 > [engine-specific notes](#engine-specific-notes).
 
 ### Query size limit

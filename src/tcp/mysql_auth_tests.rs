@@ -493,6 +493,79 @@ async fn upstream_tls_required_but_not_offered_is_refused_before_the_greeting() 
     );
 }
 
+/// UPSTREAM_SSLMODE=verify-full with UPSTREAM_SSLROOTCERT on MySQL. Up to
+/// 4.12.2 the MySQL path ignored the bundle and verified against the public web
+/// roots, so a server whose certificate a private CA issued failed every
+/// handshake. The bundle is now trusted, as on Postgres: the HandshakeResponse
+/// reaches the server over TLS and the client gets the server's OK.
+#[tokio::test]
+async fn upstream_verify_full_trusts_the_private_ca_in_upstream_sslrootcert() {
+    use crate::tcp::upstream::test_pki::{TestCa, server_config};
+    use tokio::io::AsyncReadExt;
+
+    let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
+    let ca = TestCa::new("vericto test private CA");
+    let dir = tempfile::tempdir().unwrap();
+    let ca_path = dir.path().join("ca.pem");
+    std::fs::write(&ca_path, ca.pem()).unwrap();
+    let server = server_config(&ca.issue(&["127.0.0.1"]), None);
+
+    let db = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let db_port = db.local_addr().unwrap().port();
+    let (seen_tx, seen_rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        let (mut s, _) = db.accept().await.unwrap();
+        send(&mut s, 0, &handshake()).await;
+        let ssl_request = mc::read_packet(&mut s).await.unwrap().expect("SSL Request");
+        let mut tls = match tokio_rustls::TlsAcceptor::from(server).accept(s).await {
+            Ok(tls) => tls,
+            Err(e) => {
+                let _ = seen_tx.send(Err(e.to_string()));
+                return;
+            }
+        };
+        let response = mc::read_packet(&mut tls)
+            .await
+            .unwrap()
+            .expect("HandshakeResponse over TLS");
+        let ok = MySqlPacket {
+            seq: 3,
+            payload: OK.to_vec(),
+        };
+        tls.write_all(&ok.encode()).await.unwrap();
+        tls.flush().await.unwrap();
+        let _ = seen_tx.send(Ok((ssl_request.seq, response.seq)));
+        let mut rest = [0u8; 1];
+        let _ = tls.read(&mut rest).await;
+    });
+
+    let (cfg, _) = config_with(
+        ("127.0.0.1", db_port),
+        EnforcementPolicy::default(),
+        TelemetryQueryMode::Raw,
+        crate::tcp::evaluator::default_ruleset(),
+        crate::tcp::upstream::UpstreamTlsMode::VerifyFull,
+    );
+    let mut cfg = std::sync::Arc::try_unwrap(cfg)
+        .ok()
+        .expect("the only reference");
+    cfg.upstream_ca_path = Some(ca_path.to_str().unwrap().into());
+    let port = spawn_mysql_proxy(std::sync::Arc::new(cfg)).await;
+
+    let mut c = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    let greeting = recv(&mut c, "the greeting").await.expect("greeting");
+    assert_eq!(greeting.seq, 0);
+    send(&mut c, 1, &handshake_response()).await;
+    let ok = recv(&mut c, "the server's OK").await;
+    let upstream = timeout(seen_rx).await.unwrap();
+    assert_eq!(
+        upstream,
+        Ok((1, 2)),
+        "SSL Request, then the response over TLS"
+    );
+    assert_eq!(ok.expect("the OK is relayed").payload, OK.to_vec());
+}
+
 /// The server hangs up after the client's HandshakeResponse, mid-auth: the
 /// client gets the greeting and then a close, not a hang.
 #[tokio::test]

@@ -617,8 +617,9 @@ pub async fn intercept_client_to_server(
 /// upstream first (no client-side startup negotiation, unlike Postgres), then
 /// the server→client relay carries the handshake and the interception loop
 /// passes auth packets through (gated by `is_command_phase_start`) before
-/// intercepting queries. Client-side TLS is not offered in Phase 1 (trusted
-/// network); upstream TLS for MySQL is a follow-up.
+/// intercepting queries. TLS, when configured, covers both hops (see the TLS
+/// coherence note in `run_mysql_session`); the upstream hop verifies against
+/// `UPSTREAM_SSLROOTCERT` and presents `UPSTREAM_SSLCERT`, as on Postgres.
 pub async fn handle_mysql_connection(client: tokio::net::TcpStream, config: Arc<PgProxyConfig>) {
     let peer = client
         .peer_addr()
@@ -779,6 +780,9 @@ async fn run_mysql_session(
             tcp,
             &config.upstream_host,
             config.upstream_tls,
+            config.upstream_ca_path.as_deref(),
+            config.upstream_client_cert.as_deref(),
+            config.upstream_client_key.as_deref(),
         )
         .await?;
         // HandshakeResponse over TLS with CLIENT_SSL set, re-sequenced to 2.
