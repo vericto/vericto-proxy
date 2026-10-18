@@ -315,7 +315,7 @@ buffer), or to an empty value to turn it off.
 | `VERICTO_API_KEY`                   | —       | Workspace API key (`vtro_...`)                   |
 | `VERICTO_DATABASE_ID`               | —       | UUID of the database record; enables + correlates telemetry |
 | `VERICTO_RULES_SYNC_INTERVAL_SECS`  | `300`   | How often to poll `/sync/rules` (min 30)         |
-| `VERICTO_TELEMETRY_BUFFER`          | `memory`| `memory` or `disk` (survives restarts)           |
+| `VERICTO_TELEMETRY_BUFFER`          | `memory`| `memory` or `disk` (survives restarts), any case. Any other value fails startup |
 | `VERICTO_TELEMETRY_DISK_PATH`       | `/var/lib/vericto/spool` | Spool dir when buffer=disk        |
 | `VERICTO_TELEMETRY_SPOOL_SUBDIR`    | — (off) | buffer=disk, several proxies on one volume: spool to `<spool dir>/tasks/<name>/`, `<name>` = `task` (ECS task id, else hostname), `hostname`, or a fixed name. See [Several proxies on one volume](#several-proxies-on-one-volume) |
 | `VERICTO_TELEMETRY_SPOOL_ORPHAN_SECS` | `600` | With `VERICTO_TELEMETRY_SPOOL_SUBDIR`: a proxy's directory whose lease is this old is adopted by a live one (min 120) |
@@ -449,8 +449,8 @@ hop; `PROXY_TLS_MODE` covers the client→proxy hop.
 | Variable             | Values / Default | Description                              |
 |----------------------|------------------|------------------------------------------|
 | `UPSTREAM_SSLMODE`   | `disable` (def) \| `require` \| `verify-full` | TLS to the database |
-| `UPSTREAM_SSLROOTCERT`| —               | CA bundle (PEM) for `verify-full`        |
-| `UPSTREAM_SSLCERT` / `UPSTREAM_SSLKEY` | —  | Client cert for upstream mutual TLS (Postgres) |
+| `UPSTREAM_SSLROOTCERT`| —               | CA bundle (PEM) for `verify-full` (Postgres). Read at startup: a missing file, or one without a certificate, fails startup |
+| `UPSTREAM_SSLCERT` / `UPSTREAM_SSLKEY` | —  | Client cert for upstream mutual TLS (Postgres). Read at startup when `UPSTREAM_SSLMODE` is not `disable`: half a pair, a missing file or one without a certificate/key fails startup |
 | `PROXY_TLS_MODE`     | `disable` (def) \| `require` | Terminate client-side TLS. With `require`, a client that does not request TLS is refused (Postgres: SQLSTATE 28000) |
 | `PROXY_TLS_CERT` / `PROXY_TLS_KEY` | —  | Server cert/key presented to clients. Either a **path** to a PEM file or the **PEM contents inline** — inline lets a secrets manager deliver the key, so it never has to be baked into the image |
 

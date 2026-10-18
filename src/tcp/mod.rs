@@ -64,22 +64,23 @@ impl TcpProxyOptions {
     /// the DEFAULT ports (Postgres 5432/5433, MySQL 3306/3307) when they are not
     /// set explicitly.
     pub fn from_env() -> Option<Self> {
-        let is_mysql = matches!(
-            std::env::var("VERICTO_WIRE_PROTOCOL").as_deref(),
-            Ok("mysql")
-        );
+        Self::from_lookup(&|key| std::env::var(key).ok())
+    }
+
+    /// [`Self::from_env`] reading each variable through `env`, so tests can pass
+    /// their own values without touching the process environment.
+    fn from_lookup(env: &dyn Fn(&str) -> Option<String>) -> Option<Self> {
+        let is_mysql = matches!(env("VERICTO_WIRE_PROTOCOL").as_deref(), Some("mysql"));
         // Protocol-derived port defaults (upstream, listen). Only used when the
         // corresponding env var is absent.
         let (default_upstream_port, default_listen_port) =
             if is_mysql { (3306, 3307) } else { (5432, 5433) };
 
-        let upstream_host = std::env::var("UPSTREAM_HOST").ok()?;
-        let upstream_port = std::env::var("UPSTREAM_PORT")
-            .ok()
+        let upstream_host = env("UPSTREAM_HOST")?;
+        let upstream_port = env("UPSTREAM_PORT")
             .and_then(|v| v.parse().ok())
             .unwrap_or(default_upstream_port);
-        let listen_port = std::env::var("PROXY_LISTEN_PORT")
-            .ok()
+        let listen_port = env("PROXY_LISTEN_PORT")
             .and_then(|v| v.parse().ok())
             .unwrap_or(default_listen_port);
 
@@ -87,26 +88,22 @@ impl TcpProxyOptions {
             listen_port,
             upstream_host,
             upstream_port,
-            database_id: std::env::var("VERICTO_DATABASE_ID").ok(),
+            database_id: env("VERICTO_DATABASE_ID"),
             // Upstream TLS (proxy→database): UPSTREAM_SSLMODE=require|verify-full.
             upstream_tls: crate::tcp::upstream::UpstreamTlsMode::from_env_str(
-                &std::env::var("UPSTREAM_SSLMODE").unwrap_or_default(),
+                &env("UPSTREAM_SSLMODE").unwrap_or_default(),
             ),
-            upstream_ca_path: std::env::var("UPSTREAM_SSLROOTCERT").ok(),
+            upstream_ca_path: env("UPSTREAM_SSLROOTCERT"),
             // Upstream mutual TLS (client cert the proxy presents to the DB).
             // Currently honored on the Postgres hop; ignored by the MySQL path.
-            upstream_client_cert: std::env::var("UPSTREAM_SSLCERT").ok(),
-            upstream_client_key: std::env::var("UPSTREAM_SSLKEY").ok(),
+            upstream_client_cert: env("UPSTREAM_SSLCERT"),
+            upstream_client_key: env("UPSTREAM_SSLKEY"),
             // Client TLS (client→proxy): PROXY_TLS_MODE + PROXY_TLS_CERT/KEY.
-            client_tls: ClientTlsMode::from_env_str(
-                &std::env::var("PROXY_TLS_MODE").unwrap_or_default(),
-            ),
-            client_tls_cert: std::env::var("PROXY_TLS_CERT").ok(),
-            client_tls_key: std::env::var("PROXY_TLS_KEY").ok(),
+            client_tls: ClientTlsMode::from_env_str(&env("PROXY_TLS_MODE").unwrap_or_default()),
+            client_tls_cert: env("PROXY_TLS_CERT"),
+            client_tls_key: env("PROXY_TLS_KEY"),
             // Dedicated health-check port (opt-in). Ignored if unparseable.
-            healthz_port: std::env::var("VERICTO_HEALTHZ_PORT")
-                .ok()
-                .and_then(|v| v.parse().ok()),
+            healthz_port: env("VERICTO_HEALTHZ_PORT").and_then(|v| v.parse().ok()),
         })
     }
 }
@@ -144,6 +141,16 @@ pub async fn run_pg_proxy(
         ClientTlsMode::Disable => None,
     };
     let client_tls_enabled = client_tls_acceptor.is_some();
+
+    // Same for proxy→database TLS: each connection loads the CA bundle and the
+    // mutual-TLS pair, so load them once here and fail fast if one is missing,
+    // empty or unparseable, rather than on every connection.
+    crate::tcp::upstream::validate_upstream_tls(
+        opts.upstream_tls,
+        opts.upstream_ca_path.as_deref(),
+        opts.upstream_client_cert.as_deref(),
+        opts.upstream_client_key.as_deref(),
+    )?;
 
     let config = Arc::new(PgProxyConfig {
         upstream_host: opts.upstream_host.clone(),
@@ -280,3 +287,217 @@ mod access_tests;
 mod mysql_auth_tests;
 #[cfg(test)]
 mod sensitive_tests;
+#[cfg(test)]
+mod session_tests;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tcp::upstream::UpstreamTlsMode;
+    use arc_swap::ArcSwap;
+    use std::collections::HashMap;
+
+    fn options(vars: &[(&str, &str)]) -> Option<TcpProxyOptions> {
+        let map: HashMap<String, String> = vars
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        TcpProxyOptions::from_lookup(&move |key| map.get(key).cloned())
+    }
+
+    /// Without UPSTREAM_HOST there is nothing to proxy to: the TCP proxy is off.
+    #[test]
+    fn no_upstream_host_means_no_proxy() {
+        assert!(options(&[]).is_none());
+        assert!(options(&[("UPSTREAM_PORT", "5432")]).is_none());
+    }
+
+    /// The wire protocol only changes the default ports; everything else is off
+    /// or plaintext until it is set.
+    #[test]
+    fn default_ports_follow_the_wire_protocol() {
+        let pg = options(&[("UPSTREAM_HOST", "db")]).unwrap();
+        assert_eq!((pg.upstream_port, pg.listen_port), (5432, 5433));
+        assert_eq!(pg.upstream_tls, UpstreamTlsMode::Disable);
+        assert_eq!(pg.client_tls, ClientTlsMode::Disable);
+        assert_eq!(pg.healthz_port, None);
+        assert!(pg.database_id.is_none() && pg.upstream_ca_path.is_none());
+
+        let my = options(&[("UPSTREAM_HOST", "db"), ("VERICTO_WIRE_PROTOCOL", "mysql")]).unwrap();
+        assert_eq!((my.upstream_port, my.listen_port), (3306, 3307));
+    }
+
+    #[test]
+    fn every_variable_reaches_its_option_and_bad_ports_fall_back() {
+        let o = options(&[
+            ("UPSTREAM_HOST", "db.internal"),
+            ("UPSTREAM_PORT", "6543"),
+            ("PROXY_LISTEN_PORT", "7000"),
+            ("VERICTO_DATABASE_ID", "db-1"),
+            ("UPSTREAM_SSLMODE", "verify-full"),
+            ("UPSTREAM_SSLROOTCERT", "/etc/ca.pem"),
+            ("UPSTREAM_SSLCERT", "/etc/c.pem"),
+            ("UPSTREAM_SSLKEY", "/etc/k.pem"),
+            ("PROXY_TLS_MODE", "require"),
+            ("PROXY_TLS_CERT", "/etc/s.pem"),
+            ("PROXY_TLS_KEY", "/etc/s.key"),
+            ("VERICTO_HEALTHZ_PORT", "8080"),
+        ])
+        .unwrap();
+        assert_eq!(o.upstream_host, "db.internal");
+        assert_eq!((o.upstream_port, o.listen_port), (6543, 7000));
+        assert_eq!(o.database_id.as_deref(), Some("db-1"));
+        assert_eq!(o.upstream_tls, UpstreamTlsMode::VerifyFull);
+        assert_eq!(o.upstream_ca_path.as_deref(), Some("/etc/ca.pem"));
+        assert_eq!(o.upstream_client_cert.as_deref(), Some("/etc/c.pem"));
+        assert_eq!(o.upstream_client_key.as_deref(), Some("/etc/k.pem"));
+        assert_eq!(o.client_tls, ClientTlsMode::Require);
+        assert_eq!(o.client_tls_cert.as_deref(), Some("/etc/s.pem"));
+        assert_eq!(o.client_tls_key.as_deref(), Some("/etc/s.key"));
+        assert_eq!(o.healthz_port, Some(8080));
+
+        let bad = options(&[
+            ("UPSTREAM_HOST", "db"),
+            ("UPSTREAM_PORT", "99999"),
+            ("PROXY_LISTEN_PORT", "x"),
+            ("VERICTO_HEALTHZ_PORT", "-1"),
+        ])
+        .unwrap();
+        assert_eq!((bad.upstream_port, bad.listen_port), (5432, 5433));
+        assert_eq!(bad.healthz_port, None);
+    }
+
+    type Shared = (
+        SharedRuleset,
+        SharedPolicy,
+        SharedAccessPolicies,
+        SharedTelemetryMode,
+    );
+
+    fn shared() -> Shared {
+        (
+            Arc::new(ArcSwap::from_pointee(
+                crate::tcp::evaluator::default_ruleset(),
+            )),
+            Arc::new(ArcSwap::from_pointee(
+                vericto_engine::EnforcementPolicy::default(),
+            )),
+            Arc::new(ArcSwap::from_pointee(
+                vericto_engine::AccessPolicyMap::default(),
+            )),
+            Arc::new(ArcSwap::from_pointee(
+                crate::tcp::rules_sync::TelemetryQueryMode::default(),
+            )),
+        )
+    }
+
+    async fn run(protocol: &str, opts: TcpProxyOptions) -> std::io::Error {
+        let (rules, policy, access, mode) = shared();
+        let run = async {
+            match protocol {
+                "mysql" => run_mysql_proxy(opts, rules, policy, access, mode, None).await,
+                _ => run_pg_proxy(opts, rules, policy, access, mode, None).await,
+            }
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(5), run)
+            .await
+            .expect("a startup error returns at once")
+            .expect_err("startup must fail")
+    }
+
+    fn base(listen_port: u16) -> TcpProxyOptions {
+        options(&[
+            ("UPSTREAM_HOST", "127.0.0.1"),
+            ("PROXY_LISTEN_PORT", &listen_port.to_string()),
+        ])
+        .unwrap()
+    }
+
+    /// PROXY_TLS_MODE=require without a certificate or key fails at startup with
+    /// the variable named, on both protocols, instead of failing per connection.
+    #[tokio::test]
+    async fn client_tls_without_material_fails_at_startup() {
+        for protocol in ["postgres", "mysql"] {
+            let mut no_cert = base(0);
+            no_cert.client_tls = ClientTlsMode::Require;
+            let err = run(protocol, no_cert).await;
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+            assert!(err.to_string().contains("PROXY_TLS_CERT"), "{err}");
+
+            let mut no_key = base(0);
+            no_key.client_tls = ClientTlsMode::Require;
+            no_key.client_tls_cert = Some("/etc/vericto/cert.pem".into());
+            let err = run(protocol, no_key).await;
+            assert!(err.to_string().contains("PROXY_TLS_KEY"), "{err}");
+
+            let mut missing = base(0);
+            missing.client_tls = ClientTlsMode::Require;
+            missing.client_tls_cert = Some("/nonexistent/vericto/cert.pem".into());
+            missing.client_tls_key = Some("/nonexistent/vericto/key.pem".into());
+            let err = run(protocol, missing).await;
+            assert!(err.to_string().contains("/nonexistent/vericto"), "{err}");
+        }
+    }
+
+    /// Postgres upstream TLS material is loaded at startup: a verify-full CA
+    /// bundle without a certificate, a missing one, or half a mutual-TLS pair
+    /// stops the proxy before it listens. A usable bundle gets as far as the
+    /// listener (here: a taken port).
+    #[tokio::test]
+    async fn bad_upstream_tls_material_fails_at_startup() {
+        let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
+        let dir = tempfile::tempdir().unwrap();
+        let empty = dir.path().join("empty-ca.pem");
+        std::fs::write(&empty, "").unwrap();
+        let empty = empty.to_str().unwrap().to_string();
+
+        let mut no_cert_in_ca = base(0);
+        no_cert_in_ca.upstream_tls = UpstreamTlsMode::VerifyFull;
+        no_cert_in_ca.upstream_ca_path = Some(empty.clone());
+        let err = run("postgres", no_cert_in_ca).await;
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(
+            err.to_string()
+                .contains("no certificates found in UPSTREAM_SSLROOTCERT"),
+            "{err}"
+        );
+        assert!(err.to_string().contains(&empty), "{err}");
+
+        let mut missing_ca = base(0);
+        missing_ca.upstream_tls = UpstreamTlsMode::VerifyFull;
+        missing_ca.upstream_ca_path = Some("/nonexistent/vericto/ca.pem".into());
+        let err = run("postgres", missing_ca).await;
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+        assert!(
+            err.to_string().contains("/nonexistent/vericto/ca.pem"),
+            "{err}"
+        );
+
+        let mut half_pair = base(0);
+        half_pair.upstream_tls = UpstreamTlsMode::Require;
+        half_pair.upstream_client_cert = Some("/etc/vericto/client.pem".into());
+        let err = run("postgres", half_pair).await;
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("UPSTREAM_SSLKEY"), "{err}");
+
+        let ca = dir.path().join("ca.pem");
+        std::fs::write(&ca, crate::tcp::upstream::TEST_CA_CERT).unwrap();
+        let taken = TcpListener::bind("0.0.0.0:0").await.unwrap();
+        let mut good = base(taken.local_addr().unwrap().port());
+        good.upstream_tls = UpstreamTlsMode::VerifyFull;
+        good.upstream_ca_path = Some(ca.to_str().unwrap().into());
+        let err = run("postgres", good).await;
+        assert_eq!(err.kind(), std::io::ErrorKind::AddrInUse, "{err}");
+    }
+
+    /// A listen port already taken is a startup error, not a silent hang.
+    #[tokio::test]
+    async fn a_taken_listen_port_is_a_startup_error() {
+        let taken = TcpListener::bind("0.0.0.0:0").await.unwrap();
+        let port = taken.local_addr().unwrap().port();
+        for protocol in ["postgres", "mysql"] {
+            let err = run(protocol, base(port)).await;
+            assert_eq!(err.kind(), std::io::ErrorKind::AddrInUse, "{err}");
+        }
+    }
+}

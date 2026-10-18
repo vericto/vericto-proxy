@@ -687,6 +687,124 @@ mod tests {
         assert_eq!(**mode.load(), TelemetryQueryMode::Sanitized);
     }
 
+    /// A failed first sync (server error, auth failure, a body that does not
+    /// parse, or no API at all) keeps the built-in ruleset and default policy,
+    /// writes no cache, and still marks the proxy ready: a control-plane outage
+    /// must not become a proxy outage.
+    #[tokio::test]
+    async fn a_failed_sync_keeps_the_built_in_ruleset_and_still_gets_ready() {
+        use crate::config::BufferMode;
+        use axum::{Router, http::StatusCode, routing::get};
+
+        async fn first_sync_against(api_url: String) -> (usize, EnforcementPolicy, bool) {
+            let dir = tempfile::tempdir().unwrap();
+            let cache_path = dir.path().join("rules-cache.json");
+            let cfg = ControlPlaneConfig {
+                api_url,
+                api_key: "vk_test".into(),
+                database_id: None,
+                rules_sync_interval: Duration::from_secs(3600),
+                rules_cache_path: Some(cache_path.clone()),
+                buffer_mode: BufferMode::Memory,
+                disk_spool_path: String::new(),
+                memory_capacity: 10,
+                batch_size: 10,
+                flush_interval: Duration::from_secs(5),
+                spool: crate::config::SpoolTuning::default(),
+                delivery: crate::config::DeliveryTuning::default(),
+            };
+            let rules = Arc::new(ArcSwap::from_pointee(
+                crate::tcp::evaluator::default_ruleset(),
+            ));
+            let pol = Arc::new(ArcSwap::from_pointee(EnforcementPolicy::default()));
+            let ready = crate::tcp::healthz::Readiness::new();
+            let task = tokio::spawn(run(
+                cfg,
+                rules.clone(),
+                pol.clone(),
+                Arc::new(ArcSwap::from_pointee(AccessPolicyMap::default())),
+                Arc::new(ArcSwap::from_pointee(TelemetryQueryMode::default())),
+                ready.clone(),
+                None,
+            ));
+            tokio::time::timeout(Duration::from_secs(10), ready.wait_ready())
+                .await
+                .expect("ready after the first attempt, even a failed one");
+            task.abort();
+            let n = rules.load().len();
+            let p = (**pol.load()).clone();
+            (n, p, cache_path.exists())
+        }
+
+        let built_in = crate::tcp::evaluator::default_ruleset().len();
+        let app = Router::new()
+            .route(
+                "/500/api/v1/sync/rules",
+                get(|| async { (StatusCode::INTERNAL_SERVER_ERROR, "boom") }),
+            )
+            .route(
+                "/401/api/v1/sync/rules",
+                get(|| async { (StatusCode::UNAUTHORIZED, "{\"error\":\"bad key\"}") }),
+            )
+            .route(
+                "/garbage/api/v1/sync/rules",
+                get(|| async { "{\"rules\": \"not a list\"" }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await });
+
+        for case in ["500", "401", "garbage"] {
+            let (n, policy, cached) = first_sync_against(format!("http://{addr}/{case}")).await;
+            assert_eq!(n, built_in, "{case}: the built-in ruleset stays");
+            assert_eq!(policy, EnforcementPolicy::default(), "{case}");
+            assert!(!cached, "{case}: a failed sync is never cached");
+        }
+        server.abort();
+
+        let dead = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap()
+        };
+        let (n, _, cached) = first_sync_against(format!("http://{dead}")).await;
+        assert_eq!(n, built_in, "unreachable API: the built-in ruleset stays");
+        assert!(!cached);
+    }
+
+    /// The dashboard can slow the sync down or speed it up, but never below the
+    /// 30-second floor that protects the API.
+    #[tokio::test]
+    async fn the_dashboard_sync_interval_is_applied_with_a_floor() {
+        let mut interval = Duration::from_secs(300);
+        let mut ticker = tokio::time::interval(interval);
+        let pc = |secs: Option<u64>, dialect: Option<&str>| ProxyConfig {
+            rules_sync_interval_secs: secs,
+            telemetry_batch_size: Some(10),
+            dialect: dialect.map(str::to_string),
+            ..ProxyConfig::default()
+        };
+        apply_proxy_config(&pc(Some(5), None), &mut interval, &mut ticker);
+        assert_eq!(interval, Duration::from_secs(30));
+        assert_eq!(ticker.period(), Duration::from_secs(30));
+        apply_proxy_config(
+            &pc(Some(600), Some("snowflake")),
+            &mut interval,
+            &mut ticker,
+        );
+        assert_eq!(interval, Duration::from_secs(600));
+        // No interval in the config: unchanged (a dialect mismatch only warns).
+        apply_proxy_config(&pc(None, Some("oracle")), &mut interval, &mut ticker);
+        assert_eq!(ticker.period(), Duration::from_secs(600));
+    }
+
+    #[test]
+    fn an_unknown_action_falls_back_to_flag() {
+        assert_eq!(parse_action("BLOCK"), EnforcementAction::Block);
+        assert_eq!(parse_action("Monitor"), EnforcementAction::Monitor);
+        assert_eq!(parse_action("quarantine"), EnforcementAction::Flag);
+        assert_eq!(parse_action(""), EnforcementAction::Flag);
+    }
+
     /// Every poll carries the pipeline counters (4.12.0); an API that does not know
     /// the header answers exactly as before, which is what this stand-in does.
     #[tokio::test]

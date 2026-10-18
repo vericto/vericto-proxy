@@ -7,12 +7,74 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [4.12.2] — 2026-10-18
+
+Two configuration mistakes that used to pass silently now stop the proxy at
+startup with an error naming the variable. No wire-protocol changes;
+enforcement is unchanged.
+
+### Fixed
+
+- **`VERICTO_TELEMETRY_BUFFER` is case-insensitive and trimmed.** Up to 4.12.1
+  only the exact value `disk` selected the disk spool: `DISK`, `Disk` or
+  ` disk` silently selected the in-memory buffer, so telemetry was not durable
+  across restarts and the rules cache stayed off, with nothing in the log.
+  `disk` and `memory` are now accepted in any case, with surrounding whitespace
+  ignored; unset or empty is still `memory`.
+- **An upstream CA bundle without a certificate fails at startup.** With
+  `UPSTREAM_SSLMODE=verify-full`, an `UPSTREAM_SSLROOTCERT` file holding no
+  certificate built an empty trust store: every connection failed closed at
+  the TLS handshake, but the proxy started and reported ready. The Postgres
+  proxy now loads its upstream TLS material once at startup, as it already did
+  for `PROXY_TLS_MODE=require` without a certificate or key: a missing,
+  unreadable or empty CA bundle, half of an `UPSTREAM_SSLCERT` /
+  `UPSTREAM_SSLKEY` pair, or a client certificate or key that does not parse
+  stops it before it listens. Errors name the variable and the file path.
+  The files are still read again for each connection, as before.
+
+### Upgrade notes
+
+- **Behaviour change: an invalid value now fails startup.** A
+  `VERICTO_TELEMETRY_BUFFER` other than `memory` or `disk` (for example
+  `disc`) exits with `VERICTO_TELEMETRY_BUFFER="disc" is not supported`, like
+  an unusable `VERICTO_TELEMETRY_SPOOL_SUBDIR`; it used to run on the memory
+  buffer. Only read when the control-plane link is configured.
+- **Behaviour change: an empty CA bundle fails startup.** A deployment with
+  `UPSTREAM_SSLMODE=require` or `verify-full` whose CA bundle or mutual-TLS
+  files are missing, empty or unparseable used to start and fail every
+  connection; it now exits at startup. With `UPSTREAM_SSLMODE=disable` the
+  files are not read. A `DISK` (upper case) deployment now gets the disk
+  spool and the rules cache it asked for: make sure the spool volume is
+  mounted.
+
 ### Documentation
 
 - The `Cargo.toml` comment on the `vericto-engine` dependency called the engine
   an "open-core" library. It is under the Elastic License 2.0, which is
   source-available, not open source; the comment now says so. No code or
   dependency change.
+
+### Tests
+
+- Unit-test line coverage from 85.8% to 91.3% (cargo-llvm-cov; production lines
+  only, without the in-file test modules: 76.7% to 85.5%). New tests cover the
+  everyday query path on both protocols (allowed query forwarded byte for byte,
+  dangerous one answered by the proxy and never forwarded, the extended-protocol
+  sequence swallowed until Sync), Terminate / COM_QUIT, malformed Postgres
+  frames, the `VERICTO_MAX_QUERY_BYTES` boundary (inclusive at the limit, refused
+  one byte over, forwarded unevaluated under `monitor_mode`), the upstream TLS
+  negotiation (a server that declines TLS is refused, never downgraded; broken
+  handshakes; mutual-TLS file errors), MySQL connection-phase failures (no
+  greeting, upstream TLS required but not offered, upstream gone mid-auth), a
+  failed first rule sync (5xx, 401, unparseable body, unreachable API: the
+  built-in ruleset stays, nothing is cached, the proxy still gets ready), every
+  configuration variable and its clamping, and spool-directory adoption without
+  a lease.
+- Testability seams with no behaviour change: `ControlPlaneConfig`,
+  `TcpProxyOptions` and `VERICTO_MAX_QUERY_BYTES` are read through a lookup
+  function (the process environment in production), and the ECS task id through
+  a function that takes the metadata endpoint, so tests never mutate the
+  process environment.
 
 ## [4.12.1] — 2026-10-15
 

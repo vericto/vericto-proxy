@@ -58,9 +58,15 @@ pub fn dialect_cap(dialect: Dialect) -> usize {
 /// ignoring a limit an operator meant to set is how a deployment ends up running
 /// something other than what its config says.
 pub fn configured_max_query_bytes() -> usize {
-    match std::env::var("VERICTO_MAX_QUERY_BYTES") {
-        Err(_) => DEFAULT_MAX_QUERY_BYTES,
-        Ok(raw) => match raw.trim().parse::<usize>() {
+    max_query_bytes_from(std::env::var("VERICTO_MAX_QUERY_BYTES").ok().as_deref())
+}
+
+/// [`configured_max_query_bytes`] for the raw value of the variable (`None` when
+/// it is unset), so the parsing is testable without touching the environment.
+fn max_query_bytes_from(raw: Option<&str>) -> usize {
+    match raw {
+        None => DEFAULT_MAX_QUERY_BYTES,
+        Some(raw) => match raw.trim().parse::<usize>() {
             Ok(v) if v > 0 => v,
             _ => {
                 tracing::warn!(
@@ -244,6 +250,28 @@ mod tests {
         assert!(marker.contains("12345"));
         assert!(!marker.to_ascii_uppercase().contains("SELECT"));
         assert!(!marker.to_ascii_uppercase().contains("INSERT"));
+    }
+
+    /// Unset, unparseable, zero or negative values fall back to the default
+    /// instead of failing startup; a positive value, padded or not, is used.
+    #[test]
+    fn the_configured_limit_falls_back_to_the_default_on_bad_input() {
+        assert_eq!(max_query_bytes_from(None), DEFAULT_MAX_QUERY_BYTES);
+        assert_eq!(max_query_bytes_from(Some("65536")), 65_536);
+        assert_eq!(max_query_bytes_from(Some(" 1024 \n")), 1024);
+        for bad in ["", "0", "-1", "10MB", "1e6"] {
+            assert_eq!(
+                max_query_bytes_from(Some(bad)),
+                DEFAULT_MAX_QUERY_BYTES,
+                "{bad:?} must fall back"
+            );
+        }
+    }
+
+    #[test]
+    fn a_dialect_the_proxy_does_not_serve_gets_the_strictest_cap() {
+        assert_eq!(dialect_cap(Dialect::Snowflake), MYSQL_MAX_PACKET_LEN);
+        assert_eq!(dialect_cap(Dialect::Postgres), 64 * 1024 * 1024);
     }
 
     #[test]
