@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Vericto S.A.S.
+// SPDX-License-Identifier: FSL-1.1-ALv2
+
 //! The telemetry pipeline as metrics (since 4.12.0): a Prometheus text page,
 //! `GET /metrics` on the health-check listener (`tcp::healthz`), and a CloudWatch
 //! Embedded Metric Format (EMF) line on stdout every interval, for deployments

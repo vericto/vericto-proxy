@@ -7,6 +7,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [4.14.0] — 2026-10-18
+
+**A new license, and no code change.** From this version on, vericto-proxy is
+licensed under the Functional Source License, Version 1.1, ALv2 Future License
+(SPDX `FSL-1.1-ALv2`) instead of the Elastic License 2.0. **All previously
+released versions, 4.13.0 and earlier, remain under the Elastic License 2.0.**
+The proxy behaves exactly as 4.13.0 did. It moves to vericto-engine v4.3.0,
+which has the same code as v4.2.0 under the same new license.
+
+### Changed
+
+- **License: FSL-1.1-ALv2, which becomes Apache-2.0 after two years.** `LICENSE`
+  is the FSL-1.1-ALv2 text from fsl.software, unmodified, with
+  "Copyright 2026 Vericto S.A.S." in its notice. It lets you use, copy, modify
+  and redistribute the proxy for any purpose other than a Competing Use: a
+  commercial product or service that substitutes for the proxy, or for a
+  Vericto product that uses it, or that offers substantially similar
+  functionality. Running the proxy in front of your own databases, including in
+  production at a company, is a permitted purpose. Each version is also
+  licensed under the Apache License 2.0 from the second anniversary of the date
+  it is made available, irrevocably. Compared with the Elastic License 2.0, the
+  FSL also covers self-managed competing products (ELv2 only restricted hosted
+  and managed services) and drops the license-key clause.
+- **vericto-engine v4.3.0** (from v4.2.0): the engine's own relicensing
+  release, FSL-1.1-ALv2, with no code change. The whole binary, engine
+  included, is now under one license, so `NOTICE`, `deny.toml` and
+  `third-party/about.toml` need no exception for an Elastic-2.0 engine.
+- `Cargo.toml` and `Cargo.lock` declare `license = "FSL-1.1-ALv2"` (the SPDX
+  identifier) and version 4.14.0. The image label is
+  `org.opencontainers.image.licenses=FSL-1.1-ALv2` (`release.yml`).
+- `NOTICE` states the copyright, the license, the Apache-2.0 future license,
+  that versions up to 4.13.0 stay under the Elastic License 2.0, and where the
+  third-party notices are.
+- **New `LICENSING.md`**: which versions are under which license, and a short
+  FAQ (what is allowed, what a Competing Use is, when a version becomes
+  Apache-2.0, commercial licenses). **New `TRADEMARKS.md`**: the license grants
+  no right to the Vericto name or logo, and what you may do without asking.
+- `THIRD_PARTY_LICENSES` in the image: `third-party/about.toml` no longer
+  accepts `Elastic-2.0` for any crate. It accepts `FSL-1.1-ALv2` for
+  vericto-proxy and vericto-engine only, and the file's header explains it.
+  `deny.toml` does the same with `exceptions`, so a third-party dependency
+  under a source-available license still fails `cargo deny check`.
+- Every Rust source file and `third-party/build-notices.sh` start with
+  `SPDX-FileCopyrightText` and `SPDX-License-Identifier` lines (the REUSE
+  convention).
+- README (badge and License section), CONTRIBUTING and the Dockerfile comments
+  name the new license. CONTRIBUTING explains that CLA 1.0, which names the
+  Elastic License 2.0, also covers later and other licenses.
+
 ## [4.13.0] — 2026-10-18
 
 A security update of the bundled PostgreSQL parser and vericto-engine v4.2.0

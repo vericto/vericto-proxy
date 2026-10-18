@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Vericto S.A.S.
+// SPDX-License-Identifier: FSL-1.1-ALv2
+
 //! The telemetry pipeline's counters, sent with every rule sync (since 4.12.0).
 //!
 //! Up to 4.11 the only place a proxy said how many events it had dropped was its

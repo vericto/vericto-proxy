@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Vericto S.A.S.
+// SPDX-License-Identifier: FSL-1.1-ALv2
+
 //! Admission limit on the size of a query the proxy will evaluate.
 //!
 //! Evaluation cost grows linearly with input size, and it runs before the query

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Vericto S.A.S.
+// SPDX-License-Identifier: FSL-1.1-ALv2
+
 //! Protocol-agnostic session logic for the multi-dialect proxy.
 //!
 //! The client→server interception loop is identical across wire protocols once

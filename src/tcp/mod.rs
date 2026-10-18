@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Vericto S.A.S.
+// SPDX-License-Identifier: FSL-1.1-ALv2
+
 //! Transparent PostgreSQL wire-protocol TCP proxy.
 //!
 //! Lets any driver/ORM connect to Vericto as if it were Postgres (only the

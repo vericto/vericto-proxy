@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Vericto S.A.S.
+// SPDX-License-Identifier: FSL-1.1-ALv2
+
 //! The MySQL connection phase through the proxy, packet by packet.
 //!
 //! The proxy relays the auth exchange without understanding the plugins, so the

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Vericto S.A.S.
+// SPDX-License-Identifier: FSL-1.1-ALv2
+
 //! The interception loop's everyday paths and their failure modes, on both wire
 //! protocols: a query in, a decision, and what reaches the database.
 //!

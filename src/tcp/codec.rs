@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Vericto S.A.S.
+// SPDX-License-Identifier: FSL-1.1-ALv2
+
 //! PostgreSQL wire-protocol codec (pgwire v3).
 //!
 //! Handles message framing in both phases:

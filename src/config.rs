@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Vericto S.A.S.
+// SPDX-License-Identifier: FSL-1.1-ALv2
+
 //! Configuration for the control-plane link to the Vericto API.
 //!
 //! When the proxy runs in customer infrastructure (wire-protocol mode), it

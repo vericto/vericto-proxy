@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Vericto S.A.S.
+// SPDX-License-Identifier: FSL-1.1-ALv2
+
 //! Event queue abstraction with two implementations selected by config:
 //!   - MemoryQueue: bounded in-memory ring buffer (default).
 //!   - DiskQueue: on-disk spool that survives restarts; entries are removed only

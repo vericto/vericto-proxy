@@ -75,9 +75,10 @@ RUN groupadd --system --gid 1001 vericto && \
 COPY --from=builder /app/target/release/vericto-proxy /usr/local/bin/vericto-proxy
 RUN chown vericto:vericto /usr/local/bin/vericto-proxy
 
-# The Elastic License 2.0 requires that anyone who receives the software also
-# receives its terms, and the dependencies' licenses require their notices to go
-# with binary copies, so all three files ship next to the binary.
+# The Functional Source License requires that anyone who receives the software
+# also receives its terms (or a link to them) and its copyright notices, and the
+# dependencies' licenses require their notices to go with binary copies, so all
+# three files ship next to the binary.
 COPY LICENSE NOTICE /usr/share/doc/vericto-proxy/
 COPY --from=builder /app/THIRD_PARTY_LICENSES /usr/share/doc/vericto-proxy/
 
