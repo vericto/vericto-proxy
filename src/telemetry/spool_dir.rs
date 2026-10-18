@@ -150,6 +150,12 @@ pub fn sanitize_name(raw: &str) -> Option<String> {
 /// answer within two seconds.
 pub async fn ecs_task_id() -> Option<String> {
     let base = std::env::var("ECS_CONTAINER_METADATA_URI_V4").ok()?;
+    ecs_task_id_at(&base).await
+}
+
+/// [`ecs_task_id`] against the metadata endpoint at `base`, so tests can point
+/// it at a local stand-in instead of the environment.
+async fn ecs_task_id_at(base: &str) -> Option<String> {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(2))
         .build()
@@ -851,6 +857,142 @@ mod tests {
         assert!(!slow.own_dir().exists());
         slow.heartbeat(SystemTime::now()).unwrap();
         assert!(slow.own_dir().join(LEASE_FILE).exists());
+        let _ = fs::remove_dir_all(base);
+    }
+
+    /// A directory without a readable lease (a crash before the first lease
+    /// write, or a corrupt one) is adopted only once nothing in it has changed
+    /// for the orphan window.
+    #[test]
+    fn a_directory_without_a_lease_is_adopted_after_the_orphan_window() {
+        let base = scratch("nolease");
+        let me = SpoolLayout::new(&base, "me").prepare(ORPHAN).unwrap();
+        let crashed = base.join(TASKS_DIR).join("crashed");
+        fs::create_dir_all(&crashed).unwrap();
+        fs::write(crashed.join(LEASE_FILE), b"not json").unwrap();
+        fs::write(crashed.join(".seg.tmp"), b"half").unwrap();
+        // Hidden directories are never candidates.
+        fs::create_dir_all(base.join(TASKS_DIR).join(".hidden")).unwrap();
+        let q = open(me.own_dir());
+
+        let now = SystemTime::now();
+        assert_eq!(me.scan(&q, now, ORPHAN).adopted_dirs, 0, "recently touched");
+        let later = now + ORPHAN + Duration::from_secs(5);
+        assert_eq!(me.scan(&q, later, ORPHAN).adopted_dirs, 1);
+        assert!(!crashed.exists());
+        assert!(base.join(TASKS_DIR).join(".hidden").exists());
+        let _ = fs::remove_dir_all(base);
+    }
+
+    /// Two adoptions of the same name in the same second do not collide.
+    #[test]
+    fn adoption_targets_never_collide() {
+        let base = scratch("collide-target");
+        let me = SpoolLayout::new(&base, "me").prepare(ORPHAN).unwrap();
+        let now = SystemTime::now();
+        let first = me.adoption_target("gone", now).unwrap();
+        fs::create_dir_all(&first).unwrap();
+        let second = me.adoption_target("gone", now).unwrap();
+        assert_ne!(first, second);
+        assert!(second.to_string_lossy().ends_with("-1"));
+        // Claiming a directory another proxy already took is not an error.
+        assert_eq!(me.claim("already-taken", now).unwrap(), None);
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn spool_file_names() {
+        assert!(is_spool_file_name("seg-0001.jsonl"));
+        assert!(is_spool_file_name("0b6f.json"));
+        assert!(!is_spool_file_name(".rules-cache"));
+        assert!(!is_spool_file_name(".seg-1.jsonl"));
+        assert!(!is_spool_file_name("seg-1.jsonl.tmp"));
+        assert!(!is_spool_file_name("notes.txt"));
+    }
+
+    #[tokio::test]
+    async fn the_directory_name_follows_the_mode() {
+        assert_eq!(resolve_name(&SubdirMode::Off, Some("t-1")).await, None);
+        assert_eq!(
+            resolve_name(&SubdirMode::Fixed("replica-2".into()), None).await,
+            Some("replica-2".to_string())
+        );
+        assert_eq!(
+            resolve_name(&SubdirMode::Task, Some("0123abcd")).await,
+            Some("0123abcd".to_string()),
+            "the known task id wins"
+        );
+        // Without a task id (and outside ECS) there is always some usable name.
+        for mode in [SubdirMode::Task, SubdirMode::Hostname] {
+            let name = resolve_name(&mode, None).await.expect("a name");
+            assert_eq!(sanitize_name(&name).as_deref(), Some(name.as_str()));
+        }
+    }
+
+    /// The task id comes from the metadata endpoint's TaskARN; any failure
+    /// (no answer, not JSON, no ARN) is `None`, never an error.
+    #[tokio::test]
+    async fn the_ecs_task_id_is_read_from_the_metadata_endpoint() {
+        use axum::{Router, routing::get};
+        let app = Router::new()
+            .route(
+                "/good/task",
+                get(|| async {
+                    axum::Json(serde_json::json!({
+                        "TaskARN": "arn:aws:ecs:us-east-1:123456789012:task/prod/abc123def"
+                    }))
+                }),
+            )
+            .route(
+                "/noarn/task",
+                get(|| async { axum::Json(serde_json::json!({})) }),
+            )
+            .route("/html/task", get(|| async { "<html>" }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await });
+
+        assert_eq!(
+            ecs_task_id_at(&format!("{url}/good/")).await.as_deref(),
+            Some("abc123def"),
+            "trailing slash tolerated"
+        );
+        assert_eq!(ecs_task_id_at(&format!("{url}/noarn")).await, None);
+        assert_eq!(ecs_task_id_at(&format!("{url}/html")).await, None);
+        server.abort();
+        let dead = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap()
+        };
+        assert_eq!(ecs_task_id_at(&format!("http://{dead}")).await, None);
+    }
+
+    /// The maintenance loop's first tick renews the lease and adopts what a
+    /// previous proxy released, without waiting for the periodic interval.
+    #[tokio::test]
+    async fn maintenance_adopts_at_startup_and_keeps_the_lease() {
+        let base = scratch("maintenance");
+        let gone = SpoolLayout::new(&base, "gone").prepare(ORPHAN).unwrap();
+        {
+            let q = open(gone.own_dir());
+            q.push(event("g0"));
+            assert!(q.flush(Duration::from_secs(10)));
+        }
+        gone.release();
+        let me = Arc::new(SpoolLayout::new(&base, "me").prepare(ORPHAN).unwrap());
+        let queue: Arc<dyn EventQueue> = Arc::new(open(me.own_dir()));
+        let task = tokio::spawn(run_maintenance(Arc::clone(&me), Arc::clone(&queue), ORPHAN));
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while gone.own_dir().exists() {
+            assert!(std::time::Instant::now() < deadline, "not adopted in time");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        task.abort();
+        assert_eq!(ids(queue.as_ref()), vec!["g0"]);
+        assert!(
+            read_lease(me.own_dir()).is_some_and(|l| !l.released),
+            "lease held"
+        );
         let _ = fs::remove_dir_all(base);
     }
 

@@ -405,6 +405,135 @@ async fn failed_login_is_relayed_and_closed() {
     assert_eq!(upstream, Upstream::Closed);
 }
 
+// ── The upstream fails during the connection phase ───────────────────────────
+
+/// A proxy whose fake server runs `serve` on its one connection, with the given
+/// upstream TLS mode. Returns the proxy port.
+async fn proxy_in_front_of<F, Fut>(
+    upstream_tls: crate::tcp::upstream::UpstreamTlsMode,
+    serve: F,
+) -> u16
+where
+    F: FnOnce(TcpStream) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = ()> + Send,
+{
+    let db = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let db_port = db.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        let (s, _) = db.accept().await.unwrap();
+        serve(s).await;
+    });
+    let (cfg, _) = config_with(
+        ("127.0.0.1", db_port),
+        EnforcementPolicy::default(),
+        TelemetryQueryMode::Raw,
+        crate::tcp::evaluator::default_ruleset(),
+        upstream_tls,
+    );
+    spawn_mysql_proxy(cfg).await
+}
+
+/// A server that accepts the connection and closes it without a greeting: the
+/// client is closed too, instead of waiting for a handshake that never comes.
+#[tokio::test]
+async fn an_upstream_that_closes_before_the_greeting_closes_the_client() {
+    let port = proxy_in_front_of(
+        crate::tcp::upstream::UpstreamTlsMode::Disable,
+        |s| async move { drop(s) },
+    )
+    .await;
+    let mut c = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    assert!(recv(&mut c, "the close").await.is_none());
+}
+
+/// An unreachable database: the client connection is closed at once.
+#[tokio::test]
+async fn an_unreachable_upstream_closes_the_client() {
+    let dead_port = {
+        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        l.local_addr().unwrap().port()
+    };
+    let (cfg, _) = config_with(
+        ("127.0.0.1", dead_port),
+        EnforcementPolicy::default(),
+        TelemetryQueryMode::Raw,
+        crate::tcp::evaluator::default_ruleset(),
+        crate::tcp::upstream::UpstreamTlsMode::Disable,
+    );
+    let port = spawn_mysql_proxy(cfg).await;
+    let mut c = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    assert!(recv(&mut c, "the close").await.is_none());
+}
+
+/// UPSTREAM_SSLMODE=require against a server that does not offer TLS: the proxy
+/// refuses to continue in plaintext, before the client sees a greeting or sends
+/// its credentials.
+#[tokio::test]
+async fn upstream_tls_required_but_not_offered_is_refused_before_the_greeting() {
+    let mut no_tls = handshake();
+    let caps = greeting_caps(&no_tls) & !0x0000_0800;
+    no_tls[CAPS_LOWER_AT..CAPS_LOWER_AT + 2].copy_from_slice(&(caps as u16).to_le_bytes());
+    let (seen_tx, seen_rx) = tokio::sync::oneshot::channel();
+    let port = proxy_in_front_of(
+        crate::tcp::upstream::UpstreamTlsMode::Require,
+        |mut s| async move {
+            send(&mut s, 0, &no_tls).await;
+            let _ = seen_tx.send(mc::read_packet(&mut s).await.ok().flatten());
+        },
+    )
+    .await;
+    let mut c = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    assert!(
+        recv(&mut c, "the close").await.is_none(),
+        "no greeting is relayed"
+    );
+    assert!(
+        timeout(seen_rx).await.unwrap().is_none(),
+        "the server receives nothing from the proxy"
+    );
+}
+
+/// The server hangs up after the client's HandshakeResponse, mid-auth: the
+/// client gets the greeting and then a close, not a hang.
+#[tokio::test]
+async fn an_upstream_that_dies_mid_auth_closes_the_client() {
+    let port = proxy_in_front_of(
+        crate::tcp::upstream::UpstreamTlsMode::Disable,
+        |mut s| async move {
+            send(&mut s, 0, &handshake()).await;
+            let _ = recv(&mut s, "the HandshakeResponse").await;
+        },
+    )
+    .await;
+    let mut c = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    recv(&mut c, "the greeting")
+        .await
+        .expect("greeting relayed");
+    send(&mut c, 1, &handshake_response()).await;
+    assert!(recv(&mut c, "the close").await.is_none());
+}
+
+/// A client that disconnects right after the greeting: the proxy drops the
+/// upstream connection as well.
+#[tokio::test]
+async fn a_client_that_leaves_after_the_greeting_closes_the_upstream() {
+    let (closed_tx, closed_rx) = tokio::sync::oneshot::channel();
+    let port = proxy_in_front_of(
+        crate::tcp::upstream::UpstreamTlsMode::Disable,
+        |mut s| async move {
+            send(&mut s, 0, &handshake()).await;
+            let _ = closed_tx.send(recv(&mut s, "the proxy to close").await.is_none());
+        },
+    )
+    .await;
+    let mut c = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    recv(&mut c, "the greeting")
+        .await
+        .expect("greeting relayed");
+    drop(c);
+    assert!(timeout(closed_rx).await.unwrap(), "upstream closed");
+}
+
 // ── Real MySQL ───────────────────────────────────────────────────────────────
 
 /// Many logins as one user, in a row and at the same time. Against a

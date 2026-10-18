@@ -323,4 +323,319 @@ mod tests {
         );
         assert_eq!(UpstreamTlsMode::default(), UpstreamTlsMode::Disable);
     }
+
+    use tokio::net::TcpListener;
+
+    /// A syntactically valid PEM block whose DER is meaningless: enough to reach
+    /// the parsing branches without shipping real key material in the tests.
+    const FAKE_CERT: &str = "-----BEGIN CERTIFICATE-----\nZm9v\n-----END CERTIFICATE-----\n";
+    const FAKE_KEY: &str = "-----BEGIN PRIVATE KEY-----\nZm9v\n-----END PRIVATE KEY-----\n";
+
+    fn install_provider() {
+        let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
+    }
+
+    /// A scratch file holding `body`, removed when the guard drops.
+    struct TempPem(std::path::PathBuf);
+    impl TempPem {
+        fn new(body: &str) -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "vericto-upstream-test-{}.pem",
+                uuid::Uuid::new_v4()
+            ));
+            std::fs::write(&path, body).unwrap();
+            Self(path)
+        }
+        fn path(&self) -> &str {
+            self.0.to_str().unwrap()
+        }
+    }
+    impl Drop for TempPem {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    /// A one-connection fake database: runs `serve` on the accepted socket and
+    /// returns what it produced.
+    async fn fake_db<F, Fut, T>(serve: F) -> (u16, tokio::task::JoinHandle<T>)
+    where
+        F: FnOnce(TcpStream) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = T> + Send,
+        T: Send + 'static,
+    {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let task = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            serve(socket).await
+        });
+        (port, task)
+    }
+
+    async fn within<T>(f: impl std::future::Future<Output = T>) -> T {
+        tokio::time::timeout(std::time::Duration::from_secs(5), f)
+            .await
+            .expect("timed out")
+    }
+
+    /// The default deployment: plaintext, no SSLRequest, bytes relayed both ways.
+    #[tokio::test]
+    async fn disable_mode_relays_plaintext_without_an_ssl_request() {
+        let (port, db) = fake_db(|mut s| async move {
+            let mut got = [0u8; 5];
+            s.read_exact(&mut got).await.unwrap();
+            s.write_all(b"world").await.unwrap();
+            got
+        })
+        .await;
+        let (mut r, mut w) = within(connect_upstream(
+            "127.0.0.1",
+            port,
+            UpstreamTlsMode::Disable,
+            None,
+            None,
+            None,
+        ))
+        .await
+        .expect("plaintext connect");
+        w.write_all(b"hello").await.unwrap();
+        w.flush().await.unwrap();
+        let mut back = [0u8; 5];
+        within(r.read_exact(&mut back)).await.unwrap();
+        assert_eq!(&back, b"world");
+        assert_eq!(&within(db).await.unwrap(), b"hello", "no SSLRequest first");
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_database_is_an_error() {
+        let port = {
+            let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            l.local_addr().unwrap().port()
+        };
+        let err = within(connect_upstream(
+            "127.0.0.1",
+            port,
+            UpstreamTlsMode::Disable,
+            None,
+            None,
+            None,
+        ))
+        .await
+        .err()
+        .expect("nothing listens there");
+        assert_eq!(err.kind(), io::ErrorKind::ConnectionRefused);
+    }
+
+    /// UPSTREAM_SSLMODE=require against a server without TLS: the proxy refuses
+    /// to fall back to plaintext, after sending exactly the 8-byte SSLRequest.
+    #[tokio::test]
+    async fn a_server_that_declines_tls_is_refused_not_downgraded() {
+        let (port, db) = fake_db(|mut s| async move {
+            let mut req = [0u8; 8];
+            s.read_exact(&mut req).await.unwrap();
+            s.write_all(b"N").await.unwrap();
+            req
+        })
+        .await;
+        let err = within(connect_upstream(
+            "127.0.0.1",
+            port,
+            UpstreamTlsMode::Require,
+            None,
+            None,
+            None,
+        ))
+        .await
+        .err()
+        .expect("must not downgrade");
+        assert!(err.to_string().contains("declined TLS"), "{err}");
+        assert!(err.to_string().contains("'N'"), "{err}");
+        assert_eq!(within(db).await.unwrap(), SSL_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn a_server_that_closes_before_answering_the_ssl_request_is_an_error() {
+        let (port, _db) = fake_db(|mut s| async move {
+            let mut req = [0u8; 8];
+            s.read_exact(&mut req).await.unwrap();
+        })
+        .await;
+        let err = within(connect_upstream(
+            "127.0.0.1",
+            port,
+            UpstreamTlsMode::VerifyFull,
+            None,
+            None,
+            None,
+        ))
+        .await
+        .err()
+        .expect("no reply");
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+    }
+
+    /// A server that accepts the SSLRequest but then does not speak TLS fails
+    /// the handshake: the session never proceeds unencrypted.
+    #[tokio::test]
+    async fn a_broken_tls_handshake_is_an_error() {
+        install_provider();
+        let (port, _db) = fake_db(|mut s| async move {
+            let mut req = [0u8; 8];
+            s.read_exact(&mut req).await.unwrap();
+            s.write_all(b"S").await.unwrap();
+            // Read the ClientHello, answer with garbage that is not a TLS record.
+            let mut buf = [0u8; 512];
+            let _ = s.read(&mut buf).await;
+            let _ = s.write_all(b"this is not TLS at all\r\n").await;
+        })
+        .await;
+        let res = within(connect_upstream(
+            "127.0.0.1",
+            port,
+            UpstreamTlsMode::Require,
+            None,
+            None,
+            None,
+        ))
+        .await;
+        assert!(res.is_err(), "a garbled handshake must fail");
+    }
+
+    /// Mutual TLS needs both halves; one alone is a configuration error raised
+    /// before any TLS byte is sent.
+    #[tokio::test]
+    async fn a_client_cert_without_its_key_is_refused() {
+        let (port, _db) = fake_db(|mut s| async move {
+            let mut req = [0u8; 8];
+            s.read_exact(&mut req).await.unwrap();
+            s.write_all(b"S").await.unwrap();
+            let mut rest = Vec::new();
+            let _ = s.read_to_end(&mut rest).await;
+            rest
+        })
+        .await;
+        let err = within(connect_upstream(
+            "127.0.0.1",
+            port,
+            UpstreamTlsMode::Require,
+            None,
+            Some("/etc/vericto/client.pem"),
+            None,
+        ))
+        .await
+        .err()
+        .expect("half a key pair");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("UPSTREAM_SSLKEY"), "{err}");
+    }
+
+    #[test]
+    fn client_auth_is_optional_but_both_halves_go_together() {
+        assert!(load_client_auth(None, None).unwrap().is_none());
+        let err = load_client_auth(None, Some("/k.pem")).expect_err("key alone");
+        assert!(err.to_string().contains("UPSTREAM_SSLCERT"), "{err}");
+    }
+
+    /// File errors name the file (a path is not a secret) so the operator can fix it.
+    #[test]
+    fn unreadable_or_empty_client_auth_files_say_which_and_why() {
+        let err = load_client_auth(Some("/nonexistent/c.pem"), Some("/nonexistent/k.pem"))
+            .expect_err("missing cert");
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+        assert!(err.to_string().contains("/nonexistent/c.pem"), "{err}");
+
+        let cert = TempPem::new(FAKE_CERT);
+        let err = load_client_auth(Some(cert.path()), Some("/nonexistent/k.pem"))
+            .expect_err("missing key");
+        assert!(err.to_string().contains("/nonexistent/k.pem"), "{err}");
+
+        let empty = TempPem::new("no PEM here\n");
+        let err = load_client_auth(Some(empty.path()), Some(empty.path()))
+            .expect_err("no certificate in the file");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("no certificates found"), "{err}");
+
+        // A certificate where the key belongs: a real, easy swap of the two vars.
+        let err = load_client_auth(Some(cert.path()), Some(cert.path()))
+            .expect_err("a certificate is not a key");
+        assert!(err.to_string().contains("no private key found"), "{err}");
+
+        let key = TempPem::new(FAKE_KEY);
+        let (certs, _key) = load_client_auth(Some(cert.path()), Some(key.path()))
+            .unwrap()
+            .expect("both halves parsed");
+        assert_eq!(certs.len(), 1);
+    }
+
+    #[test]
+    fn client_configs_build_for_each_mode() {
+        install_provider();
+        // verify-full without a CA bundle trusts the public web PKI roots.
+        assert!(build_client_config(UpstreamTlsMode::VerifyFull, None, None).is_ok());
+        assert!(build_client_config(UpstreamTlsMode::Require, None, None).is_ok());
+
+        let err = build_client_config(
+            UpstreamTlsMode::VerifyFull,
+            Some("/nonexistent/ca.pem"),
+            None,
+        )
+        .expect_err("missing CA bundle");
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+
+        // A CA bundle whose certificate does not parse is refused, not skipped:
+        // skipping it would silently verify against nothing.
+        let ca = TempPem::new(FAKE_CERT);
+        let err = build_client_config(UpstreamTlsMode::VerifyFull, Some(ca.path()), None)
+            .expect_err("unparseable CA");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+
+        // A CA file with no certificate at all builds a config with an empty
+        // trust store: it fails closed (no server certificate verifies), but only
+        // at the first handshake, not at startup.
+        let empty = TempPem::new("");
+        assert!(build_client_config(UpstreamTlsMode::VerifyFull, Some(empty.path()), None).is_ok());
+
+        // A client key that does not parse is refused when the config is built.
+        let cert = TempPem::new(FAKE_CERT);
+        let key = TempPem::new(FAKE_KEY);
+        let auth = load_client_auth(Some(cert.path()), Some(key.path())).unwrap();
+        let err =
+            build_client_config(UpstreamTlsMode::Require, None, auth).expect_err("meaningless key");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    /// The `require` verifier accepts any certificate (libpq `sslmode=require`)
+    /// and offers the usual signature schemes.
+    #[test]
+    fn require_mode_verifier_accepts_any_certificate() {
+        use tokio_rustls::rustls::client::danger::ServerCertVerifier;
+        use tokio_rustls::rustls::pki_types::UnixTime;
+        let v = danger::NoCertVerification;
+        let cert = CertificateDer::from(vec![1, 2, 3]);
+        let name = ServerName::try_from("db.internal").unwrap();
+        assert!(
+            v.verify_server_cert(&cert, &[], &name, &[], UnixTime::now())
+                .is_ok()
+        );
+        let schemes = v.supported_verify_schemes();
+        assert!(schemes.contains(&tokio_rustls::rustls::SignatureScheme::ED25519));
+        assert!(schemes.contains(&tokio_rustls::rustls::SignatureScheme::RSA_PSS_SHA256));
+    }
+
+    /// MySQL upgrades an open socket mid-handshake; a peer that hangs up instead
+    /// of answering the ClientHello is an error, never a plaintext session.
+    #[tokio::test]
+    async fn upgrading_a_socket_whose_peer_hangs_up_is_an_error() {
+        install_provider();
+        let (port, _db) = fake_db(|s| async move { drop(s) }).await;
+        let tcp = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let res = within(upgrade_to_tls_client(
+            tcp,
+            "127.0.0.1",
+            UpstreamTlsMode::Require,
+        ))
+        .await;
+        assert!(res.is_err());
+    }
 }

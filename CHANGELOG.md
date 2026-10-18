@@ -14,6 +14,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   source-available, not open source; the comment now says so. No code or
   dependency change.
 
+### Tests
+
+- Unit-test line coverage from 85.8% to 91.3% (cargo-llvm-cov; production lines
+  only, without the in-file test modules: 76.7% to 85.5%). New tests cover the
+  everyday query path on both protocols (allowed query forwarded byte for byte,
+  dangerous one answered by the proxy and never forwarded, the extended-protocol
+  sequence swallowed until Sync), Terminate / COM_QUIT, malformed Postgres
+  frames, the `VERICTO_MAX_QUERY_BYTES` boundary (inclusive at the limit, refused
+  one byte over, forwarded unevaluated under `monitor_mode`), the upstream TLS
+  negotiation (a server that declines TLS is refused, never downgraded; broken
+  handshakes; mutual-TLS file errors), MySQL connection-phase failures (no
+  greeting, upstream TLS required but not offered, upstream gone mid-auth), a
+  failed first rule sync (5xx, 401, unparseable body, unreachable API: the
+  built-in ruleset stays, nothing is cached, the proxy still gets ready), every
+  configuration variable and its clamping, and spool-directory adoption without
+  a lease.
+- Testability seams with no behaviour change: `ControlPlaneConfig`,
+  `TcpProxyOptions` and `VERICTO_MAX_QUERY_BYTES` are read through a lookup
+  function (the process environment in production), and the ECS task id through
+  a function that takes the metadata endpoint, so tests never mutate the
+  process environment.
+
 ## [4.12.1] — 2026-10-15
 
 Requires vericto-engine v4.1.1 (from v4.0.0). No wire-protocol changes, and

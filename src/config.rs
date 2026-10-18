@@ -88,20 +88,20 @@ impl Default for DeliveryTuning {
 }
 
 impl DeliveryTuning {
-    fn from_env() -> Self {
+    fn from_lookup(env: Lookup<'_>) -> Self {
         let d = Self::default();
-        let retry_base = env_u64("VERICTO_TELEMETRY_RETRY_BASE_MS")
+        let retry_base = env_u64(env, "VERICTO_TELEMETRY_RETRY_BASE_MS")
             .map(|ms| Duration::from_millis(ms.max(1)))
             .unwrap_or(d.retry_base);
         Self {
-            max_in_flight: env_usize("VERICTO_TELEMETRY_MAX_IN_FLIGHT")
+            max_in_flight: env_usize(env, "VERICTO_TELEMETRY_MAX_IN_FLIGHT")
                 .unwrap_or(d.max_in_flight)
                 .clamp(1, 64),
-            gzip: std::env::var("VERICTO_TELEMETRY_GZIP")
+            gzip: env("VERICTO_TELEMETRY_GZIP")
                 .map(|v| !matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false" | "no"))
                 .unwrap_or(d.gzip),
             retry_base,
-            retry_max: env_u64("VERICTO_TELEMETRY_RETRY_MAX_SECS")
+            retry_max: env_u64(env, "VERICTO_TELEMETRY_RETRY_MAX_SECS")
                 .map(Duration::from_secs)
                 .unwrap_or(d.retry_max)
                 .max(retry_base),
@@ -178,27 +178,27 @@ impl Default for SpoolTuning {
 }
 
 impl SpoolTuning {
-    fn from_env() -> Self {
+    fn from_lookup(env: Lookup<'_>) -> Self {
         let d = Self::default();
         Self {
-            queue_capacity: env_usize("VERICTO_TELEMETRY_QUEUE_CAPACITY")
+            queue_capacity: env_usize(env, "VERICTO_TELEMETRY_QUEUE_CAPACITY")
                 .unwrap_or(d.queue_capacity)
                 .max(1),
-            flush_every: env_u64("VERICTO_TELEMETRY_SPOOL_FLUSH_MS")
+            flush_every: env_u64(env, "VERICTO_TELEMETRY_SPOOL_FLUSH_MS")
                 .map(|ms| Duration::from_millis(ms.max(1)))
                 .unwrap_or(d.flush_every),
-            segment_max: env_usize("VERICTO_TELEMETRY_SPOOL_BATCH_MAX")
+            segment_max: env_usize(env, "VERICTO_TELEMETRY_SPOOL_BATCH_MAX")
                 .unwrap_or(d.segment_max)
                 .max(1),
-            shutdown_timeout: env_u64("VERICTO_TELEMETRY_SHUTDOWN_TIMEOUT_MS")
+            shutdown_timeout: env_u64(env, "VERICTO_TELEMETRY_SHUTDOWN_TIMEOUT_MS")
                 .map(Duration::from_millis)
                 .unwrap_or(d.shutdown_timeout),
-            max_bytes: env_u64("VERICTO_TELEMETRY_SPOOL_MAX_BYTES")
+            max_bytes: env_u64(env, "VERICTO_TELEMETRY_SPOOL_MAX_BYTES")
                 .map(|b| b.max(SPOOL_MIN_BYTES))
                 .unwrap_or(d.max_bytes),
             max_events: spool_max_events(
-                env_usize("VERICTO_TELEMETRY_SPOOL_MAX_EVENTS"),
-                env_usize("VERICTO_TELEMETRY_MEMORY_CAPACITY"),
+                env_usize(env, "VERICTO_TELEMETRY_SPOOL_MAX_EVENTS"),
+                env_usize(env, "VERICTO_TELEMETRY_MEMORY_CAPACITY"),
             ),
         }
     }
@@ -215,22 +215,26 @@ impl ControlPlaneConfig {
     /// when it is, but `VERICTO_API_URL` would send the API key in clear text
     /// (see [`check_api_url`]).
     pub fn from_env() -> Result<Option<Self>, String> {
-        let (Ok(api_url), Ok(api_key)) = (
-            std::env::var("VERICTO_API_URL"),
-            std::env::var("VERICTO_API_KEY"),
-        ) else {
+        Self::from_lookup(&|key| std::env::var(key).ok())
+    }
+
+    /// [`Self::from_env`] reading each variable through `env`, so tests can pass
+    /// their own values without touching the process environment.
+    fn from_lookup(env: Lookup<'_>) -> Result<Option<Self>, String> {
+        let (Some(api_url), Some(api_key)) = (env("VERICTO_API_URL"), env("VERICTO_API_KEY"))
+        else {
             return Ok(None);
         };
         if api_url.is_empty() || api_key.is_empty() {
             return Ok(None);
         }
-        check_api_url(&api_url, env_flag("VERICTO_ALLOW_INSECURE_API_URL"))?;
+        check_api_url(&api_url, env_flag(env, "VERICTO_ALLOW_INSECURE_API_URL"))?;
 
         let rules_sync_interval = Duration::from_secs(
             // Minimum 30 seconds to avoid hammering the API.
             // Values below the minimum are silently clamped — a warning is logged
             // so operators can spot the misconfiguration without a hard failure.
-            env_u64("VERICTO_RULES_SYNC_INTERVAL_SECS")
+            env_u64(env, "VERICTO_RULES_SYNC_INTERVAL_SECS")
                 .map(|v| {
                     if v < RULES_SYNC_MIN_SECS {
                         tracing::warn!(
@@ -248,16 +252,16 @@ impl ControlPlaneConfig {
                 .unwrap_or(300), // default: 5 min
         );
 
-        let buffer_mode = match std::env::var("VERICTO_TELEMETRY_BUFFER").as_deref() {
-            Ok("disk") => BufferMode::Disk,
+        let buffer_mode = match env("VERICTO_TELEMETRY_BUFFER").as_deref() {
+            Some("disk") => BufferMode::Disk,
             _ => BufferMode::Memory,
         };
 
-        let disk_spool_path = std::env::var("VERICTO_TELEMETRY_DISK_PATH")
-            .unwrap_or_else(|_| "/var/lib/vericto/spool".to_string());
+        let disk_spool_path = env("VERICTO_TELEMETRY_DISK_PATH")
+            .unwrap_or_else(|| "/var/lib/vericto/spool".to_string());
 
         let rules_cache_path = rules_cache_path(
-            std::env::var("VERICTO_RULES_CACHE_PATH").ok(),
+            env("VERICTO_RULES_CACHE_PATH"),
             buffer_mode,
             &disk_spool_path,
         );
@@ -265,18 +269,20 @@ impl ControlPlaneConfig {
         Ok(Some(Self {
             api_url: api_url.trim_end_matches('/').to_string(),
             api_key,
-            database_id: std::env::var("VERICTO_DATABASE_ID").ok(),
+            database_id: env("VERICTO_DATABASE_ID"),
             rules_sync_interval,
             rules_cache_path,
             buffer_mode,
             disk_spool_path,
-            memory_capacity: env_usize("VERICTO_TELEMETRY_MEMORY_CAPACITY").unwrap_or(10_000),
-            batch_size: batch_size_from(env_usize("VERICTO_TELEMETRY_BATCH_SIZE")),
+            memory_capacity: env_usize(env, "VERICTO_TELEMETRY_MEMORY_CAPACITY").unwrap_or(10_000),
+            batch_size: batch_size_from(env_usize(env, "VERICTO_TELEMETRY_BATCH_SIZE")),
             flush_interval: Duration::from_secs(
-                env_u64("VERICTO_TELEMETRY_FLUSH_SECS").unwrap_or(5).max(1),
+                env_u64(env, "VERICTO_TELEMETRY_FLUSH_SECS")
+                    .unwrap_or(5)
+                    .max(1),
             ),
-            spool: SpoolTuning::from_env(),
-            delivery: DeliveryTuning::from_env(),
+            spool: SpoolTuning::from_lookup(env),
+            delivery: DeliveryTuning::from_lookup(env),
         }))
     }
 }
@@ -351,8 +357,12 @@ pub fn same_origin_redirects() -> reqwest::redirect::Policy {
     })
 }
 
-fn env_flag(key: &str) -> bool {
-    std::env::var(key)
+/// Reads one configuration variable: the process environment in production, a
+/// fixed map in tests.
+type Lookup<'a> = &'a dyn Fn(&str) -> Option<String>;
+
+fn env_flag(env: Lookup<'_>, key: &str) -> bool {
+    env(key)
         .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
         .unwrap_or(false)
 }
@@ -384,12 +394,12 @@ fn rules_cache_path(
     }
 }
 
-fn env_u64(key: &str) -> Option<u64> {
-    std::env::var(key).ok().and_then(|v| v.parse().ok())
+fn env_u64(env: Lookup<'_>, key: &str) -> Option<u64> {
+    env(key).and_then(|v| v.parse().ok())
 }
 
-fn env_usize(key: &str) -> Option<usize> {
-    std::env::var(key).ok().and_then(|v| v.parse().ok())
+fn env_usize(env: Lookup<'_>, key: &str) -> Option<usize> {
+    env(key).and_then(|v| v.parse().ok())
 }
 
 #[cfg(test)]
@@ -505,6 +515,199 @@ mod tests {
             !*leaked.lock().unwrap(),
             "the API key reached another origin"
         );
+    }
+
+    /// Builds a configuration from `vars` only, never the process environment.
+    fn from_vars(vars: &[(&str, &str)]) -> Result<Option<ControlPlaneConfig>, String> {
+        let map: std::collections::HashMap<String, String> = vars
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        ControlPlaneConfig::from_lookup(&move |key| map.get(key).cloned())
+    }
+
+    const LINK: [(&str, &str); 2] = [
+        ("VERICTO_API_URL", "https://api.vericto.com/"),
+        ("VERICTO_API_KEY", "vtro_test"),
+    ];
+
+    /// Without both the URL and the key the link is off, and that is not an error:
+    /// the proxy runs on its built-in ruleset (dev, air-gapped).
+    #[test]
+    fn the_link_is_off_unless_both_url_and_key_are_set() {
+        assert!(from_vars(&[]).unwrap().is_none());
+        assert!(from_vars(&LINK[..1]).unwrap().is_none());
+        assert!(from_vars(&LINK[1..]).unwrap().is_none());
+        assert!(
+            from_vars(&[("VERICTO_API_URL", ""), ("VERICTO_API_KEY", "vtro_test")])
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            from_vars(&[("VERICTO_API_URL", "https://x"), ("VERICTO_API_KEY", "")])
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    /// Only the URL and the key set: every other setting takes its documented default.
+    #[test]
+    fn a_minimal_link_uses_the_documented_defaults() {
+        let cfg = from_vars(&LINK).unwrap().expect("link configured");
+        assert_eq!(
+            cfg.api_url, "https://api.vericto.com",
+            "trailing slash trimmed"
+        );
+        assert_eq!(cfg.api_key, "vtro_test");
+        assert_eq!(cfg.database_id, None);
+        assert_eq!(cfg.rules_sync_interval, Duration::from_secs(300));
+        assert_eq!(cfg.buffer_mode, BufferMode::Memory);
+        assert_eq!(cfg.disk_spool_path, "/var/lib/vericto/spool");
+        assert_eq!(
+            cfg.rules_cache_path, None,
+            "no cache with the memory buffer"
+        );
+        assert_eq!(cfg.memory_capacity, 10_000);
+        assert_eq!(cfg.batch_size, MAX_INGEST_BATCH);
+        assert_eq!(cfg.flush_interval, Duration::from_secs(5));
+        assert_eq!(cfg.spool, SpoolTuning::default());
+        assert_eq!(cfg.delivery, DeliveryTuning::default());
+    }
+
+    /// An http:// API URL would send the key in clear text: refused at startup
+    /// unless the operator opts in, and a URL that does not parse is refused too.
+    #[test]
+    fn an_insecure_or_invalid_api_url_is_a_startup_error() {
+        let insecure = [
+            ("VERICTO_API_URL", "http://api.internal:4000"),
+            ("VERICTO_API_KEY", "vtro_test"),
+        ];
+        let err = from_vars(&insecure).expect_err("http:// to a remote host");
+        assert!(err.contains("clear text"), "{err}");
+        assert!(!err.contains("vtro_test"), "the key is never echoed: {err}");
+
+        let mut allowed = insecure.to_vec();
+        allowed.push(("VERICTO_ALLOW_INSECURE_API_URL", "TRUE"));
+        assert!(from_vars(&allowed).unwrap().is_some());
+
+        let mut not_a_flag = insecure.to_vec();
+        not_a_flag.push(("VERICTO_ALLOW_INSECURE_API_URL", "maybe"));
+        assert!(from_vars(&not_a_flag).is_err(), "only 1/true/yes opt in");
+
+        let err = from_vars(&[
+            ("VERICTO_API_URL", "not a url"),
+            ("VERICTO_API_KEY", "vtro_test"),
+        ])
+        .expect_err("unparseable URL");
+        assert!(err.contains("not a valid URL"), "{err}");
+    }
+
+    /// Every tuning variable set: each one reaches its field.
+    #[test]
+    fn every_setting_is_read_from_its_variable() {
+        let mut vars = LINK.to_vec();
+        vars.extend([
+            ("VERICTO_DATABASE_ID", "db-123"),
+            ("VERICTO_RULES_SYNC_INTERVAL_SECS", "120"),
+            ("VERICTO_TELEMETRY_BUFFER", "disk"),
+            ("VERICTO_TELEMETRY_DISK_PATH", "/data/spool"),
+            ("VERICTO_TELEMETRY_MEMORY_CAPACITY", "2000"),
+            ("VERICTO_TELEMETRY_BATCH_SIZE", "50"),
+            ("VERICTO_TELEMETRY_FLUSH_SECS", "9"),
+            ("VERICTO_TELEMETRY_QUEUE_CAPACITY", "64"),
+            ("VERICTO_TELEMETRY_SPOOL_FLUSH_MS", "10"),
+            ("VERICTO_TELEMETRY_SPOOL_BATCH_MAX", "25"),
+            ("VERICTO_TELEMETRY_SHUTDOWN_TIMEOUT_MS", "750"),
+            ("VERICTO_TELEMETRY_SPOOL_MAX_BYTES", "8388608"),
+            ("VERICTO_TELEMETRY_SPOOL_MAX_EVENTS", "40000"),
+            ("VERICTO_TELEMETRY_MAX_IN_FLIGHT", "8"),
+            ("VERICTO_TELEMETRY_GZIP", "no"),
+            ("VERICTO_TELEMETRY_RETRY_BASE_MS", "250"),
+            ("VERICTO_TELEMETRY_RETRY_MAX_SECS", "30"),
+        ]);
+        let cfg = from_vars(&vars).unwrap().unwrap();
+        assert_eq!(cfg.database_id.as_deref(), Some("db-123"));
+        assert_eq!(cfg.rules_sync_interval, Duration::from_secs(120));
+        assert_eq!(cfg.buffer_mode, BufferMode::Disk);
+        assert_eq!(cfg.disk_spool_path, "/data/spool");
+        assert_eq!(
+            cfg.rules_cache_path,
+            Some(PathBuf::from("/data/spool").join(RULES_CACHE_FILE)),
+            "the disk buffer turns the rules cache on, inside the spool"
+        );
+        assert_eq!(cfg.memory_capacity, 2000);
+        assert_eq!(cfg.batch_size, 50);
+        assert_eq!(cfg.flush_interval, Duration::from_secs(9));
+        assert_eq!(
+            cfg.spool,
+            SpoolTuning {
+                queue_capacity: 64,
+                flush_every: Duration::from_millis(10),
+                segment_max: 25,
+                shutdown_timeout: Duration::from_millis(750),
+                max_bytes: 8 * 1024 * 1024,
+                max_events: Some(40_000),
+            }
+        );
+        assert_eq!(
+            cfg.delivery,
+            DeliveryTuning {
+                max_in_flight: 8,
+                gzip: false,
+                retry_base: Duration::from_millis(250),
+                retry_max: Duration::from_secs(30),
+            }
+        );
+    }
+
+    /// Out-of-range values are clamped to something that works rather than
+    /// failing startup or hammering the API; unparseable ones use the default.
+    #[test]
+    fn out_of_range_settings_are_clamped_and_garbage_uses_the_default() {
+        let mut vars = LINK.to_vec();
+        vars.extend([
+            ("VERICTO_RULES_SYNC_INTERVAL_SECS", "1"),
+            ("VERICTO_TELEMETRY_BUFFER", "DISK"),
+            ("VERICTO_TELEMETRY_BATCH_SIZE", "100000"),
+            ("VERICTO_TELEMETRY_FLUSH_SECS", "0"),
+            ("VERICTO_TELEMETRY_QUEUE_CAPACITY", "0"),
+            ("VERICTO_TELEMETRY_SPOOL_FLUSH_MS", "0"),
+            ("VERICTO_TELEMETRY_SPOOL_BATCH_MAX", "0"),
+            ("VERICTO_TELEMETRY_SPOOL_MAX_BYTES", "1"),
+            ("VERICTO_TELEMETRY_MAX_IN_FLIGHT", "1000"),
+            ("VERICTO_TELEMETRY_GZIP", "yes please"),
+            ("VERICTO_TELEMETRY_RETRY_BASE_MS", "0"),
+            ("VERICTO_TELEMETRY_RETRY_MAX_SECS", "0"),
+            ("VERICTO_TELEMETRY_MEMORY_CAPACITY", "lots"),
+            ("VERICTO_RULES_CACHE_PATH", ""),
+        ]);
+        let cfg = from_vars(&vars).unwrap().unwrap();
+        assert_eq!(
+            cfg.rules_sync_interval,
+            Duration::from_secs(RULES_SYNC_MIN_SECS)
+        );
+        assert_eq!(
+            cfg.buffer_mode,
+            BufferMode::Memory,
+            "the buffer value is case-sensitive"
+        );
+        assert_eq!(cfg.batch_size, MAX_INGEST_BATCH);
+        assert_eq!(cfg.flush_interval, Duration::from_secs(1));
+        assert_eq!(cfg.spool.queue_capacity, 1);
+        assert_eq!(cfg.spool.flush_every, Duration::from_millis(1));
+        assert_eq!(cfg.spool.segment_max, 1);
+        assert_eq!(cfg.spool.max_bytes, SPOOL_MIN_BYTES);
+        assert_eq!(cfg.spool.max_events, None, "unparseable capacity is unset");
+        assert_eq!(cfg.memory_capacity, 10_000);
+        assert_eq!(cfg.delivery.max_in_flight, 64);
+        assert!(cfg.delivery.gzip, "only 0/false/no turn gzip off");
+        assert_eq!(cfg.delivery.retry_base, Duration::from_millis(1));
+        assert_eq!(
+            cfg.delivery.retry_max,
+            Duration::from_millis(1),
+            "the longest wait is never below the first one"
+        );
+        assert_eq!(cfg.rules_cache_path, None);
     }
 
     #[test]
