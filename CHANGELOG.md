@@ -7,6 +7,66 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [4.13.0] — 2026-10-18
+
+A security update of the bundled PostgreSQL parser and vericto-engine v4.2.0
+(from v4.1.3). **This release can block statements that 4.12.3 let through**
+(see "Changed"). No wire-protocol or configuration changes.
+
+### Security
+
+- **pg_query 6.2.1 (libpg_query 17-6.2.5), from 6.2.0 (libpg_query 17-6.2.2).**
+  It fixes [GHSA-6ggm-xmc9-8ffg](https://github.com/pganalyze/libpg_query/security/advisories/GHSA-6ggm-xmc9-8ffg)
+  (High, CVSS 3.1 8.1; CWE-125, CWE-170, CWE-787): `pg_query_normalize()` could
+  read and write heap memory out of bounds on specially crafted query text.
+  The advisory is published by pganalyze in the libpg_query repository; it has
+  no CVE and no RustSec entry, so `cargo audit` does not report it. Parsing,
+  fingerprinting and deparsing are not affected.
+  - **The proxy is affected.** For PostgreSQL traffic it passes the client's SQL
+    to `pg_query::normalize` to strip literals from sanitized telemetry, from
+    VERICTO-085 suggestions in sanitized mode, and from the query preview in
+    every block log line, whatever the reporting mode. A client that can send
+    SQL through the proxy could reach the bug. MySQL text is normalized with
+    the proxy's own tokenizer and was not affected.
+  - 6.2.1 also hardens the deparser that the engine uses for mask rewrites
+    (strict checks for unexpected pointer values, parentheses kept around
+    subscripted array constructors).
+  - `third-party/pg_query-bundled.txt` names the new versions; the license
+    texts did not change.
+
+### Changed
+
+- **vericto-engine v4.2.0.** What changes for traffic through the proxy:
+  - **The decision is the strongest action across all violations.** When the
+    workspace policy softens a severity (for example Critical to Flag), 4.1.3
+    could let the softened violation decide for the whole statement and
+    forward a script that also held a violation that blocks. With 4.2.0 such a
+    script is blocked: `DROP TABLE a; INSERT INTO archive SELECT * FROM accounts`
+    under a policy that maps Critical to Flag now blocks with VERICTO-040
+    instead of being forwarded as a Flag. Nothing that 4.12.3 blocked is
+    allowed now, and a statement whose violations all resolve to the same
+    action gets the same decision and the same reported rule as before.
+  - When the sensitive-column code shares an action with a rule, the reported
+    winner can change (VERICTO-085 now ranks by severity like any rule); the
+    decision and the forwarded rewrite do not.
+- **The built-in ruleset is the engine's standard ruleset.** The proxy used to
+  keep its own copy of the 42 built-in rules for use before its first rule
+  sync and whenever a sync fails; it now uses `vericto_engine::standard_rules()`.
+  The codes, severities and default actions are the same; a test still pins
+  them.
+
+### CI
+
+- **The CLA check runs in GitHub Actions** instead of cla-assistant.io, whose
+  webhook failed on every delivery on 2026-10-17 and 2026-10-18 and left pull
+  requests without a status. `.github/workflows/cla.yml` (CLA Assistant Lite,
+  pinned by commit SHA) reports the `CLA` check. The agreement is unchanged
+  (ICLA v1.0, now also in `CLA.md`). Contributors sign it by commenting
+  `I have read the CLA Document and I hereby sign the CLA` on their pull
+  request, and `recheck` reruns the check. Signatures are kept on the
+  `cla-signatures` branch. The workflow never checks out pull request code.
+  No code change.
+
 ## [4.12.3] — 2026-10-18
 
 Requires vericto-engine v4.1.3 (from v4.1.1): fewer false positives, short

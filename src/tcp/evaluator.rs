@@ -6,7 +6,7 @@
 use vericto_engine::parser::{Dialect, parser_for};
 use vericto_engine::{
     ACCESS_RULE_CODE, AccessMode, Decision, DeniedRef, EnforcementAction, EnforcementPolicy,
-    EvaluationOutcome, Needed, ParseErrorAction, ReportedViolation, Rule, RuleEngine, RuleType,
+    EvaluationOutcome, Needed, ParseErrorAction, ReportedViolation, Rule, RuleEngine,
     SensitivePolicy, Severity, TouchedColumn,
 };
 
@@ -416,92 +416,17 @@ fn postgres_parameter_mismatch(original: &str, rewritten: &str) -> Option<String
     })
 }
 
-/// Default ruleset: the built-in rules with their canonical severity and
-/// recommended `default_action` (verbatim from the R13 table). It is the
-/// engine's whole catalogue (pinned by `default_ruleset_has_the_engine_catalogue`).
+/// Default ruleset: the engine's standard ruleset (`vericto_engine::standard_rules()`),
+/// every built-in rule at its canonical severity and default action. The proxy
+/// evaluates with it before its first rule sync and whenever a sync fails. The
+/// engine keeps that table equal to its README catalogue and its evaluator
+/// (`tests/rule_catalogue_sync.rs` there), so the proxy keeps no copy of it.
 ///
 /// In production this ruleset would be resolved per workspace (querying the
 /// API or database based on the `database` from the StartupMessage). For
 /// single-tenant / dev mode these built-ins are the safe minimum.
 pub fn default_ruleset() -> Vec<Rule> {
-    // (code, severity, default_action) — verbatim from the R13 table.
-    let rules: &[(&str, Severity, EnforcementAction)] = &[
-        // Destructive-critical (Critical / BLOCK).
-        ("VERICTO-001", Severity::Critical, EnforcementAction::Block), // DELETE without WHERE
-        ("VERICTO-003", Severity::Critical, EnforcementAction::Block), // DELETE with always-true WHERE
-        ("VERICTO-010", Severity::Critical, EnforcementAction::Block), // DROP TABLE / DATABASE
-        ("VERICTO-011", Severity::Critical, EnforcementAction::Block), // TRUNCATE TABLE
-        ("VERICTO-012", Severity::Critical, EnforcementAction::Block), // DROP SCHEMA
-        ("VERICTO-030", Severity::Critical, EnforcementAction::Block), // UPDATE without WHERE (primary tables)
-        ("VERICTO-042", Severity::Critical, EnforcementAction::Block), // UPDATE without WHERE
-        ("VERICTO-090", Severity::Critical, EnforcementAction::Block), // OR tautology in WHERE (SQL injection)
-        ("VERICTO-080", Severity::Critical, EnforcementAction::Block), // COPY … TO/FROM PROGRAM (server-side RCE)
-        ("VERICTO-081", Severity::Critical, EnforcementAction::Block), // DO $$ … $$ anonymous code block
-        // MySQL text the engine and MySQL would read differently. Engine-driven: the
-        // engine blocks it whatever this list holds; listed so the catalogue is whole.
-        ("VERICTO-086", Severity::Critical, EnforcementAction::Block),
-        // Snowflake rules (VERICTO-091 to VERICTO-097). They read only what the
-        // engine's Snowflake parser records, so they never fire on the Postgres or
-        // MySQL wire protocol this proxy serves; listed so the catalogue is whole.
-        ("VERICTO-091", Severity::Critical, EnforcementAction::Block), // Stage unload or file transfer
-        ("VERICTO-092", Severity::Critical, EnforcementAction::Block), // External stage or integration
-        ("VERICTO-093", Severity::Critical, EnforcementAction::Block), // Share to another account
-        // SQLite rules (VERICTO-098 to VERICTO-101). They read only what the
-        // engine's SQLite parser records, so they never fire on the Postgres or
-        // MySQL wire protocol this proxy serves (SQLite is a library inside the
-        // application: there is no wire protocol to front); listed so the
-        // catalogue is whole.
-        ("VERICTO-100", Severity::Critical, EnforcementAction::Block), // Extension loading or file functions
-        // High / BLOCK.
-        ("VERICTO-002", Severity::High, EnforcementAction::Block), // DELETE with LIMIT 0 (MySQL)
-        ("VERICTO-013", Severity::High, EnforcementAction::Block), // DROP INDEX without IF EXISTS
-        ("VERICTO-015", Severity::High, EnforcementAction::Block), // ALTER TABLE DROP COLUMN
-        ("VERICTO-016", Severity::High, EnforcementAction::Block), // ALTER TABLE RENAME
-        ("VERICTO-017", Severity::High, EnforcementAction::Block), // ALTER TABLE DROP CONSTRAINT
-        ("VERICTO-018", Severity::High, EnforcementAction::Block), // ALTER TABLE ALTER COLUMN TYPE
-        ("VERICTO-019", Severity::High, EnforcementAction::Block), // ALTER TABLE DISABLE TRIGGER / RLS
-        ("VERICTO-031", Severity::High, EnforcementAction::Block), // UPDATE in CTE without WHERE
-        ("VERICTO-033", Severity::High, EnforcementAction::Block), // DELETE in subquery without WHERE
-        ("VERICTO-040", Severity::High, EnforcementAction::Block), // INSERT INTO … SELECT without filter
-        ("VERICTO-070", Severity::High, EnforcementAction::Block), // SLEEP() / PG_SLEEP()
-        ("VERICTO-082", Severity::High, EnforcementAction::Block), // GRANT / REVOKE
-        ("VERICTO-083", Severity::High, EnforcementAction::Block), // MERGE (mass mutation)
-        ("VERICTO-084", Severity::High, EnforcementAction::Block), // CREATE TABLE AS SELECT (bulk copy)
-        // Read of a sensitive column. Engine-driven: it only acts on the policy's
-        // column tags (High for block/mask, Medium for flag), never through this list.
-        ("VERICTO-085", Severity::High, EnforcementAction::Block),
-        // Access outside the agent's allowlist. Engine-driven: it only acts on the
-        // session user's `access_policy` (block under enforce, flag under observe),
-        // never through this list.
-        ("VERICTO-087", Severity::High, EnforcementAction::Block),
-        // Snowflake only (see above).
-        ("VERICTO-094", Severity::High, EnforcementAction::Block), // Recovery reduced
-        ("VERICTO-095", Severity::High, EnforcementAction::Block), // Warehouse cost
-        ("VERICTO-096", Severity::High, EnforcementAction::Block), // Code that runs later
-        ("VERICTO-097", Severity::High, EnforcementAction::Block), // Role switch
-        // SQLite only (see below).
-        ("VERICTO-098", Severity::High, EnforcementAction::Block), // ATTACH DATABASE
-        ("VERICTO-099", Severity::High, EnforcementAction::Block), // PRAGMA that turns a safety off
-        ("VERICTO-101", Severity::High, EnforcementAction::Block), // VACUUM INTO
-        // Medium / FLAG.
-        ("VERICTO-050", Severity::Medium, EnforcementAction::Flag), // SELECT without LIMIT
-        ("VERICTO-051", Severity::Medium, EnforcementAction::Flag), // SELECT * without WHERE
-        ("VERICTO-061", Severity::Medium, EnforcementAction::Flag), // INSERT batch > 10k rows
-        // Low / MONITOR.
-        ("VERICTO-060", Severity::Low, EnforcementAction::Monitor), // INSERT without explicit columns
-    ];
-
-    rules
-        .iter()
-        .map(|(code, severity, default_action)| Rule {
-            rule_id: code.to_string(),
-            code: code.to_string(),
-            severity: *severity,
-            default_action: *default_action,
-            rule_type: RuleType::Standard,
-            ast_condition_yaml: None,
-        })
-        .collect()
+    vericto_engine::standard_rules()
 }
 
 #[cfg(test)]
@@ -555,7 +480,9 @@ mod tests {
         ("VERICTO-060", Severity::Low, EnforcementAction::Monitor),
     ];
 
-    // Task 5.9 — default_ruleset() matches the R13 table verbatim.
+    // Task 5.9 — default_ruleset() holds exactly the R13 table. The engine's
+    // standard ruleset is in code order, and since engine 4.2.0 the decision does
+    // not depend on the order of the rules, so the comparison is by code.
     #[test]
     fn default_ruleset_matches_r13_table_verbatim() {
         let ruleset = default_ruleset();
@@ -564,155 +491,22 @@ mod tests {
             R13.len(),
             "default_ruleset() must have exactly the R13 entries"
         );
-        for (rule, (code, severity, action)) in ruleset.iter().zip(R13.iter()) {
-            assert_eq!(&rule.code, code, "rule code mismatch");
+        let by_code: std::collections::BTreeMap<&str, &Rule> =
+            ruleset.iter().map(|r| (r.code.as_str(), r)).collect();
+        assert_eq!(by_code.len(), R13.len(), "no duplicate codes");
+        for (code, severity, action) in R13 {
+            let rule = by_code
+                .get(code)
+                .unwrap_or_else(|| panic!("{code} missing from default_ruleset()"));
             assert_eq!(&rule.rule_id, code, "rule_id should equal the code");
             assert_eq!(rule.severity, *severity, "severity mismatch for {code}");
             assert_eq!(
                 rule.default_action, *action,
                 "default_action mismatch for {code}"
             );
+            assert_eq!(rule.rule_type, vericto_engine::RuleType::Standard, "{code}");
+            assert!(rule.ast_condition_yaml.is_none(), "{code}");
         }
-    }
-
-    /// Source directory of the `vericto-engine` this crate is built against: the
-    /// git checkout of the commit `Cargo.lock` pins. Found without `cargo metadata`
-    /// first, because `cargo metadata --offline` needs every package of the graph
-    /// downloaded, including other platforms' (CI only fetches the host's), and
-    /// fails there. Falls back to `cargo metadata` for a non-default CARGO_HOME layout.
-    fn engine_source_dir() -> std::path::PathBuf {
-        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-        let lock =
-            std::fs::read_to_string(manifest_dir.join("Cargo.lock")).expect("read Cargo.lock");
-        // `None` when the engine is not a git source, e.g. a local `[patch]` to a
-        // path checkout: `cargo metadata` below then names that directory.
-        let rev = lock
-            .split("[[package]]")
-            .find(|p| p.contains("name = \"vericto-engine\""))
-            .and_then(|p| p.lines().find(|l| l.starts_with("source = \"git+")))
-            .and_then(|l| {
-                l.trim_end_matches('"')
-                    .rsplit('#')
-                    .next()
-                    .map(str::to_owned)
-            });
-        let cargo_home = std::env::var_os("CARGO_HOME")
-            .map(std::path::PathBuf::from)
-            .or_else(|| std::env::var_os("HOME").map(|h| std::path::Path::new(&h).join(".cargo")))
-            .expect("CARGO_HOME or HOME");
-        let checkouts = cargo_home.join("git").join("checkouts");
-        if let Some(rev) = rev
-            && let Ok(entries) = std::fs::read_dir(&checkouts)
-        {
-            for e in entries.flatten() {
-                if !e
-                    .file_name()
-                    .to_string_lossy()
-                    .starts_with("vericto-engine-")
-                {
-                    continue;
-                }
-                let dir = e.path().join(&rev[..7.min(rev.len())]);
-                if dir.join("Cargo.toml").is_file() {
-                    return dir;
-                }
-            }
-        }
-        let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
-        let out = std::process::Command::new(cargo)
-            .args(["metadata", "--format-version", "1", "--locked"])
-            .current_dir(manifest_dir)
-            .output()
-            .expect("run cargo metadata");
-        assert!(
-            out.status.success(),
-            "cargo metadata failed: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-        let meta: serde_json::Value = serde_json::from_slice(&out.stdout).expect("metadata JSON");
-        let manifest = meta["packages"]
-            .as_array()
-            .expect("packages")
-            .iter()
-            .find(|p| p["name"] == "vericto-engine")
-            .and_then(|p| p["manifest_path"].as_str())
-            .expect("vericto-engine in the dependency graph");
-        std::path::Path::new(manifest)
-            .parent()
-            .expect("manifest dir")
-            .to_path_buf()
-    }
-
-    /// The engine's rule catalogue: every `VERICTO-NNN` row of its README, with the
-    /// severity of the `### <Severity>` section it is listed under. The engine's own
-    /// `rule_catalogue_sync` test keeps that table equal to its evaluator.
-    fn engine_catalogue() -> std::collections::BTreeMap<String, Severity> {
-        let readme = std::fs::read_to_string(engine_source_dir().join("README.md"))
-            .expect("read the engine README");
-        let mut severity = None;
-        let mut out = std::collections::BTreeMap::new();
-        for line in readme.lines() {
-            if let Some(h) = line.strip_prefix("### ") {
-                severity = match h.trim() {
-                    "Critical" => Some(Severity::Critical),
-                    "High" => Some(Severity::High),
-                    "Medium" => Some(Severity::Medium),
-                    "Low" => Some(Severity::Low),
-                    "Informational" => Some(Severity::Informational),
-                    _ => None,
-                };
-                continue;
-            }
-            let Some(row) = line.trim_start().strip_prefix("| VERICTO-") else {
-                continue;
-            };
-            let digits: String = row.chars().take_while(|c| c.is_ascii_digit()).collect();
-            if digits.is_empty() || !row[digits.len()..].trim_start().starts_with('|') {
-                continue;
-            }
-            let code = format!("VERICTO-{digits}");
-            let sev = severity.unwrap_or_else(|| panic!("{code} is outside a severity section"));
-            assert!(
-                out.insert(code.clone(), sev).is_none(),
-                "{code} listed twice"
-            );
-        }
-        assert!(
-            !out.is_empty(),
-            "no catalogue rows found in the engine README"
-        );
-        out
-    }
-
-    /// The built-in ruleset is the engine's catalogue: same codes, same
-    /// severities, nothing missing and nothing extra. A new engine rule fails
-    /// this test until it is added here.
-    #[test]
-    fn default_ruleset_has_the_engine_catalogue() {
-        let engine = engine_catalogue();
-        let builtin: std::collections::BTreeMap<String, Severity> = default_ruleset()
-            .into_iter()
-            .map(|r| (r.code, r.severity))
-            .collect();
-        let missing: Vec<&String> = engine
-            .keys()
-            .filter(|c| !builtin.contains_key(*c))
-            .collect();
-        let extra: Vec<&String> = builtin
-            .keys()
-            .filter(|c| !engine.contains_key(*c))
-            .collect();
-        assert!(
-            missing.is_empty() && extra.is_empty(),
-            "built-in ruleset ({}) differs from the engine catalogue ({}): missing {missing:?}, extra {extra:?}",
-            builtin.len(),
-            engine.len()
-        );
-        assert_eq!(
-            builtin, engine,
-            "severities differ from the engine catalogue"
-        );
-        assert_eq!(default_ruleset().len(), engine.len(), "no duplicate codes");
     }
 
     /// The SQLite rules (and VERICTO-070's SQLite probe) are in the built-in
@@ -780,6 +574,33 @@ mod tests {
                 assert_eq!(severity, Severity::Critical);
             }
             TcpDecision::Forward { .. } => panic!("destructive query must Block, not Forward"),
+        }
+    }
+
+    // Engine 4.2.0: the decision is the strongest resolved action across all the
+    // violations. A workspace policy that softens Critical to Flag no longer lets
+    // the (softened) DROP decide for a script that also holds a High violation
+    // that blocks; with engine 4.1.3 this script was forwarded as a Flag.
+    #[test]
+    fn a_softened_violation_does_not_outvote_one_that_blocks() {
+        let rules = default_ruleset();
+        let policy = EnforcementPolicy {
+            critical: EnforcementAction::Flag,
+            ..EnforcementPolicy::default()
+        };
+        let sql = "DROP TABLE a; INSERT INTO archive SELECT * FROM accounts";
+        match evaluate(sql, Dialect::Postgres, &rules, &policy) {
+            TcpDecision::Block {
+                rule_code,
+                severity,
+                ..
+            } => {
+                assert_eq!(rule_code, "VERICTO-040");
+                assert_eq!(severity, Severity::High);
+            }
+            TcpDecision::Forward { violations, .. } => {
+                panic!("must Block on VERICTO-040, was forwarded: {violations:?}")
+            }
         }
     }
 
