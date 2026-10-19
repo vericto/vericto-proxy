@@ -79,9 +79,9 @@ pub const DROP_WARN_EVERY: Duration = Duration::from_secs(10);
 /// How often the disk writer looks at its channel while it collects a batch.
 const WRITER_POLL: Duration = Duration::from_millis(5);
 
-/// Default bound of the disk spool, in bytes: 1 GiB. See the README ("Disk spool
-/// size") for the arithmetic: about 28 minutes of an API outage at 1,500 events
-/// per second of the measured average event size (417 bytes), and 5% of
+/// Default bound of the disk spool, in bytes: 1 GiB. See `docs/CONFIGURATION.md`
+/// ("Disk spool size") for the arithmetic: about 28 minutes of an API outage at
+/// 1,500 events per second of the measured average event size (417 bytes), and 5% of
 /// Fargate's default 20 GiB of ephemeral storage.
 pub const DEFAULT_SPOOL_MAX_BYTES: u64 = 1024 * 1024 * 1024;
 

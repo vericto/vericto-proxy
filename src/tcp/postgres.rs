@@ -892,12 +892,12 @@ mod tests {
     use crate::tcp::evaluator::Observation;
     use vericto_engine::{ReportedViolation, Severity};
 
-    /// The measurement behind `VERICTO_TELEMETRY_SPOOL_MAX_BYTES`' default (README,
-    /// "Disk spool size"): the average spool line of a pgbench-style mix (the
-    /// staging benchmark's traffic) plus a few application statements that break
-    /// rules, evaluated with the built-in ruleset and serialized exactly as the
-    /// spool writes them (one JSON object and a newline per event). Run with
-    /// `--nocapture` to see the figure.
+    /// The measurement behind `VERICTO_TELEMETRY_SPOOL_MAX_BYTES`' default
+    /// (`docs/CONFIGURATION.md`, "Disk spool size"): the average spool line of a
+    /// pgbench-style mix (the staging benchmark's traffic) plus a few application
+    /// statements that break rules, evaluated with the built-in ruleset and
+    /// serialized exactly as the spool writes them (one JSON object and a newline
+    /// per event). Run with `--nocapture` to see the figure.
     #[test]
     fn the_default_spool_bound_covers_minutes_of_an_api_outage() {
         let workload = [
@@ -945,7 +945,7 @@ mod tests {
         );
         assert!(
             (250..2_000).contains(&average),
-            "average event of {average} bytes: re-check the README arithmetic"
+            "average event of {average} bytes: re-check the docs/CONFIGURATION.md arithmetic"
         );
         assert!(
             minutes >= 15,

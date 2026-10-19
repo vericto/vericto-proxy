@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [4.14.2] — 2026-10-19
+
+**Documentation only; no code change.** The proxy behaves exactly as 4.14.1 did.
+
+### Changed
+
+- README: the opening now says what the proxy is for and the problem it solves,
+  states the license (FSL-1.1-ALv2, Apache-2.0 two years after each release) near
+  the top, and the quickstart and Docker examples use `vericto/vericto-proxy:4.14.2`
+  from Docker Hub (GHCR serves the same digest) instead of
+  `ghcr.io/vericto/vericto-proxy:4.5.1`.
+- README shortened. The advanced configuration (control-plane link, monthly quota,
+  disk spool size, several proxies on one volume, TLS, query size limit, health
+  check, observability and metrics, engine-specific and MySQL notes) moved, unchanged,
+  to `docs/CONFIGURATION.md`; the full sensitive-column and agent-access references
+  to `docs/SENSITIVE_COLUMNS.md` and `docs/AGENT_ACCESS.md`, with a summary left in
+  the README; "Run from source" to `CONTRIBUTING.md`. Comments and `.env.example`
+  that pointed to the README's "Disk spool size" now point to `docs/CONFIGURATION.md`.
+
 ## [4.14.1] — 2026-10-19
 
 **The image is now also on Docker Hub, and no code change.** The proxy behaves
