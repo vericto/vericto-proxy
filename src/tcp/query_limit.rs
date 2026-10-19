@@ -16,8 +16,19 @@
 //! |  4 MB |  1313 ms |     122 ms | 1435 ms |
 //! | 10 MB |  3440 ms |     382 ms | 3822 ms |
 //!
-//! Roughly 0.35 ms/KB. Postgres framing accepts up to 64 MiB, which extrapolates
-//! to about 23 s of evaluation for a single statement.
+//! The table works out to roughly 0.33 ms/KB on the machine it was taken on (an
+//! earlier version of this comment said 0.35). The proxy path measured end to
+//! end is lower: added p50 grows by about 0.23 ms/KB of SQL on PostgreSQL and
+//! 0.18 ms/KB on MySQL (least-squares fit; benchmark session s3-412,
+//! 2026-10-16: vericto-proxy 4.12.0, vericto-engine 3.9.0, Fargate ARM64 at
+//! 0.25 vCPU, TLS on both legs, multi-row `INSERT` of 10 to 1,000 rows, 0.2 to
+//! 48 KB, one connection at 10 statements/s). Evaluation alone over the same
+//! statements, single thread, same session: 0.22 to 0.26 ms/KB on PostgreSQL
+//! and 0.06 to 0.09 ms/KB on MySQL. The cost is CPU time, so it shrinks with a
+//! larger vCPU share; BENCH-2026-11 (P-size) re-measures it at 0.5 and 1 vCPU.
+//!
+//! Postgres framing accepts up to 64 MiB, which at 0.23 to 0.33 ms/KB
+//! extrapolates to about 15 to 22 s of evaluation for a single statement.
 //!
 //! The limit is a *guard*, checked before parsing, so a refused query costs
 //! neither the evaluation parse nor the telemetry sanitize pass.
@@ -25,7 +36,8 @@
 use crate::tcp::codec_mysql::MYSQL_MAX_PACKET_LEN;
 use vericto_engine::Dialect;
 
-/// Default ceiling: 10 MiB, about 3.8 s of evaluation at the measured rate.
+/// Default ceiling: 10 MiB, about 3.8 s of evaluation at the rate in the table
+/// above (about 2.4 s at the 0.23 ms/KB measured end to end).
 ///
 /// Chosen to clear realistic large statements rather than to minimise latency.
 /// The shapes that legitimately get big are batch inserts and long `IN` lists —

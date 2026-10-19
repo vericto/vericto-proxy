@@ -423,7 +423,8 @@ async fn shutdown_signal() -> &'static str {
 
 fn init_tracing() {
     use tracing_subscriber::{EnvFilter, fmt};
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("info,vericto_proxy=debug"));
+    // Default `info`, as documented in docs/CONFIGURATION.md and set by the
+    // Dockerfile. `RUST_LOG=info,vericto_proxy=debug` turns the debug lines back on.
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     fmt().with_env_filter(filter).json().init();
 }

@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [4.14.3] — 2026-10-19
+
+**The default log level is now `info`, as documented.** No other behaviour change.
+
+### Fixed
+
+- Without `RUST_LOG`, the proxy logged at `info,vericto_proxy=debug` (one or more
+  debug lines per statement), while `docs/CONFIGURATION.md` documents `info`. The
+  default is now `info`. The Docker image already set `RUST_LOG=info`, so containers
+  that do not override it log exactly as before; binaries run without `RUST_LOG`,
+  and deployments that copied `RUST_LOG=info,vericto_proxy=debug` from
+  `.env.example`, are the ones that change. `.env.example` now says `RUST_LOG=info`
+  and shows how to turn the debug lines back on.
+- The evaluation-cost comment in `src/tcp/query_limit.rs` said "roughly 0.35 ms/KB".
+  It now gives the measured end-to-end slope with its conditions (about 0.23 ms/KB
+  of SQL on PostgreSQL and 0.18 ms/KB on MySQL at 0.25 vCPU, proxy 4.12.0) next to
+  the original table, and the 64 MiB extrapolation that follows from both (15 to
+  22 s instead of 23 s). Comment only.
+- README: the quickstart and Docker examples use `vericto/vericto-proxy:4.14.3`.
+
 ## [4.14.2] — 2026-10-19
 
 **Documentation only; no code change.** The proxy behaves exactly as 4.14.1 did.
