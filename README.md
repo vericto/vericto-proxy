@@ -5,6 +5,7 @@
 [![CI](https://github.com/vericto/vericto-proxy/actions/workflows/ci.yml/badge.svg)](https://github.com/vericto/vericto-proxy/actions/workflows/ci.yml)
 [![License: FSL-1.1-ALv2](https://img.shields.io/badge/license-FSL--1.1--ALv2-blue.svg)](LICENSING.md)
 [![Rust 1.88+](https://img.shields.io/badge/rust-1.88%2B-orange.svg)](https://www.rust-lang.org)
+[![Docker Hub](https://img.shields.io/docker/v/vericto/vericto-proxy?sort=semver&label=docker%20hub)](https://hub.docker.com/r/vericto/vericto-proxy)
 
 `vericto-proxy` is the **customer-facing TCP wire-protocol proxy**. It intercepts
 every query on the database wire protocol, evaluates it with the
@@ -621,7 +622,12 @@ VERICTO_TEST_MYSQL_URL=mysql://root:secret@127.0.0.1:3306 cargo test sensitive_t
 ## Docker
 
 Release images are published at `ghcr.io/vericto/vericto-proxy` for `linux/amd64`
-and `linux/arm64`, and pull without credentials.
+and `linux/arm64`, and pull without credentials. From 4.14.1 on, the same images
+are also on Docker Hub as
+[`vericto/vericto-proxy`](https://hub.docker.com/r/vericto/vericto-proxy). The
+release workflow copies the multi-arch index it pushed to GHCR, so both registries
+serve the same digest under the same tags (`<version>`, `<major>.<minor>`,
+`<major>` and `latest`): pull from whichever your environment allows.
 
 ```bash
 # Postgres. On Linux, add --add-host=host.docker.internal:host-gateway
@@ -636,12 +642,25 @@ docker run --rm \
   ghcr.io/vericto/vericto-proxy:4.5.1
 ```
 
+The same from Docker Hub:
+
+```bash
+docker pull vericto/vericto-proxy:4.14.1
+
+# Postgres. On Linux, add --add-host=host.docker.internal:host-gateway
+docker run --rm -e UPSTREAM_HOST=host.docker.internal -p 5433:5433 \
+  vericto/vericto-proxy:4.14.1
+```
+
 Images released from now on carry a build provenance attestation (Sigstore,
 GitHub Actions) that ties their digest to this repository, the release workflow
 and the commit. Verify one before you deploy it, and deploy by digest:
 
 ```bash
 gh attestation verify oci://ghcr.io/vericto/vericto-proxy:<version> --repo vericto/vericto-proxy
+
+# Docker Hub (4.14.1 and later): the same digest, attested under its Docker Hub name
+gh attestation verify oci://docker.io/vericto/vericto-proxy:<version> --repo vericto/vericto-proxy
 ```
 
 To build the image from this checkout instead:
