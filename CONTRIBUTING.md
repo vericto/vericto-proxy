@@ -39,6 +39,40 @@ cargo test
 Requires Rust 1.88+ (the `pg_query` binding needs `libclang` and `protoc` — see
 the Dockerfile for the exact system dependencies).
 
+## Run from source
+
+```bash
+# Postgres (default). Requires a local Postgres on 5432.
+UPSTREAM_HOST=localhost cargo run
+
+# MySQL. Requires a local MySQL on 3306.
+VERICTO_WIRE_PROTOCOL=mysql UPSTREAM_HOST=localhost cargo run
+
+# With the control-plane link (telemetry + rule sync)
+UPSTREAM_HOST=localhost \
+VERICTO_API_URL=https://api.vericto.com \
+VERICTO_API_KEY=vtro_... \
+VERICTO_DATABASE_ID=your-db-uuid \
+cargo run
+
+# Tests
+cargo test
+cargo clippy -- -D warnings
+cargo fmt
+
+# Also run the sensitive-column tests against a real Postgres (each creates and
+# drops its own database; without the variable they are skipped)
+VERICTO_TEST_PG_URL=postgres://postgres:postgres@127.0.0.1:5432/postgres cargo test sensitive_tests
+
+# ... and a real MySQL (5.7 or 8.0), over COM_QUERY and prepared statements
+VERICTO_TEST_MYSQL_URL=mysql://root:secret@127.0.0.1:3306 cargo test sensitive_tests
+# The agent-access tests (access_tests) use the same variables; they also create
+# and drop their own roles / users, so the admin URL needs that privilege.
+# for a MySQL that requires TLS, both hops use it: add
+#   VERICTO_TEST_MYSQL_SSLMODE=require \
+#   VERICTO_TEST_MYSQL_TLS_CERT=proxy-cert.pem VERICTO_TEST_MYSQL_TLS_KEY=proxy-key.pem
+```
+
 ## Development workflow
 
 1. Fork the repo and create a branch: `feat/my-rule` or `fix/mysql-delete`.
