@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Vericto S.A.S.
+// SPDX-License-Identifier: FSL-1.1-ALv2
+
 //! MySQL wire-protocol framing for the multi-dialect proxy (Phase 1).
 //!
 //! Scope: only what the proxy needs to intercept and evaluate SQL — packet

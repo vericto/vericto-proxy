@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Vericto S.A.S.
+// SPDX-License-Identifier: FSL-1.1-ALv2
+
 //! Upstream connection establishment, with optional TLS to the real database.
 //!
 //! The proxy→database hop is the one that typically crosses an untrusted /

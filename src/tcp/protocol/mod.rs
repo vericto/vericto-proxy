@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Vericto S.A.S.
+// SPDX-License-Identifier: FSL-1.1-ALv2
+
 //! Wire-protocol strategy for the multi-dialect TCP proxy.
 //!
 //! The proxy is a *server* of a database wire protocol. The protocol is fixed by

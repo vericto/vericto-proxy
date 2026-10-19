@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Vericto S.A.S.
+// SPDX-License-Identifier: FSL-1.1-ALv2
+
 //! Agent access allowlists (VERICTO-087) on the wire.
 //!
 //! The identity is the database user of the session (Postgres StartupMessage

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Vericto S.A.S.
+// SPDX-License-Identifier: FSL-1.1-ALv2
+
 //! Health-check listener (`healthz`) — a dedicated TCP port for load-balancer
 //! health checks, kept entirely separate from the wire-protocol traffic port.
 //!

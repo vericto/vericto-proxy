@@ -1,4 +1,7 @@
 #!/bin/sh
+# SPDX-FileCopyrightText: 2026 Vericto S.A.S.
+# SPDX-License-Identifier: FSL-1.1-ALv2
+
 # Write THIRD_PARTY_LICENSES for the vericto-proxy binary.
 #   usage: third-party/build-notices.sh <output file>   (run from the repository root)
 #

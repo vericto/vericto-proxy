@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Vericto S.A.S.
+// SPDX-License-Identifier: FSL-1.1-ALv2
+
 //! On-disk copy of the last-good `/sync/rules` response.
 //!
 //! Without it, a proxy that restarts while the control plane is unreachable comes

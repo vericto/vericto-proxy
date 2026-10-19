@@ -9,7 +9,6 @@ accepted = [
     "Apache-2.0",
     "BSD-3-Clause",
     "CDLA-Permissive-2.0",
-    "Elastic-2.0",
     "ISC",
     "MIT",
     "Unicode-3.0",
@@ -18,3 +17,12 @@ accepted = [
 targets = ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"]
 ignore-build-dependencies = true
 ignore-dev-dependencies = true
+
+# Vericto's own crates, accepted under their own license only: vericto-proxy is
+# FSL-1.1-ALv2 since 4.14.0, and vericto-engine since 4.3.0 (the tag Cargo.toml
+# pins).
+[vericto-proxy]
+accepted = ["FSL-1.1-ALv2"]
+
+[vericto-engine]
+accepted = ["FSL-1.1-ALv2"]

@@ -1,4 +1,29 @@
 vericto-proxy
 Copyright 2026 Vericto S.A.S.
 
-Licensed under the Elastic License 2.0. See LICENSE.
+This software is licensed under the Functional Source License, Version 1.1,
+ALv2 Future License (SPDX-License-Identifier: FSL-1.1-ALv2). The full terms
+are in LICENSE.
+
+Future license: each version of this software is also licensed under the
+Apache License, Version 2.0 (SPDX-License-Identifier: Apache-2.0) from the
+second anniversary of the date Vericto S.A.S. makes that version available,
+as the "Grant of Future License" section of LICENSE states.
+
+The FSL applies from version 4.14.0. Versions 4.13.0 and earlier, and every
+commit before the one that introduced the FSL, were released under the
+Elastic License 2.0 (SPDX-License-Identifier: Elastic-2.0) and remain under
+it. See LICENSING.md.
+
+vericto-engine, Vericto's SQL engine (Copyright 2026 Vericto S.A.S.), is
+compiled into the vericto-proxy binary. The release it pins (v4.3.0 in
+vericto-proxy 4.14.0) is itself licensed under FSL-1.1-ALv2.
+
+The vericto-proxy binary also contains third-party Rust crates and the C code
+that the pg_query crate compiles in (libpg_query, PostgreSQL, protobuf-c and
+xxHash), each under its own license. The Docker image lists them with their
+license texts in /usr/share/doc/vericto-proxy/THIRD_PARTY_LICENSES, which
+third-party/build-notices.sh generates when the image is built.
+
+"Vericto" and the Vericto logo are trademarks of Vericto S.A.S. The licenses
+grant no right to use them; see TRADEMARKS.md.

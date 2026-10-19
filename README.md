@@ -3,7 +3,7 @@
 > Transparent SQL TCP proxy — deterministic SQL firewall in the wire path.
 
 [![CI](https://github.com/vericto/vericto-proxy/actions/workflows/ci.yml/badge.svg)](https://github.com/vericto/vericto-proxy/actions/workflows/ci.yml)
-[![License: ELv2](https://img.shields.io/badge/license-Elastic--2.0-blue.svg)](LICENSE)
+[![License: FSL-1.1-ALv2](https://img.shields.io/badge/license-FSL--1.1--ALv2-blue.svg)](LICENSING.md)
 [![Rust 1.88+](https://img.shields.io/badge/rust-1.88%2B-orange.svg)](https://www.rust-lang.org)
 
 `vericto-proxy` is the **customer-facing TCP wire-protocol proxy**. It intercepts
@@ -689,13 +689,20 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) and [SECURITY.md](SECURITY.md).
 
 ## License
 
-Copyright 2026 Vericto S.A.S. Licensed under the Elastic License 2.0 — see
-[LICENSE](LICENSE). Source-available, no managed-service resale.
+Copyright 2026 Vericto S.A.S. Source-available under the
+[Functional Source License, Version 1.1, ALv2 Future License](LICENSE)
+(SPDX `FSL-1.1-ALv2`) since 4.14.0: use, modify and redistribute it for any
+purpose other than a Competing Use, and each version becomes Apache-2.0 two
+years after it is released. Versions 4.13.0 and earlier remain under the
+Elastic License 2.0. [LICENSING.md](LICENSING.md) answers the common questions,
+including how the embedded vericto-engine is licensed; see also
+[NOTICE](NOTICE) and [TRADEMARKS.md](TRADEMARKS.md).
 For a commercial license contact [enterprise@vericto.com](mailto:enterprise@vericto.com).
 
 The Docker image carries `LICENSE`, `NOTICE` and `THIRD_PARTY_LICENSES` (the
 licenses of every dependency compiled into the binary) in
-`/usr/share/doc/vericto-proxy/`:
+`/usr/share/doc/vericto-proxy/`, and the label
+`org.opencontainers.image.licenses=FSL-1.1-ALv2`:
 
 ```bash
 docker run --rm --entrypoint cat ghcr.io/vericto/vericto-proxy:latest \

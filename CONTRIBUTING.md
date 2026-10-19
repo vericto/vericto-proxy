@@ -2,7 +2,8 @@
 
 Thanks for your interest in improving Vericto Proxy. This guide covers the TCP
 wire-protocol proxy in this repository, which is source-available under the
-[Elastic License 2.0](LICENSE). Contributions are accepted under the Vericto
+[Functional Source License, Version 1.1, ALv2 Future License](LICENSE)
+(FSL-1.1-ALv2; see [LICENSING.md](LICENSING.md)). Contributions are accepted under the Vericto
 [Contributor License Agreement](#contributor-license-agreement).
 
 ## Code of Conduct
@@ -85,7 +86,7 @@ Scopes for this repo: `tcp`, `telemetry`, `rules-sync`, `config`, `healthz`,
 
 **Write in English** — commit subjects and bodies, code comments, test names, identifiers,
 `CHANGELOG.md` entries and pull request descriptions. The codebase is source-available
-under Elastic-2.0 and read by people who do not share a first language with its authors,
+under FSL-1.1-ALv2 and read by people who do not share a first language with its authors,
 so a single language keeps it reviewable. Part of this repository's early history is in
 Spanish; those commits are left as they are rather than rewritten, and everything from
 here forward is English.
@@ -108,7 +109,13 @@ Do **not** open a public issue for vulnerabilities. See [SECURITY.md](SECURITY.m
 Before your first pull request can be merged, you need to sign the Vericto
 Contributor License Agreement (CLA), version 1.0, in [CLA.md](CLA.md). It gives
 Vericto S.A.S. the rights it needs to distribute your contribution as part of the
-project, under the Elastic License 2.0 and under the commercial licenses it offers.
+project: under the project's license (the FSL, and the Apache License 2.0 once a
+version converts) and under the commercial licenses it offers. CLA 1.0 names the
+Elastic License 2.0, the project's license when it was written; its section 2 also
+covers later and other licenses, so it applies unchanged.
+New source files start with the same two SPDX lines as the existing ones
+(`SPDX-FileCopyrightText: 2026 Vericto S.A.S.` and
+`SPDX-License-Identifier: FSL-1.1-ALv2`).
 
 On your first pull request, the `CLA` check comments with a link to the agreement and
 fails until every author of a commit in the pull request has signed. To sign, read the

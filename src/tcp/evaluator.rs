@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Vericto S.A.S.
+// SPDX-License-Identifier: FSL-1.1-ALv2
+
 //! Bridge between the TCP proxy and the AST evaluation engine (in-process).
 //!
 //! The TCP proxy calls the existing parser and `RuleEngine` directly, without

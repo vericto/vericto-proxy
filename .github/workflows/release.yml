@@ -44,7 +44,8 @@ jobs:
 
       # The labels are set here because this is the step whose labels reach the image.
       # Without the explicit licenses label, metadata-action fills it from GitHub's
-      # license detection, which does not recognise ELv2 and reports NOASSERTION.
+      # license detection, which does not recognise FSL-1.1-ALv2 (nor ELv2 before
+      # it) and reports NOASSERTION.
       - name: Derive labels
         id: meta
         uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
@@ -53,7 +54,7 @@ jobs:
           labels: |
             org.opencontainers.image.title=vericto-proxy
             org.opencontainers.image.description=Vericto SQL security proxy — deterministic AST parsing
-            org.opencontainers.image.licenses=Elastic-2.0
+            org.opencontainers.image.licenses=FSL-1.1-ALv2
 
       - name: Build and push digest
         id: build

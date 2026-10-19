@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Vericto S.A.S.
+// SPDX-License-Identifier: FSL-1.1-ALv2
+
 //! PostgreSQL TCP proxy session handler.
 //!
 //! Terminates the PostgreSQL wire protocol transparently: the client (Prisma,
