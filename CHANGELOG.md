@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [4.14.1] — 2026-10-19
+
+**The image is now also on Docker Hub, and no code change.** The proxy behaves
+exactly as 4.14.0 did.
+
+### Added
+
+- **Docker Hub: `vericto/vericto-proxy`.** The release workflow now also
+  publishes the image to [Docker Hub](https://hub.docker.com/r/vericto/vericto-proxy),
+  next to `ghcr.io/vericto/vericto-proxy`, which keeps working as before. It does
+  not build twice: it copies the multi-arch index it pushed to GHCR, by digest,
+  and checks that Docker Hub serves the same digest, under the same tags
+  (`<version>`, `<major>.<minor>`, `<major>`, `latest`). The Docker Hub copy has
+  its own build provenance attestation, verifiable with
+  `gh attestation verify oci://docker.io/vericto/vericto-proxy:<version> --repo vericto/vericto-proxy`.
+  The Docker Hub token lives in a `dockerhub` GitHub environment that only
+  release tags (`v*.*.*`) can use, read by a separate job; without it the
+  workflow publishes to GHCR only and says so in a notice.
+- README: Docker Hub badge, `docker pull` / `docker run` examples and the
+  verification command for the Docker Hub name.
+
 ## [4.14.0] — 2026-10-18
 
 **A new license, and no code change.** From this version on, vericto-proxy is
