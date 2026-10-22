@@ -102,6 +102,10 @@ pub struct BlockContext<'a> {
     /// Sequence id of the blocked message (MySQL needs command_seq + 1 for the
     /// reply; Postgres ignores this).
     pub client_seq: u8,
+    /// The transaction state the server last reported, with policy rules on
+    /// (4.15.0): the Postgres reply's ReadyForQuery then carries it. `None`
+    /// (policy rules off): ReadyForQuery says idle, as in 4.14.3.
+    pub tx: Option<&'a crate::tcp::tx_state::ServerTxState>,
 }
 
 /// Bytes to send to the client to reject a query, plus whether the protocol
@@ -153,6 +157,32 @@ pub trait WireProtocol: Send + Sync {
 
     /// Builds the native rejection response for a blocked query.
     fn build_block_response(&self, ctx: &BlockContext) -> BlockResponse;
+
+    /// What the server answers to a successful `SET` sent as a simple query:
+    /// the proxy's reply to a `SET vericto.*` it consumed (policy rules on),
+    /// carrying the transaction state the server last reported (`tx`).
+    /// `client_seq` as in [`BlockContext`].
+    fn build_set_ok(&self, client_seq: u8, tx: &crate::tcp::tx_state::ServerTxState) -> Vec<u8>;
+
+    /// What the server answers to a statement sent while the session is in a
+    /// failed transaction block, when this protocol has one (Postgres `E`:
+    /// 25P02, and the extended sequence is skipped until Sync). `None` when the
+    /// session is not in one, or the protocol has no such state (MySQL: an
+    /// error never leaves the transaction unusable). Policy rules on only.
+    fn build_in_failed_transaction(
+        &self,
+        _kind: QueryKind,
+        _tx: &crate::tcp::tx_state::ServerTxState,
+    ) -> Option<BlockResponse> {
+        None
+    }
+
+    /// The ReadyForQuery the proxy sends when it ends a skipped extended
+    /// sequence at Sync (Postgres only). `tx` as in [`BlockContext`].
+    fn build_sync_reply(&self, tx: Option<&crate::tcp::tx_state::ServerTxState>) -> Vec<u8> {
+        let status = tx.map_or(crate::tcp::tx_state::PG_IDLE, |t| t.pg_status());
+        crate::tcp::codec::build_ready_for_query_with(status)
+    }
 
     /// The same query message carrying `sql` instead (a mask rewrite), with
     /// everything else about it unchanged. `None` when this protocol cannot

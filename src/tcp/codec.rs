@@ -317,6 +317,15 @@ pub fn build_ready_for_query() -> Vec<u8> {
     vec![b'Z', 0, 0, 0, 5, b'I']
 }
 
+/// Builds a `ReadyForQuery` ('Z') message with the given transaction status
+/// (`I` idle, `T` in a transaction block, `E` in a failed one).
+pub fn build_ready_for_query_with(status: u8) -> Vec<u8> {
+    vec![b'Z', 0, 0, 0, 5, status]
+}
+
+/// SQLSTATE of a command sent in a failed transaction block (in_failed_sql_transaction).
+pub const SQLSTATE_IN_FAILED_SQL_TRANSACTION: &str = "25P02";
+
 #[cfg(test)]
 mod tests {
     use super::*;

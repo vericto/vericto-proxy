@@ -1271,6 +1271,7 @@ fn mysql_session(
             database,
             client_caps: crate::tcp::codec_mysql::CLIENT_PROTOCOL_41
                 | crate::tcp::codec_mysql::CLIENT_SECURE_CONNECTION,
+            ..Default::default()
         },
     )
 }

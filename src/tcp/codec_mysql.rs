@@ -112,6 +112,97 @@ pub fn read_init_db_name(payload: &[u8]) -> Option<String> {
     (!name.is_empty()).then(|| name.to_string())
 }
 
+/// Connect attributes, key and value, in the order the client sent them.
+pub type ConnectAttrs = Vec<(String, String)>;
+
+/// CLIENT_PLUGIN_AUTH (bit 19): the HandshakeResponse names its auth plugin.
+pub const CLIENT_PLUGIN_AUTH: u32 = 0x0008_0000;
+/// CLIENT_CONNECT_ATTRS (bit 20): the HandshakeResponse carries connect attributes.
+pub const CLIENT_CONNECT_ATTRS: u32 = 0x0010_0000;
+
+/// Where the connect attributes of a HandshakeResponse41 are: the byte range of
+/// the whole block (its length-encoded total length included) and the
+/// key/value pairs. `None` when the response carries none or cannot be read
+/// that far. After the username and the auth data come the database (with
+/// CLIENT_CONNECT_WITH_DB) and the auth plugin name (with CLIENT_PLUGIN_AUTH),
+/// both NUL-terminated, then the attributes.
+pub fn read_connect_attrs(payload: &[u8]) -> Option<(std::ops::Range<usize>, ConnectAttrs)> {
+    let caps = read_client_capabilities(payload)?;
+    if caps & CLIENT_PROTOCOL_41 == 0 || caps & CLIENT_CONNECT_ATTRS == 0 {
+        return None;
+    }
+    let rest = payload.get(32..)?;
+    let rest = rest.get(rest.iter().position(|&b| b == 0)? + 1..)?;
+    let mut rest = skip_auth_data(rest, caps)?;
+    if caps & CLIENT_CONNECT_WITH_DB != 0 {
+        rest = rest.get(rest.iter().position(|&b| b == 0)? + 1..)?;
+    }
+    if caps & CLIENT_PLUGIN_AUTH != 0 {
+        rest = rest.get(rest.iter().position(|&b| b == 0)? + 1..)?;
+    }
+    let start = payload.len() - rest.len();
+    let (total, used) = read_lenenc_int(rest)?;
+    let end = start
+        .checked_add(used)?
+        .checked_add(usize::try_from(total).ok()?)?;
+    let mut block = payload.get(start + used..end)?;
+    let mut pairs = Vec::new();
+    while !block.is_empty() {
+        let (key, rest) = lenenc_str(block)?;
+        let (value, rest) = lenenc_str(rest)?;
+        pairs.push((key, value));
+        block = rest;
+    }
+    Some((start..end, pairs))
+}
+
+/// The HandshakeResponse without the connect attributes `drop` selects: the
+/// attribute block is rebuilt from the pairs kept. `None` when it has no
+/// readable block (forward it as it came).
+pub fn without_connect_attrs(payload: &[u8], drop: impl Fn(&str) -> bool) -> Option<Vec<u8>> {
+    let (range, pairs) = read_connect_attrs(payload)?;
+    let mut block = Vec::new();
+    for (k, v) in pairs.iter().filter(|(k, _)| !drop(k)) {
+        push_lenenc_str(&mut block, k);
+        push_lenenc_str(&mut block, v);
+    }
+    let mut out = payload[..range.start].to_vec();
+    push_lenenc_int(&mut out, block.len() as u64);
+    out.extend_from_slice(&block);
+    out.extend_from_slice(&payload[range.end..]);
+    Some(out)
+}
+
+fn lenenc_str(b: &[u8]) -> Option<(String, &[u8])> {
+    let (len, used) = read_lenenc_int(b)?;
+    let end = used.checked_add(usize::try_from(len).ok()?)?;
+    let s = String::from_utf8_lossy(b.get(used..end)?).into_owned();
+    Some((s, &b[end..]))
+}
+
+fn push_lenenc_int(out: &mut Vec<u8>, v: u64) {
+    match v {
+        0..=0xfa => out.push(v as u8),
+        0xfb..=0xffff => {
+            out.push(0xfc);
+            out.extend_from_slice(&(v as u16).to_le_bytes());
+        }
+        0x1_0000..=0xff_ffff => {
+            out.push(0xfd);
+            out.extend_from_slice(&(v as u32).to_le_bytes()[..3]);
+        }
+        _ => {
+            out.push(0xfe);
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+    }
+}
+
+fn push_lenenc_str(out: &mut Vec<u8>, s: &str) {
+    push_lenenc_int(out, s.len() as u64);
+    out.extend_from_slice(s.as_bytes());
+}
+
 /// Skips the auth data of a HandshakeResponse41 (see [`read_handshake_database`]).
 fn skip_auth_data(rest: &[u8], caps: u32) -> Option<&[u8]> {
     if caps & CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA != 0 {

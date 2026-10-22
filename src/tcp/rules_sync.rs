@@ -59,7 +59,7 @@ pub type SharedTelemetryMode = Arc<ArcSwap<TelemetryQueryMode>>;
 
 #[derive(Debug, Deserialize)]
 struct SyncResponse {
-    #[allow(dead_code)]
+    /// The bundle's version (also its ETag): reported as `policy_bundle_version`.
     version: String,
     rules: Vec<ApiRule>,
     /// Absent when the proxy talks to an older API during the compatibility
@@ -94,6 +94,22 @@ struct SyncResponse {
     /// When the quota resets (RFC 3339), with `telemetry_quota`.
     #[serde(default)]
     telemetry_quota_resets_at: Option<String>,
+    /// The database's principals (business policy rules, contract M2 §2), sent
+    /// only to a proxy that announces `cel/1`. Kept as raw JSON and read
+    /// fail-safe by [`PrincipalMap::from_sync`](crate::tcp::policy_rules::PrincipalMap::from_sync):
+    /// a malformed section is ignored, it never fails the response. Read only
+    /// with `VERICTO_POLICY_RULES` on.
+    #[serde(default)]
+    principals: Option<serde_json::Value>,
+}
+
+/// What the rule sync does for business policy rules: with the mode on it
+/// announces `cel/1` and compiles each synced ruleset into `bundle`; off, it
+/// does neither (the request and its handling are those of 4.14.3).
+#[derive(Clone, Default)]
+pub struct PolicyRulesSync {
+    pub mode: crate::tcp::policy_rules::PolicyRulesMode,
+    pub bundle: crate::tcp::policy_rules::SharedPolicyRules,
 }
 
 /// What a sync says about the monthly quota (see `telemetry::quota`).
@@ -285,6 +301,7 @@ fn apply(
     policy: &SharedPolicy,
     agent_access: &SharedAccessPolicies,
     telemetry_mode: &SharedTelemetryMode,
+    policy_rules: &PolicyRulesSync,
 ) -> Applied {
     let quota = body.quota_word();
     let mode = TelemetryQueryMode::from_api(
@@ -299,7 +316,20 @@ fn apply(
     let access_users = access.0.len();
     let rules: Vec<Rule> = body.rules.into_iter().map(ApiRule::into_rule).collect();
     let count = rules.len();
-    ruleset.store(Arc::new(rules));
+    let rules = Arc::new(rules);
+    if policy_rules.mode.is_on() {
+        // Compiled once here, never per statement; stored with the very rules it
+        // was compiled from.
+        policy_rules
+            .bundle
+            .store(Arc::new(crate::tcp::policy_rules::bundle_from_sync(
+                policy_rules.mode,
+                Arc::clone(&rules),
+                body.principals,
+                &body.version,
+            )));
+    }
+    ruleset.store(rules);
     policy.store(Arc::new(new_policy));
     agent_access.store(Arc::new(access));
     telemetry_mode.store(Arc::new(mode));
@@ -377,12 +407,39 @@ fn apply_proxy_config(
 /// With `stats`, every poll also carries the telemetry pipeline's counters in the
 /// [`STATS_HEADER`](crate::telemetry::heartbeat::STATS_HEADER) header (since
 /// 4.12.0), so the API sees what this proxy delivered and dropped.
-pub async fn run(
+#[cfg(test)]
+async fn run(
     cfg: ControlPlaneConfig,
     ruleset: SharedRuleset,
     policy: SharedPolicy,
     agent_access: SharedAccessPolicies,
     telemetry_mode: SharedTelemetryMode,
+    readiness: Arc<crate::tcp::healthz::Readiness>,
+    stats: Option<crate::telemetry::heartbeat::StatsSource>,
+) {
+    run_with_policy_rules(
+        cfg,
+        ruleset,
+        policy,
+        agent_access,
+        telemetry_mode,
+        PolicyRulesSync::default(),
+        readiness,
+        stats,
+    )
+    .await
+}
+
+/// [`run`] with business policy rules: `policy_rules.mode` on announces
+/// `cel/1` on every request and compiles every applied response.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_with_policy_rules(
+    cfg: ControlPlaneConfig,
+    ruleset: SharedRuleset,
+    policy: SharedPolicy,
+    agent_access: SharedAccessPolicies,
+    telemetry_mode: SharedTelemetryMode,
+    policy_rules: PolicyRulesSync,
     readiness: Arc<crate::tcp::healthz::Readiness>,
     stats: Option<crate::telemetry::heartbeat::StatsSource>,
 ) {
@@ -412,7 +469,14 @@ pub async fn run(
     if let Some(cached) = cache.as_ref().and_then(RulesCache::load) {
         match serde_json::from_str::<SyncResponse>(&cached.body) {
             Ok(body) => {
-                let applied = apply(body, &ruleset, &policy, &agent_access, &telemetry_mode);
+                let applied = apply(
+                    body,
+                    &ruleset,
+                    &policy,
+                    &agent_access,
+                    &telemetry_mode,
+                    &policy_rules,
+                );
                 if let Some(pc) = &applied.proxy_config {
                     apply_proxy_config(pc, &mut sync_interval, &mut ticker);
                 }
@@ -442,6 +506,12 @@ pub async fn run(
                 stats.header_value(),
             );
         }
+        if policy_rules.mode.is_on() {
+            req = req.header(
+                crate::tcp::policy_rules::POLICY_LANGUAGE_HEADER,
+                crate::tcp::policy_rules::POLICY_LANGUAGE,
+            );
+        }
         if let Some(tag) = &etag {
             req = req.header("If-None-Match", tag.clone());
         }
@@ -468,8 +538,14 @@ pub async fn run(
                             .map_err(|e| e.to_string())
                     }) {
                     Ok((text, body)) => {
-                        let applied =
-                            apply(body, &ruleset, &policy, &agent_access, &telemetry_mode);
+                        let applied = apply(
+                            body,
+                            &ruleset,
+                            &policy,
+                            &agent_access,
+                            &telemetry_mode,
+                            &policy_rules,
+                        );
                         if let Some(pc) = &applied.proxy_config {
                             apply_proxy_config(pc, &mut sync_interval, &mut ticker);
                         }
@@ -1013,7 +1089,14 @@ mod tests {
         let access: SharedAccessPolicies =
             Arc::new(ArcSwap::from_pointee(AccessPolicyMap::default()));
         let mode: SharedTelemetryMode = Arc::new(ArcSwap::from_pointee(TelemetryQueryMode::Raw));
-        apply(body, &ruleset, &policy, &access, &mode);
+        apply(
+            body,
+            &ruleset,
+            &policy,
+            &access,
+            &mode,
+            &PolicyRulesSync::default(),
+        );
         ((**policy.load()).clone(), (**access.load()).clone())
     }
 
@@ -1378,5 +1461,117 @@ mod tests {
             AccessMode::Observe
         );
         assert_eq!(restored.for_user("support_agent").unwrap().entries.len(), 3);
+    }
+
+    /// The `policy_language: cel/1` announcement and the principals section
+    /// (4.15.0). Off: no header, nothing compiled, the principals ignored, so
+    /// the request and what it puts in effect are those of 4.14.3. On: the
+    /// header on every request, and the response compiled into the bundle with
+    /// its version. A malformed principals section never fails the sync.
+    #[tokio::test]
+    async fn policy_rules_announce_cel_and_compile_the_bundle_only_when_on() {
+        use crate::config::BufferMode;
+        use crate::tcp::policy_rules::{POLICY_LANGUAGE_HEADER, PolicyRules, PolicyRulesMode};
+        use axum::{Router, http::HeaderMap, routing::get};
+        use std::sync::Mutex;
+
+        const BODY: &str = r#"{"version": "v-cel", "rules": [
+            {"rule_id": "r-refunds", "code": "POL-014", "severity": "high", "rule_type": "custom",
+             "default_action": "block",
+             "ast_condition_yaml": "rule: refund-cap\napplies_to: { ops: [insert], tables: [\"public.refunds\"] }\ndeny_if: stmt.values(\"public.refunds.amount\").exists(v, double(v) > 200.0)\naction: block\n"}
+        ], "principals": {"version": "p1", "entries": [
+            {"id": "bot", "type": "agent", "identify": {"db_user": "support_bot"}}
+        ]}}"#;
+        const MALFORMED: &str =
+            r#"{"version": "v-bad", "rules": [], "principals": {"entries": 7}}"#;
+
+        async fn sync_once(
+            mode: PolicyRulesMode,
+            body: &'static str,
+        ) -> (Vec<Option<String>>, Arc<PolicyRules>, usize) {
+            let seen: Arc<Mutex<Vec<Option<String>>>> = Arc::new(Mutex::new(Vec::new()));
+            let seen_by_api = Arc::clone(&seen);
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let app = Router::new().route(
+                "/api/v1/sync/rules",
+                get(move |headers: HeaderMap| {
+                    let seen = Arc::clone(&seen_by_api);
+                    async move {
+                        seen.lock().unwrap().push(
+                            headers
+                                .get(POLICY_LANGUAGE_HEADER)
+                                .map(|v| v.to_str().unwrap().to_string()),
+                        );
+                        body
+                    }
+                }),
+            );
+            let server = tokio::spawn(async move { axum::serve(listener, app).await });
+            let cfg = ControlPlaneConfig {
+                api_url: format!("http://{addr}"),
+                api_key: "vk_test".into(),
+                database_id: None,
+                rules_sync_interval: Duration::from_secs(3600),
+                rules_cache_path: None,
+                buffer_mode: BufferMode::Memory,
+                disk_spool_path: String::new(),
+                memory_capacity: 10,
+                batch_size: 10,
+                flush_interval: Duration::from_secs(5),
+                spool: crate::config::SpoolTuning::default(),
+                delivery: crate::config::DeliveryTuning::default(),
+            };
+            let ruleset: SharedRuleset = Arc::new(ArcSwap::from_pointee(Vec::new()));
+            let policy_rules = PolicyRulesSync {
+                mode,
+                bundle: Default::default(),
+            };
+            let ready = crate::tcp::healthz::Readiness::new();
+            let sync = tokio::spawn(run_with_policy_rules(
+                cfg,
+                ruleset.clone(),
+                Arc::new(ArcSwap::from_pointee(EnforcementPolicy::default())),
+                Arc::new(ArcSwap::from_pointee(AccessPolicyMap::default())),
+                Arc::new(ArcSwap::from_pointee(TelemetryQueryMode::default())),
+                policy_rules.clone(),
+                ready.clone(),
+                None,
+            ));
+            ready.wait_ready().await;
+            sync.abort();
+            server.abort();
+            let seen = seen.lock().unwrap().clone();
+            (seen, policy_rules.bundle.load_full(), ruleset.load().len())
+        }
+
+        let (headers, bundle, rules) = sync_once(PolicyRulesMode::Off, BODY).await;
+        assert_eq!(headers, vec![None], "off: no announcement");
+        assert_eq!(rules, 1, "the ruleset is applied as always");
+        assert!(bundle.policies.is_empty() && bundle.version.is_none());
+        assert!(bundle.principals.entries.is_empty() && bundle.rules.is_none());
+
+        for mode in [PolicyRulesMode::Observe, PolicyRulesMode::Enforce] {
+            let (headers, bundle, _) = sync_once(mode, BODY).await;
+            assert_eq!(headers, vec![Some("cel/1".to_string())], "{mode:?}");
+            assert_eq!(bundle.policies.len(), 1, "{mode:?}");
+            assert!(
+                bundle.policies.errors().is_empty(),
+                "{:?}",
+                bundle.policies.errors()
+            );
+            assert_eq!(bundle.version.as_deref(), Some("v-cel"));
+            assert_eq!(bundle.principals.entries.len(), 1);
+            assert_eq!(bundle.principals.version.as_deref(), Some("p1"));
+            assert_eq!(bundle.rules.as_ref().map(|r| r.len()), Some(1));
+        }
+
+        let (_, bundle, _) = sync_once(PolicyRulesMode::Enforce, MALFORMED).await;
+        assert_eq!(
+            bundle.version.as_deref(),
+            Some("v-bad"),
+            "the sync was applied"
+        );
+        assert!(bundle.principals.entries.is_empty());
     }
 }

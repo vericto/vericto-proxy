@@ -99,6 +99,46 @@ impl WireProtocol for PostgresProtocol {
         AccessControl::Restricted { label, kind }
     }
 
+    /// CommandComplete `SET` + ReadyForQuery with the transaction status the
+    /// server last reported (`I`, or `T` inside a transaction block).
+    fn build_set_ok(&self, _client_seq: u8, tx: &crate::tcp::tx_state::ServerTxState) -> Vec<u8> {
+        let mut bytes = crate::tcp::codec::PgMessage {
+            tag: b'C',
+            body: b"SET\0".to_vec(),
+        }
+        .encode();
+        bytes.extend_from_slice(&crate::tcp::codec::build_ready_for_query_with(
+            tx.pg_status(),
+        ));
+        bytes
+    }
+
+    /// In a failed transaction block (`E`) the server rejects every command but
+    /// the end of the block with 25P02; the proxy answers the same way for what
+    /// it would otherwise answer itself, and keeps the state `E`.
+    fn build_in_failed_transaction(
+        &self,
+        kind: QueryKind,
+        tx: &crate::tcp::tx_state::ServerTxState,
+    ) -> Option<BlockResponse> {
+        let status = tx.pg_status();
+        if status != crate::tcp::tx_state::PG_FAILED_TRANSACTION {
+            return None;
+        }
+        let mut bytes = build_error_response(
+            crate::tcp::codec::SQLSTATE_IN_FAILED_SQL_TRANSACTION,
+            "current transaction is aborted, commands ignored until end of transaction block",
+        );
+        let skip_until_sync = kind == QueryKind::Prepared;
+        if !skip_until_sync {
+            bytes.extend_from_slice(&crate::tcp::codec::build_ready_for_query_with(status));
+        }
+        Some(BlockResponse {
+            bytes,
+            skip_until_sync,
+        })
+    }
+
     fn build_block_response(&self, ctx: &BlockContext) -> BlockResponse {
         let err = build_error_response(
             SQLSTATE_INSUFFICIENT_PRIVILEGE,
@@ -108,7 +148,12 @@ impl WireProtocol for PostgresProtocol {
             QueryKind::Simple => {
                 // Simple protocol: ErrorResponse + ReadyForQuery, no skip.
                 let mut bytes = err;
-                bytes.extend_from_slice(&build_ready_for_query());
+                match ctx.tx {
+                    Some(tx) => bytes.extend_from_slice(
+                        &crate::tcp::codec::build_ready_for_query_with(tx.pg_status()),
+                    ),
+                    None => bytes.extend_from_slice(&build_ready_for_query()),
+                }
                 BlockResponse {
                     bytes,
                     skip_until_sync: false,

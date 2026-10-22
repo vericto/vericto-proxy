@@ -25,9 +25,9 @@ use tokio::sync::Mutex;
 use vericto_engine::{AccessMode, AccessPolicy, AccessPolicyMap, EnforcementPolicy};
 
 use crate::tcp::client_tls::{ClientRead, ClientWrite};
-use crate::tcp::codec::build_ready_for_query;
 use crate::tcp::evaluator::{
-    SENSITIVE_RULE_CODE, TcpDecision, access_command_decision, evaluate_message,
+    PolicyEval, SENSITIVE_RULE_CODE, TcpDecision, access_command_decision, evaluate_message,
+    evaluate_message_with,
 };
 use crate::tcp::postgres::{EventIdentity, PgProxyConfig};
 use crate::tcp::protocol::mysql::UseTarget;
@@ -62,6 +62,9 @@ use crate::tcp::protocol::{
 pub(crate) struct SessionAccess {
     user: Option<String>,
     database: CurrentDatabase,
+    /// The session's principal and declared context for telemetry, with policy
+    /// rules on (refreshed by the loop before each message); `None` when off.
+    policy_telemetry: Option<Arc<crate::tcp::policy_rules::PolicyTelemetry>>,
     cached: Option<(
         Arc<EnforcementPolicy>,
         Arc<AccessPolicyMap>,
@@ -74,6 +77,7 @@ impl SessionAccess {
         Self {
             user,
             database,
+            policy_telemetry: None,
             cached: None,
         }
     }
@@ -127,6 +131,7 @@ impl SessionAccess {
         EventIdentity {
             db_user: self.user.clone(),
             access_mode: policy.access_policy.as_ref().map(|p| p.mode),
+            policy: self.policy_telemetry.clone(),
         }
     }
 }
@@ -145,6 +150,13 @@ pub struct SessionStart {
     /// MySQL: the client capability flags of the HandshakeResponse (the layout
     /// of a later COM_CHANGE_USER depends on them). 0 on Postgres.
     pub client_caps: u32,
+    /// What the session declared at startup (`vericto.ticket`, `vericto.tenant`,
+    /// `application_name` / `program_name`). Read only with policy rules on.
+    pub declared: crate::tcp::policy_rules::SessionDeclared,
+    /// The transaction state the server last reported, kept by the relay
+    /// (policy rules on; `None` off, and then every reply the proxy writes
+    /// itself says idle, as in 4.14.3).
+    pub tx_state: Option<Arc<crate::tcp::tx_state::ServerTxState>>,
 }
 
 /// The schema unqualified names resolve to in a session, as the proxy knows it.
@@ -281,7 +293,16 @@ pub async fn intercept_client_to_server(
     start: SessionStart,
 ) -> std::io::Result<()> {
     let client_caps = start.client_caps;
+    let tx_state = start.tx_state;
+    // What a consumed `SET vericto.*` reports when no relay tracks the state.
+    let untracked = crate::tcp::tx_state::ServerTxState::new();
     let mut access = SessionAccess::new(start.user, start.database);
+    // Policy rules (4.15.0): `None` with VERICTO_POLICY_RULES=off, and then
+    // nothing below differs from 4.14.3.
+    let policy_mode = config.policy_rules.mode;
+    let mut session_policy = policy_mode
+        .is_on()
+        .then(|| crate::tcp::policy_rules::SessionPolicy::new(start.declared));
 
     // When we block in an extended/prepared sequence, swallow follow-ups until
     // the end-of-sequence marker (Postgres: Sync 'S'). Only the Postgres path
@@ -313,11 +334,31 @@ pub async fn intercept_client_to_server(
 
         if skip_until_sync {
             if is_postgres_sync(&msg) {
-                send_to_client(client_write, &build_ready_for_query()).await?;
+                send_to_client(client_write, &proto.build_sync_reply(tx_state.as_deref())).await?;
                 skip_until_sync = false;
             }
             continue; // swallow the aborted extended sequence
         }
+
+        // MySQL, policy rules on: the relay reads the response to this command
+        // for its status flags (sequence id 0 starts a command).
+        if let (Some(tx), RawClientMessage::Mysql(p)) = (tx_state.as_deref(), &msg)
+            && p.seq == 0
+            && let Some(&command) = p.payload.first()
+        {
+            tx.note_mysql_command(command);
+        }
+
+        // The session's principal against the bundle in force: resolved again
+        // only when a sync swapped the bundle, the user changed or a `SET
+        // vericto.*` declared something; otherwise two pointer compares.
+        let policy_ctx = session_policy.as_mut().map(|sp| {
+            let bundle = config.policy_rules.bundle.load_full();
+            let (ctx, telemetry) =
+                sp.context(access.user.as_deref(), &bundle, &config.policy_rules);
+            access.policy_telemetry = Some(telemetry);
+            (bundle, ctx)
+        });
 
         match proto.classify(&msg) {
             Classified::Terminate => {
@@ -418,6 +459,7 @@ pub async fn intercept_client_to_server(
                             suggested_safe_query: None,
                             kind,
                             client_seq: message_seq(&msg),
+                            tx: tx_state.as_deref(),
                         });
                         send_to_client(client_write, &block.bytes).await?;
                         if block.skip_until_sync {
@@ -429,6 +471,95 @@ pub async fn intercept_client_to_server(
                 forward(server_write, &msg.encode()).await?;
             }
             Classified::Query { sql, kind } => {
+                // `SET vericto.ticket` / `vericto.tenant`: consumed by the proxy,
+                // set once, never forwarded (policy rules on only).
+                if let Some(sp) = session_policy.as_mut() {
+                    use crate::tcp::policy_rules::{
+                        ContextStatement, SESSION_CONTEXT_RULE_CODE, intercept_context_statement,
+                    };
+                    // In a failed transaction block (Postgres `E`) the server would
+                    // refuse the statement with 25P02: so does the proxy, and the
+                    // value is not taken. Other statements go to the server, which
+                    // answers 25P02 itself.
+                    if let Some(reply) = tx_state
+                        .as_deref()
+                        .and_then(|tx| proto.build_in_failed_transaction(kind, tx))
+                    {
+                        let mut probe = sp.declared.clone();
+                        if !matches!(
+                            intercept_context_statement(
+                                &sql,
+                                kind == QueryKind::Prepared,
+                                &mut probe
+                            ),
+                            ContextStatement::NotContext
+                        ) {
+                            send_to_client(client_write, &reply.bytes).await?;
+                            if reply.skip_until_sync {
+                                skip_until_sync = true;
+                            }
+                            continue; // NOT forwarded upstream
+                        }
+                    }
+                    match intercept_context_statement(
+                        &sql,
+                        kind == QueryKind::Prepared,
+                        &mut sp.declared,
+                    ) {
+                        ContextStatement::NotContext => {}
+                        ContextStatement::Consumed => {
+                            tracing::debug!("SET vericto.* consumed by the proxy");
+                            let tx = tx_state.as_deref().unwrap_or(&untracked);
+                            send_to_client(
+                                client_write,
+                                &proto.build_set_ok(message_seq(&msg), tx),
+                            )
+                            .await?;
+                            continue; // NOT forwarded upstream
+                        }
+                        ContextStatement::Blocked(reason) => {
+                            let ast_node_path = format!("SessionContext > {reason}");
+                            let decision = TcpDecision::Block {
+                                rule_code: SESSION_CONTEXT_RULE_CODE.to_string(),
+                                ast_node_path: ast_node_path.clone(),
+                                suggested_safe_query: None,
+                                severity: vericto_engine::Severity::High,
+                                violations: Vec::new(),
+                                sensitive_columns: Vec::new(),
+                                access_denied: Vec::new(),
+                            };
+                            let policy = access.policy(config);
+                            crate::tcp::postgres::report_telemetry(
+                                config,
+                                &sql,
+                                proto.dialect(),
+                                &decision,
+                                0,
+                                &access.identity(&policy),
+                            );
+                            crate::tcp::postgres::log_block(
+                                &sql,
+                                proto.dialect(),
+                                SESSION_CONTEXT_RULE_CODE,
+                                &ast_node_path,
+                            );
+                            let block = proto.build_block_response(&BlockContext {
+                                rule_code: SESSION_CONTEXT_RULE_CODE,
+                                ast_node_path: &ast_node_path,
+                                suggested_safe_query: None,
+                                kind,
+                                client_seq: message_seq(&msg),
+                                tx: tx_state.as_deref(),
+                            });
+                            send_to_client(client_write, &block.bytes).await?;
+                            if block.skip_until_sync {
+                                skip_until_sync = true;
+                            }
+                            continue; // NOT forwarded upstream
+                        }
+                    }
+                }
+
                 // Read the active ruleset/policy lock-free (syncer may swap them).
                 // `load_full` (not `load`) because both cross into the blocking
                 // pool below, which needs owned handles rather than guards. The
@@ -474,6 +605,7 @@ pub async fn intercept_client_to_server(
                             suggested_safe_query: suggested_safe_query.as_deref(),
                             kind,
                             client_seq: message_seq(&msg),
+                            tx: tx_state.as_deref(),
                         });
                         send_to_client(client_write, &block.bytes).await?;
                         if block.skip_until_sync {
@@ -507,7 +639,27 @@ pub async fn intercept_client_to_server(
                     let dialect = proto.dialect();
                     let config = Arc::clone(config);
                     tokio::task::spawn_blocking(move || {
-                        let decision = evaluate_message(&sql, dialect, kind, &rules, &policy);
+                        let decision = match &policy_ctx {
+                            // Policy rules on: the rules the bundle's policies were
+                            // compiled from (the same ruleset once a sync ran).
+                            Some((bundle, ctx)) => {
+                                let ctx = crate::tcp::policy_rules::at_now(ctx);
+                                let rules = bundle.rules.as_ref().unwrap_or(&rules);
+                                evaluate_message_with(
+                                    &sql,
+                                    dialect,
+                                    kind,
+                                    rules,
+                                    &policy,
+                                    Some(&PolicyEval {
+                                        mode: policy_mode,
+                                        policies: &bundle.policies,
+                                        ctx: &ctx,
+                                    }),
+                                )
+                            }
+                            None => evaluate_message(&sql, dialect, kind, &rules, &policy),
+                        };
                         let eval_us = eval_start.elapsed().as_micros();
                         // Telemetry before any forwarding (R5.7): enqueued in memory,
                         // persisted by the background writer, so it costs no I/O here.
@@ -540,6 +692,7 @@ pub async fn intercept_client_to_server(
                         suggested_safe_query: suggested_safe_query.as_deref(),
                         kind,
                         client_seq: message_seq(&msg),
+                        tx: tx_state.as_deref(),
                     });
                     send_to_client(client_write, &block.bytes).await?;
                     if block.skip_until_sync {
@@ -597,6 +750,7 @@ pub async fn intercept_client_to_server(
                         suggested_safe_query: None,
                         kind,
                         client_seq: message_seq(&msg),
+                        tx: tx_state.as_deref(),
                     });
                     send_to_client(client_write, &block.bytes).await?;
                     if block.skip_until_sync {
@@ -754,10 +908,47 @@ async fn run_mysql_session(
     // The user the server authenticates: the session's identity for the
     // agent-access allowlists. The database it names is the session's first
     // current database, which wins over the policy's `default_schema`.
-    let session = SessionStart {
+    let mut session = SessionStart {
         user: mc::read_handshake_username(&client_resp.payload),
         database: CurrentDatabase::from_wire(mc::read_handshake_database(&client_resp.payload)),
         client_caps: mc::read_client_capabilities(&client_resp.payload).unwrap_or(0),
+        declared: Default::default(),
+        // Policy rules on (4.15.0): the relay follows the server status flags.
+        tx_state: config
+            .policy_rules
+            .mode
+            .is_on()
+            .then(|| Arc::new(crate::tcp::tx_state::ServerTxState::new())),
+    };
+    // Policy rules on (4.15.0): `program_name` and the `vericto.*` connect
+    // attributes are read; the `vericto.*` ones are taken out of the response.
+    // One the proxy cannot accept refuses the connection. Off: untouched.
+    let client_resp = if config.policy_rules.mode.is_on() {
+        match mysql_handshake_context(&client_resp.payload) {
+            Ok((payload, declared)) => {
+                session.declared = declared;
+                mc::MySqlPacket {
+                    seq: client_resp.seq,
+                    payload: payload.unwrap_or(client_resp.payload),
+                }
+            }
+            Err(message) => {
+                let err = mc::build_err_packet(
+                    client_resp.seq.wrapping_add(1),
+                    mc::VERICTO_BLOCK_ERR_CODE,
+                    "42000",
+                    &message,
+                );
+                client_write_direct.write_all(&err).await?;
+                client_write_direct.flush().await?;
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "MySQL connect attribute vericto.* refused",
+                ));
+            }
+        }
+    } else {
+        client_resp
     };
     // The server enables compression only if the response asks for it. A client
     // that ignored the greeting and asked anyway does not get it either: its
@@ -822,7 +1013,16 @@ async fn run_mysql_session(
         client_write_direct.write_all(&srv_pkt.encode()).await?;
         client_write_direct.flush().await?;
         match mc::classify_auth_packet(&srv_pkt.payload) {
-            AuthPhase::Ok => break,          // authenticated → command phase
+            AuthPhase::Ok => {
+                // The status flags the session starts with (autocommit, …).
+                if let (Some(tx), Some(flags)) = (
+                    session.tx_state.as_deref(),
+                    crate::tcp::tx_state::ok_status(&srv_pkt.payload),
+                ) {
+                    tx.set_mysql_flags(flags);
+                }
+                break; // authenticated → command phase
+            }
             AuthPhase::Err => return Ok(()), // auth failed; client already notified
             // The server's next packet (the OK after caching_sha2's fast-auth
             // success) is already on its way; the client has nothing to send.
@@ -841,7 +1041,17 @@ async fn run_mysql_session(
 
     // ── Command phase: now the concurrent relay + interception model applies ──
     let client_write = Arc::new(Mutex::new(client_write_direct));
-    let relay_handle = tokio::spawn(relay_upstream_to_client(server_read, client_write.clone()));
+    let relay_tracker = session.tx_state.clone().map(|state| {
+        (
+            crate::tcp::tx_state::MySqlTxTracker::new(session.client_caps),
+            state,
+        )
+    });
+    let relay_handle = tokio::spawn(relay_upstream_to_client(
+        server_read,
+        client_write.clone(),
+        relay_tracker,
+    ));
 
     let result = intercept_client_to_server(
         &proto,
@@ -857,11 +1067,53 @@ async fn run_mysql_session(
     result
 }
 
+/// MySQL, policy rules on: what a HandshakeResponse declares in its connect
+/// attributes (`program_name`, `vericto.ticket`, `vericto.tenant`), and the
+/// response without the `vericto.*` ones (`None`: forward it unchanged). `Err`
+/// with the client message for a `vericto.*` attribute the proxy cannot accept.
+pub(crate) fn mysql_handshake_context(
+    payload: &[u8],
+) -> Result<(Option<Vec<u8>>, crate::tcp::policy_rules::SessionDeclared), String> {
+    use crate::tcp::policy_rules::{
+        MAX_APPLICATION_NAME_CHARS, SESSION_CONTEXT_RULE_CODE, SessionDeclared,
+    };
+    let mut declared = SessionDeclared::default();
+    let Some((_, attrs)) = crate::tcp::codec_mysql::read_connect_attrs(payload) else {
+        return Ok((None, declared));
+    };
+    let is_context = |k: &str| k.to_ascii_lowercase().starts_with("vericto.");
+    for (key, value) in &attrs {
+        if key == "program_name" {
+            declared.application_name =
+                Some(value.chars().take(MAX_APPLICATION_NAME_CHARS).collect());
+        } else if is_context(key) {
+            declared.set_from_startup(key, value).map_err(|reason| {
+                crate::tcp::protocol::mysql::block_message(
+                    SESSION_CONTEXT_RULE_CODE,
+                    &format!("{reason} (connect attribute {key})"),
+                    None,
+                )
+            })?;
+        }
+    }
+    let stripped = attrs
+        .iter()
+        .any(|(k, _)| is_context(k))
+        .then(|| crate::tcp::codec_mysql::without_connect_attrs(payload, is_context))
+        .flatten();
+    Ok((stripped, declared))
+}
+
 /// Relays bytes from the upstream to the client without intercepting. Generic
 /// over any boxed upstream read half (shared by the MySQL session).
-async fn relay_upstream_to_client(
+pub(crate) async fn relay_upstream_to_client(
     mut server_read: crate::tcp::upstream::UpstreamRead,
     client_write: Arc<Mutex<ClientWrite>>,
+    // Policy rules on: follows the server status flags (see `tx_state`).
+    mut tracker: Option<(
+        crate::tcp::tx_state::MySqlTxTracker,
+        Arc<crate::tcp::tx_state::ServerTxState>,
+    )>,
 ) {
     use tokio::io::AsyncReadExt;
     let mut buf = vec![0u8; 16 * 1024];
@@ -869,6 +1121,9 @@ async fn relay_upstream_to_client(
         match server_read.read(&mut buf).await {
             Ok(0) => break, // upstream closed
             Ok(n) => {
+                if let Some((t, state)) = tracker.as_mut() {
+                    t.feed(&buf[..n], state);
+                }
                 let mut writer = client_write.lock().await;
                 if writer.write_all(&buf[..n]).await.is_err() || writer.flush().await.is_err() {
                     break;

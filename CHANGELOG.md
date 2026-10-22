@@ -7,6 +7,94 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [4.15.0] — 2026-10-21
+
+**Business policy rules, behind `VERICTO_POLICY_RULES` (default `off`).** With the
+flag off the proxy behaves exactly as 4.14.3: same rule-sync request, same bytes to
+the database, same verdicts, same telemetry. This is a preview for the business
+policy rules milestone M2; nothing turns it on by itself.
+
+### Added
+
+- **`VERICTO_POLICY_RULES=off|observe|enforce`**, any case; unset or empty is `off`,
+  and any other value fails startup (as `VERICTO_TELEMETRY_BUFFER` does), so a typo
+  can neither leave enforcement off nor turn it on silently.
+- **Policy bundle compiled at sync.** With the flag on, every `GET /sync/rules`
+  carries `X-Vericto-Policy-Language: cel/1`, and each applied response (the rules
+  cache included) is compiled once with the engine's `PolicySet::compile` into an
+  `ArcSwap`, together with the very rules it was compiled from and the response's
+  `version` (reported as `policy_bundle_version`). A policy that does not compile
+  is logged and fails closed in its scope (engine behaviour).
+- **Principals.** The `principals` section of `/sync/rules` (identify: `db_user`,
+  `db_user_pattern` with medium trust, `application_name`, `listener` with weak
+  trust; `narrow`; `attrs`; `{db_user}` templates) is resolved once per session,
+  and again only when a sync swaps the bundle or a MySQL COM_CHANGE_USER changes the
+  user. The strongest identifying signal wins; narrowing must also match and never
+  raises trust; two principals at the same top trust are ambiguous and the session
+  is `unknown` with `weak` trust, as is a session nothing matches. A malformed
+  section, or entry, is ignored with a warning and never fails the sync.
+- **Session signals.** Postgres `application_name` (StartupMessage parameter or
+  `-c application_name=` in `options`), MySQL `program_name` (connect attributes),
+  and the listener (the address the proxy binds). No client address is captured:
+  `session.client_ip` is left unset.
+- **Session context: `vericto.ticket` and `vericto.tenant`.** From the Postgres
+  StartupMessage (`-c vericto.ticket=…` / `--vericto.ticket=…` in `options`, or a
+  `vericto.*` parameter), from MySQL connect attributes, or from `SET [SESSION]
+  vericto.ticket {= | TO} '…'` sent on its own as a simple query. The proxy consumes
+  them and never forwards them: the StartupMessage and the HandshakeResponse reach
+  the database without them, and a `SET` is answered by the proxy (CommandComplete
+  `SET` + ReadyForQuery, or an OK_Packet) carrying the session's real transaction
+  state: the relay follows the last ReadyForQuery status (`I`, `T`, `E`) and the
+  last MySQL OK/EOF status flags (`SERVER_STATUS_IN_TRANS`, autocommit), so the
+  proxy's own replies (a consumed `SET`, a refusal, the Sync that ends a refused
+  extended sequence) report what the server reported last. In a failed
+  Postgres transaction block (`E`) a `SET vericto.*`, simple or extended, gets
+  25P02 as the server would answer it, and its value is not taken. MySQL has no
+  failed-transaction state, so it has no equivalent. Each key is set once per session: a
+  second `SET`, a `RESET`, `SET … TO DEFAULT` or a `set_config` of a key already
+  set, any other `vericto.*` name, `SET LOCAL`, and a `SET vericto.*` sent as a
+  prepared statement or among other statements, are blocked with
+  `VERICTO-SESSION-CONTEXT` (and reported). A startup setting the proxy cannot
+  accept refuses the connection before it reaches the database. Values are 1 to
+  128 characters without control characters.
+- **Evaluation with context.** With the flag on, each statement is evaluated with
+  the engine's `evaluate_with_context` (mode `proxy`, the principal, `db.id`, the
+  time in UTC, the ticket, the tenant, `application_name` and the listener).
+  `enforce`: the policies decide with the rest of the rules, including the engine's
+  block of a statement it cannot read when an enforced blocking policy may apply.
+  `observe`: the verdict is the one `evaluate()` gives; what the policies found is
+  added to the event, every block lowered to a flag, so a statement only a policy
+  would have blocked is forwarded and reported `FLAGGED`. In `observe` a bundle
+  with policies costs a second evaluation per statement. An empty policy set costs
+  nothing over 4.14.3 in either mode (the engine short-cuts it).
+- **Telemetry fields**, only with the flag on: `principal_id`, `principal_type`,
+  `principal_trust`, `principal_via`, `application_name`, `policy_bundle_version`,
+  `ticket_id` and `session_tenant`. No client address.
+- `docs/CONFIGURATION.md` ("Business policy rules"), `.env.example` and the README
+  document the flag.
+
+### Security
+
+- **rustls-webpki 0.103.15 → 0.103.16** (RUSTSEC-2026-0382, certificate verification
+  may accept distrusted intermediates) and **webpki-roots 1.0.8 → 1.0.10**
+  (RUSTSEC-2026-0381, bundled roots allowed distrusted emSign intermediates). Both
+  advisories were published on 2026-10-19 and also affect 4.14.3, whose CI
+  supply-chain job now fails on them. Lockfile only: these are the TLS
+  verification of the upstream (`UPSTREAM_SSLMODE=verify-*`) and control-plane hops.
+
+### Changed
+
+- **vericto-engine 4.3.0 → 4.4.0** (business policies, CEL in custom rules). Its
+  `evaluate()` keeps the 4.3.0 contract, so with the flag off no verdict changes.
+  `pg_query` 6.2 and `sqlparser` 0.63 stay aligned with the engine. The engine adds
+  `regex`, already in the lockfile.
+- README: the quickstart and Docker examples use `vericto/vericto-proxy:4.15.0`.
+
+### Not yet verified
+
+- The BENCH quick suite (features off within the 95% interval of 4.14.3) has not
+  been run for this release: the proxy repository has no local benchmark.
+
 ## [4.14.3] — 2026-10-19
 
 **The default log level is now `info`, as documented.** No other behaviour change.

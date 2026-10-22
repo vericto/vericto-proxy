@@ -12,10 +12,12 @@ pub mod codec;
 pub mod codec_mysql;
 pub mod evaluator;
 pub mod healthz;
+pub mod policy_rules;
 pub mod postgres;
 pub mod protocol;
 pub mod query_limit;
 pub mod session;
+pub mod tx_state;
 pub mod upstream;
 
 use std::sync::Arc;
@@ -23,10 +25,28 @@ use std::sync::Arc;
 use tokio::net::TcpListener;
 
 use crate::tcp::client_tls::ClientTlsMode;
+use crate::tcp::policy_rules::{PolicyRulesRuntime, SharedPolicyRules};
 use crate::tcp::postgres::{PgProxyConfig, TelemetrySink, handle_connection};
 use crate::tcp::rules_sync::{
     SharedAccessPolicies, SharedPolicy, SharedRuleset, SharedTelemetryMode,
 };
+
+/// The policy-rules part of the proxy config: the mode, the shared bundle, and
+/// the listener sessions arrive on (the address the proxy binds).
+fn policy_runtime(opts: &TcpProxyOptions, bundle: SharedPolicyRules) -> PolicyRulesRuntime {
+    if opts.policy_rules.is_on() {
+        tracing::info!(
+            mode = opts.policy_rules.as_str(),
+            "Business policy rules are on (VERICTO_POLICY_RULES)"
+        );
+    }
+    PolicyRulesRuntime {
+        mode: opts.policy_rules,
+        bundle,
+        listener: format!("0.0.0.0:{}", opts.listen_port),
+        database_id: opts.database_id.clone(),
+    }
+}
 
 pub mod client_tls;
 
@@ -55,6 +75,8 @@ pub struct TcpProxyOptions {
     /// a separate listener answers probes without touching the upstream. `None`
     /// disables it (the default; e.g. dev, or when the LB probes the traffic port).
     pub healthz_port: Option<u16>,
+    /// `VERICTO_POLICY_RULES=off|observe|enforce` (default off, since 4.15.0).
+    pub policy_rules: crate::tcp::policy_rules::PolicyRulesMode,
 }
 
 impl TcpProxyOptions {
@@ -112,6 +134,10 @@ impl TcpProxyOptions {
             client_tls_key: env("PROXY_TLS_KEY"),
             // Dedicated health-check port (opt-in). Ignored if unparseable.
             healthz_port: env("VERICTO_HEALTHZ_PORT").and_then(|v| v.parse().ok()),
+            // Business policy rules; an unsupported value fails startup.
+            policy_rules: crate::tcp::policy_rules::PolicyRulesMode::parse(
+                env("VERICTO_POLICY_RULES").as_deref(),
+            )?,
         }))
     }
 }
@@ -126,6 +152,7 @@ pub async fn run_pg_proxy(
     policy: SharedPolicy,
     agent_access: SharedAccessPolicies,
     telemetry_mode: SharedTelemetryMode,
+    policy_rules: SharedPolicyRules,
     telemetry: Option<TelemetrySink>,
 ) -> std::io::Result<()> {
     // Resolve client→proxy TLS once at startup. Fail fast if require mode is set
@@ -179,6 +206,7 @@ pub async fn run_pg_proxy(
             query_limit::configured_max_query_bytes(),
             vericto_engine::Dialect::Postgres,
         ),
+        policy_rules: policy_runtime(&opts, policy_rules),
     });
 
     let addr = format!("0.0.0.0:{}", opts.listen_port);
@@ -219,6 +247,7 @@ pub async fn run_mysql_proxy(
     policy: SharedPolicy,
     agent_access: SharedAccessPolicies,
     telemetry_mode: SharedTelemetryMode,
+    policy_rules: SharedPolicyRules,
     telemetry: Option<TelemetrySink>,
 ) -> std::io::Result<()> {
     // Optional client→proxy TLS acceptor (same as the PG path).
@@ -268,6 +297,7 @@ pub async fn run_mysql_proxy(
             query_limit::configured_max_query_bytes(),
             vericto_engine::Dialect::Mysql,
         ),
+        policy_rules: policy_runtime(&opts, policy_rules),
     });
 
     let addr = format!("0.0.0.0:{}", opts.listen_port);
@@ -302,6 +332,8 @@ pub mod rules_sync;
 mod access_tests;
 #[cfg(test)]
 mod mysql_auth_tests;
+#[cfg(test)]
+mod policy_rules_tests;
 #[cfg(test)]
 mod sensitive_tests;
 #[cfg(test)]
@@ -470,8 +502,13 @@ mod tests {
         let (rules, policy, access, mode) = shared();
         let run = async {
             match protocol {
-                "mysql" => run_mysql_proxy(opts, rules, policy, access, mode, None).await,
-                _ => run_pg_proxy(opts, rules, policy, access, mode, None).await,
+                "mysql" => {
+                    run_mysql_proxy(opts, rules, policy, access, mode, Default::default(), None)
+                        .await
+                }
+                _ => {
+                    run_pg_proxy(opts, rules, policy, access, mode, Default::default(), None).await
+                }
             }
         };
         tokio::time::timeout(std::time::Duration::from_secs(5), run)
