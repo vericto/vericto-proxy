@@ -117,6 +117,36 @@ pub struct TelemetryEvent {
     /// lists it (engine contract §3.2). Names only. Omitted when nothing was.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub access_denied: Vec<AccessDeniedPayload>,
+    // ── Business policy rules (4.15.0), only with VERICTO_POLICY_RULES on ──────
+    // Every one is omitted when the flag is off, so an event is then exactly what
+    // 4.14.3 sent. Names and declared context, not query data: sent in
+    // sanitized mode too. There is deliberately no client address among them.
+    /// The session's principal (the `principals` section of `/sync/rules`): its
+    /// id, or the database user when no principal (or more than one) matched.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub principal_id: Option<String>,
+    /// agent | service | human | pipeline | tool | unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub principal_type: Option<String>,
+    /// weak | medium | strong: the trust of the signal that identified it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub principal_trust: Option<String>,
+    /// The signal that identified it (db_user, db_user_pattern,
+    /// application_name, listener); omitted for an unmatched or ambiguous one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub principal_via: Option<String>,
+    /// Postgres `application_name`, MySQL `program_name` connect attribute.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub application_name: Option<String>,
+    /// The `version` of the `/sync/rules` response whose policies evaluated it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy_bundle_version: Option<String>,
+    /// The session's `vericto.ticket` (declared, not verified).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ticket_id: Option<String>,
+    /// The session's `vericto.tenant`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_tenant: Option<String>,
 }
 
 /// One reference an agent-access allowlist denied, shaped for the ingest schema:
@@ -452,6 +482,14 @@ mod tests {
             db_user: None,
             access_policy_mode: None,
             access_denied: Vec::new(),
+            principal_id: None,
+            principal_type: None,
+            principal_trust: None,
+            principal_via: None,
+            application_name: None,
+            policy_bundle_version: None,
+            ticket_id: None,
+            session_tenant: None,
         }
     }
 

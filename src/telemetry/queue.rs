@@ -1454,6 +1454,14 @@ mod tests {
             db_user: None,
             access_policy_mode: None,
             access_denied: Vec::new(),
+            principal_id: None,
+            principal_type: None,
+            principal_trust: None,
+            principal_via: None,
+            application_name: None,
+            policy_bundle_version: None,
+            ticket_id: None,
+            session_tenant: None,
         }
     }
 

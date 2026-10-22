@@ -90,6 +90,13 @@ async fn main() {
     let telemetry_mode: SharedTelemetryMode =
         Arc::new(ArcSwap::from_pointee(TelemetryQueryMode::default()));
 
+    // Business policy rules (VERICTO_POLICY_RULES, default off, since 4.15.0):
+    // the principals and policies of the last sync. Empty until one arrives,
+    // and never filled with the flag off.
+    let policy_rules: tcp::policy_rules::SharedPolicyRules = Arc::new(ArcSwap::from_pointee(
+        tcp::policy_rules::PolicyRules::default(),
+    ));
+
     // Readiness signal for the health-check listener: not-ready until warm-up
     // completes. When the control-plane link is enabled, the syncer flips it
     // after its first sync attempt; when disabled, we're ready immediately (the
@@ -218,13 +225,18 @@ async fn main() {
             let sync_agent_access = agent_access.clone();
             let sync_telemetry_mode = telemetry_mode.clone();
             let sync_readiness = readiness.clone();
+            let sync_policy_rules = crate::tcp::rules_sync::PolicyRulesSync {
+                mode: tcp_opts.policy_rules,
+                bundle: policy_rules.clone(),
+            };
             tokio::spawn(async move {
-                crate::tcp::rules_sync::run(
+                crate::tcp::rules_sync::run_with_policy_rules(
                     sync_cfg,
                     sync_ruleset,
                     sync_policy,
                     sync_agent_access,
                     sync_telemetry_mode,
+                    sync_policy_rules,
                     sync_readiness,
                     Some(sync_stats),
                 )
@@ -317,6 +329,7 @@ async fn main() {
                     policy,
                     agent_access,
                     telemetry_mode,
+                    policy_rules,
                     telemetry_sink,
                 )
                 .await
@@ -328,6 +341,7 @@ async fn main() {
                     policy,
                     agent_access,
                     telemetry_mode,
+                    policy_rules,
                     telemetry_sink,
                 )
                 .await

@@ -63,6 +63,9 @@ pub struct PgProxyConfig {
     /// Largest query this proxy will evaluate, already clamped to what the wire
     /// protocol can deliver. Resolved once at startup — see `tcp::query_limit`.
     pub max_query_bytes: usize,
+    /// Business policy rules (`VERICTO_POLICY_RULES`, default off): the mode,
+    /// the synced principals and compiled policies, the listener (since 4.15.0).
+    pub policy_rules: crate::tcp::policy_rules::PolicyRulesRuntime,
 }
 
 /// Where the TCP proxy pushes evaluation telemetry (non-blocking).
@@ -92,6 +95,31 @@ async fn run_session(client: TcpStream, config: Arc<PgProxyConfig>) -> std::io::
     let (mut client_read, mut client_write, startup_raw, startup) =
         negotiate_startup(client, config.client_tls_acceptor.as_ref()).await?;
     let session_user = startup.user;
+
+    // Policy rules on (4.15.0): the `vericto.*` settings and `application_name`
+    // are taken out of the StartupMessage; the `vericto.*` ones never reach the
+    // database. A setting the proxy cannot accept refuses the connection. Off:
+    // the StartupMessage is forwarded exactly as it came.
+    let (startup_raw, declared) = if config.policy_rules.mode.is_on() {
+        match startup_context(&startup_raw) {
+            Ok(v) => v,
+            Err(message) => {
+                client_write
+                    .write_all(&crate::tcp::codec::build_error_response(
+                        crate::tcp::codec::SQLSTATE_INSUFFICIENT_PRIVILEGE,
+                        &message,
+                    ))
+                    .await?;
+                client_write.flush().await?;
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "StartupMessage vericto.* setting refused",
+                ));
+            }
+        }
+    } else {
+        (startup_raw, Default::default())
+    };
 
     // `search_path` (and the identity settings) set by the StartupMessage are
     // the `SET` the engine denies under an allowlist: evaluated as that `SET`,
@@ -165,11 +193,20 @@ async fn run_session(client: TcpStream, config: Arc<PgProxyConfig>) -> std::io::
     // corrupt the protocol; before then we can still surface a typed error.
     let relay_wrote = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
+    // Policy rules on (4.15.0): the relay also follows the ReadyForQuery status,
+    // so the replies the proxy writes itself carry the real transaction state.
+    let tx_state = config
+        .policy_rules
+        .mode
+        .is_on()
+        .then(|| Arc::new(crate::tcp::tx_state::ServerTxState::new()));
+
     // Relay server→client (auth, data, notices) without intercepting.
     let relay_handle = tokio::spawn(relay_server_to_client(
         server_read,
         client_write.clone(),
         relay_wrote.clone(),
+        tx_state.clone(),
     ));
 
     // ── Phase 4: client→server interception loop
@@ -184,7 +221,7 @@ async fn run_session(client: TcpStream, config: Arc<PgProxyConfig>) -> std::io::
     // function's futures closes the sockets, unwinding the client side too.
     let mut relay_handle = relay_handle;
     let result = tokio::select! {
-        r = intercept_client_to_server(&mut client_read, &mut server_write, &client_write, &config, session_user) => {
+        r = intercept_client_to_server(&mut client_read, &mut server_write, &client_write, &config, session_user, declared, tx_state) => {
             // Client ended or a block/forward error unwound the loop: stop the relay.
             relay_handle.abort();
             r
@@ -211,6 +248,33 @@ async fn run_session(client: TcpStream, config: Arc<PgProxyConfig>) -> std::io::
     };
 
     result
+}
+
+/// The StartupMessage to forward and what the session declared in it, with
+/// policy rules on; `Err` with the client message when a `vericto.*` setting is
+/// not one the proxy accepts. A message that cannot be read as pairs is
+/// forwarded as it came (the server refuses it) with nothing declared.
+pub(crate) fn startup_context(
+    raw: &[u8],
+) -> Result<(Vec<u8>, crate::tcp::policy_rules::SessionDeclared), String> {
+    use crate::tcp::policy_rules::{SESSION_CONTEXT_RULE_CODE, SessionDeclared, strip_startup};
+    let Some(ctx) = strip_startup(raw) else {
+        return Ok((raw.to_vec(), SessionDeclared::default()));
+    };
+    let mut declared = SessionDeclared {
+        application_name: ctx.application_name,
+        ..Default::default()
+    };
+    for (name, value) in &ctx.settings {
+        declared.set_from_startup(name, value).map_err(|reason| {
+            crate::tcp::protocol::postgres::block_message(
+                SESSION_CONTEXT_RULE_CODE,
+                &format!("{reason} (StartupMessage {name})"),
+                None,
+            )
+        })?;
+    }
+    Ok((ctx.raw, declared))
 }
 
 /// Negotiates the startup phase and returns the client transport halves, the
@@ -310,16 +374,23 @@ async fn read_startup_message<R: AsyncRead + Unpin>(
 /// whether it is still safe to inject a native `ErrorResponse`: once server
 /// bytes have reached the client (auth/rows in flight), injecting one would
 /// corrupt the protocol stream, so it must fall back to a plain close.
-async fn relay_server_to_client(
+pub(crate) async fn relay_server_to_client(
     mut server_read: crate::tcp::upstream::UpstreamRead,
     client_write: Arc<Mutex<ClientWrite>>,
     wrote_any: Arc<std::sync::atomic::AtomicBool>,
+    tx_state: Option<Arc<crate::tcp::tx_state::ServerTxState>>,
 ) {
     let mut buf = vec![0u8; 16 * 1024];
+    let mut tracker = tx_state.map(|s| (crate::tcp::tx_state::PgTxTracker::new(), s));
     loop {
         match server_read.read(&mut buf).await {
             Ok(0) => break, // upstream closed
             Ok(n) => {
+                // Before the bytes reach the client: its next message then sees
+                // the state they carry.
+                if let Some((t, state)) = tracker.as_mut() {
+                    t.feed(&buf[..n], state);
+                }
                 let mut writer = client_write.lock().await;
                 if writer.write_all(&buf[..n]).await.is_err() || writer.flush().await.is_err() {
                     break;
@@ -342,6 +413,8 @@ async fn intercept_client_to_server(
     client_write: &Arc<Mutex<ClientWrite>>,
     config: &Arc<PgProxyConfig>,
     session_user: Option<String>,
+    declared: crate::tcp::policy_rules::SessionDeclared,
+    tx_state: Option<Arc<crate::tcp::tx_state::ServerTxState>>,
 ) -> std::io::Result<()> {
     let proto = crate::tcp::protocol::postgres::PostgresProtocol;
     crate::tcp::session::intercept_client_to_server(
@@ -352,6 +425,8 @@ async fn intercept_client_to_server(
         config,
         crate::tcp::session::SessionStart {
             user: session_user,
+            declared,
+            tx_state,
             ..Default::default()
         },
     )
@@ -398,6 +473,9 @@ fn dialect_name(dialect: Dialect) -> &'static str {
 pub struct EventIdentity {
     pub db_user: Option<String>,
     pub access_mode: Option<vericto_engine::AccessMode>,
+    /// The session's principal and declared context, only with
+    /// `VERICTO_POLICY_RULES` on (since 4.15.0).
+    pub policy: Option<Arc<crate::tcp::policy_rules::PolicyTelemetry>>,
 }
 
 /// [`build_event`] in raw mode, for the tests that only exercise the mapping.
@@ -629,7 +707,23 @@ fn build_event(
             vericto_engine::AccessMode::Enforce => "enforce".to_string(),
         }),
         access_denied: redaction.payload(),
+        principal_id: policy_field(identity, |p| &p.principal_id),
+        principal_type: policy_field(identity, |p| &p.principal_type),
+        principal_trust: policy_field(identity, |p| &p.principal_trust),
+        principal_via: policy_field(identity, |p| &p.principal_via),
+        application_name: policy_field(identity, |p| &p.application_name),
+        policy_bundle_version: policy_field(identity, |p| &p.policy_bundle_version),
+        ticket_id: policy_field(identity, |p| &p.ticket_id),
+        session_tenant: policy_field(identity, |p| &p.session_tenant),
     }
+}
+
+/// One policy field of an event's identity; `None` with policy rules off.
+fn policy_field(
+    identity: &EventIdentity,
+    field: impl Fn(&crate::tcp::policy_rules::PolicyTelemetry) -> &Option<String>,
+) -> Option<String> {
+    identity.policy.as_deref().and_then(|p| field(p).clone())
 }
 
 /// The VERICTO-087 denials of an event, made safe to report.
@@ -918,6 +1012,7 @@ mod tests {
         let identity = EventIdentity {
             db_user: Some("app_rw".to_string()),
             access_mode: None,
+            policy: None,
         };
         let database_id = uuid::Uuid::new_v4().to_string();
         let mut total = 0usize;
@@ -1587,6 +1682,7 @@ mod tests {
             )),
             telemetry: None,
             max_query_bytes: crate::tcp::query_limit::DEFAULT_MAX_QUERY_BYTES,
+            policy_rules: Default::default(),
         })
     }
 

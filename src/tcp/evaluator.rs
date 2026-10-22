@@ -13,6 +13,9 @@ use vericto_engine::{
     SensitivePolicy, Severity, TouchedColumn,
 };
 
+use vericto_engine::policy::{EvalContext, PolicySet};
+
+use crate::tcp::policy_rules::PolicyRulesMode;
 use crate::tcp::protocol::QueryKind;
 
 /// Rule code of every sensitive-column outcome (engine contract §3.1), including
@@ -167,50 +170,11 @@ pub fn evaluate(
 ) -> TcpDecision {
     let parser = parser_for(dialect);
     match parser.parse(sql) {
-        Ok(parsed) => {
-            let outcome = RuleEngine::evaluate(&parsed, rules, policy);
-            if outcome.decision != Decision::Block
-                && let Some(reason) = rewrite_inconsistency(&outcome, dialect, policy)
-            {
-                tracing::error!(
-                    reason,
-                    "sensitive-column outcome is inconsistent; blocking rather than forwarding"
-                );
-                return TcpDecision::sensitive_block(
-                    reason,
-                    outcome.violations,
-                    outcome.sensitive_columns,
-                    outcome.access_denied,
-                );
-            }
-            match outcome.decision {
-                Decision::Block => TcpDecision::Block {
-                    rule_code: outcome.rule_code.unwrap_or_else(|| "VERICTO".to_string()),
-                    ast_node_path: outcome.ast_node_path.unwrap_or_default(),
-                    suggested_safe_query: outcome.suggested_safe_query,
-                    severity: outcome.severity.unwrap_or(Severity::Critical),
-                    violations: outcome.violations,
-                    sensitive_columns: outcome.sensitive_columns,
-                    access_denied: outcome.access_denied,
-                },
-                Decision::Flag | Decision::Allow => TcpDecision::Forward {
-                    observation: outcome.action.map(|action| Observation {
-                        rule_code: outcome
-                            .rule_code
-                            .clone()
-                            .unwrap_or_else(|| "VERICTO".to_string()),
-                        ast_node_path: outcome.ast_node_path.clone().unwrap_or_default(),
-                        severity: outcome.severity.unwrap_or(Severity::Medium),
-                        action,
-                        parse_error: None,
-                    }),
-                    violations: outcome.violations,
-                    rewritten_query: outcome.rewritten_query,
-                    sensitive_columns: outcome.sensitive_columns,
-                    access_denied: outcome.access_denied,
-                },
-            }
-        }
+        Ok(parsed) => decide(
+            RuleEngine::evaluate(&parsed, rules, policy),
+            dialect,
+            policy,
+        ),
         // `effective_parse_error`, not the raw `parse_error`: with a `block` or
         // `mask` tag configured a query the engine cannot read cannot be shown not
         // to read the column, so it blocks whatever the workspace chose (engine
@@ -250,6 +214,54 @@ pub fn evaluate(
     }
 }
 
+/// The decision for an engine outcome of a statement that parsed: a block
+/// blocks; anything else forwards, with the engine's rewrite when a mask
+/// applied, unless the outcome does not hold together (see
+/// [`rewrite_inconsistency`]), which blocks.
+fn decide(outcome: EvaluationOutcome, dialect: Dialect, policy: &EnforcementPolicy) -> TcpDecision {
+    if outcome.decision != Decision::Block
+        && let Some(reason) = rewrite_inconsistency(&outcome, dialect, policy)
+    {
+        tracing::error!(
+            reason,
+            "sensitive-column outcome is inconsistent; blocking rather than forwarding"
+        );
+        return TcpDecision::sensitive_block(
+            reason,
+            outcome.violations,
+            outcome.sensitive_columns,
+            outcome.access_denied,
+        );
+    }
+    match outcome.decision {
+        Decision::Block => TcpDecision::Block {
+            rule_code: outcome.rule_code.unwrap_or_else(|| "VERICTO".to_string()),
+            ast_node_path: outcome.ast_node_path.unwrap_or_default(),
+            suggested_safe_query: outcome.suggested_safe_query,
+            severity: outcome.severity.unwrap_or(Severity::Critical),
+            violations: outcome.violations,
+            sensitive_columns: outcome.sensitive_columns,
+            access_denied: outcome.access_denied,
+        },
+        Decision::Flag | Decision::Allow => TcpDecision::Forward {
+            observation: outcome.action.map(|action| Observation {
+                rule_code: outcome
+                    .rule_code
+                    .clone()
+                    .unwrap_or_else(|| "VERICTO".to_string()),
+                ast_node_path: outcome.ast_node_path.clone().unwrap_or_default(),
+                severity: outcome.severity.unwrap_or(Severity::Medium),
+                action,
+                parse_error: None,
+            }),
+            violations: outcome.violations,
+            rewritten_query: outcome.rewritten_query,
+            sensitive_columns: outcome.sensitive_columns,
+            access_denied: outcome.access_denied,
+        },
+    }
+}
+
 /// [`evaluate`], plus the checks that depend on how the query arrived.
 ///
 /// A prepared statement (Postgres `Parse`, MySQL `COM_STMT_PREPARE`) is
@@ -269,6 +281,195 @@ pub fn evaluate_message(
     policy: &EnforcementPolicy,
 ) -> TcpDecision {
     checked_for_kind(evaluate(sql, dialect, rules, policy), sql, dialect, kind)
+}
+
+/// What a statement is evaluated with when `VERICTO_POLICY_RULES` is on.
+pub struct PolicyEval<'a> {
+    pub mode: PolicyRulesMode,
+    pub policies: &'a PolicySet,
+    pub ctx: &'a EvalContext,
+}
+
+/// [`evaluate_message`] with the business policies.
+///
+/// `None`, `off` or an empty policy set: exactly [`evaluate_message`] (an
+/// empty set is what `evaluate_with_context` itself short-cuts to).
+/// `enforce`: the engine's `evaluate_with_context` decides, including the
+/// parse-error block it forces when an enforced blocking policy may apply.
+/// `observe`: the verdict is [`evaluate`]'s, and what the policies found is
+/// added to it as flags (see [`observed`]).
+pub fn evaluate_message_with(
+    sql: &str,
+    dialect: Dialect,
+    kind: QueryKind,
+    rules: &[Rule],
+    policy: &EnforcementPolicy,
+    policies: Option<&PolicyEval<'_>>,
+) -> TcpDecision {
+    let decision = match policies {
+        Some(pe) if pe.mode.is_on() && !pe.policies.is_empty() => {
+            let outcome = vericto_engine::evaluate_with_context(
+                sql,
+                dialect,
+                rules,
+                policy,
+                pe.policies,
+                pe.ctx,
+            );
+            match pe.mode {
+                PolicyRulesMode::Enforce => from_outcome(outcome, dialect, policy),
+                _ => observed(evaluate(sql, dialect, rules, policy), outcome, pe.policies),
+            }
+        }
+        _ => evaluate(sql, dialect, rules, policy),
+    };
+    checked_for_kind(decision, sql, dialect, kind)
+}
+
+/// The decision for any outcome of `evaluate_with_context`, a parse error
+/// included (the engine reports it as `VERICTO-PARSE-ERROR`, Block or Flag).
+fn from_outcome(
+    outcome: EvaluationOutcome,
+    dialect: Dialect,
+    policy: &EnforcementPolicy,
+) -> TcpDecision {
+    if outcome.parse_error_kind().is_none() {
+        return decide(outcome, dialect, policy);
+    }
+    let path = outcome.ast_node_path.unwrap_or_default();
+    let message = path
+        .strip_prefix("PARSE_ERROR: ")
+        .unwrap_or(&path)
+        .to_string();
+    if outcome.decision == Decision::Block {
+        TcpDecision::Block {
+            rule_code: "VERICTO-PARSE-ERROR".to_string(),
+            ast_node_path: path,
+            suggested_safe_query: None,
+            severity: Severity::Medium,
+            violations: Vec::new(),
+            sensitive_columns: Vec::new(),
+            access_denied: Vec::new(),
+        }
+    } else {
+        TcpDecision::Forward {
+            violations: Vec::new(),
+            observation: Some(Observation {
+                rule_code: "VERICTO-PARSE-ERROR".to_string(),
+                ast_node_path: path,
+                severity: Severity::Medium,
+                action: EnforcementAction::Flag,
+                parse_error: Some(message),
+            }),
+            rewritten_query: None,
+            sensitive_columns: Vec::new(),
+            access_denied: Vec::new(),
+        }
+    }
+}
+
+/// `observe`: `baseline` (the verdict without policies) unchanged, with what
+/// the policies found added to its violations, every block lowered to a flag.
+/// A statement the policies alone would have blocked (or flagged) is reported
+/// FLAGGED; one that was allowed stays forwarded; a rewrite, a mask and every
+/// non-policy block stay exactly as `evaluate()` decided them. Exemptions are
+/// not applied: they only ever loosen, and observe never changes a verdict.
+fn observed(
+    baseline: TcpDecision,
+    outcome: EvaluationOutcome,
+    policies: &PolicySet,
+) -> TcpDecision {
+    let lower = |a: EnforcementAction| a.min(EnforcementAction::Flag);
+    let mut found: Vec<ReportedViolation> = outcome
+        .violations
+        .into_iter()
+        .filter(|v| policies.contains_rule(&v.rule_id))
+        .map(|mut v| {
+            v.action = lower(v.action);
+            v
+        })
+        .collect();
+    // Policy results with no violation of their own (a statement the engine
+    // could not read under an enforced policy, insufficient trust, a policy
+    // that does not compile), when they ask for an action.
+    for hit in &outcome.policy_hits {
+        if let Some(action) = hit.action
+            && !found.iter().any(|v| v.rule_code == hit.rule_code)
+        {
+            found.push(ReportedViolation {
+                rule_id: hit.rule_id.clone(),
+                rule_code: hit.rule_code.clone(),
+                severity: hit.severity,
+                action: lower(action),
+                ast_node_path: format!("Policy > {}", hit.message),
+                estimated_rows_affected: None,
+                suggested_safe_query: None,
+            });
+        }
+    }
+    if found.is_empty() {
+        return baseline;
+    }
+    found.sort_by(|a, b| {
+        b.action
+            .cmp(&a.action)
+            .then_with(|| b.severity.cmp(&a.severity))
+            .then_with(|| a.rule_code.cmp(&b.rule_code))
+    });
+    let add = |violations: &mut Vec<ReportedViolation>, found: Vec<ReportedViolation>| {
+        for v in found {
+            if !violations.iter().any(|o| o.rule_code == v.rule_code) {
+                violations.push(v);
+            }
+        }
+    };
+    match baseline {
+        TcpDecision::Forward {
+            observation,
+            mut violations,
+            rewritten_query,
+            sensitive_columns,
+            access_denied,
+        } => {
+            let observation = observation.or_else(|| {
+                found.first().map(|v| Observation {
+                    rule_code: v.rule_code.clone(),
+                    ast_node_path: v.ast_node_path.clone(),
+                    severity: v.severity,
+                    action: v.action,
+                    parse_error: None,
+                })
+            });
+            add(&mut violations, found);
+            TcpDecision::Forward {
+                observation,
+                violations,
+                rewritten_query,
+                sensitive_columns,
+                access_denied,
+            }
+        }
+        TcpDecision::Block {
+            rule_code,
+            ast_node_path,
+            suggested_safe_query,
+            severity,
+            mut violations,
+            sensitive_columns,
+            access_denied,
+        } => {
+            add(&mut violations, found);
+            TcpDecision::Block {
+                rule_code,
+                ast_node_path,
+                suggested_safe_query,
+                severity,
+                violations,
+                sensitive_columns,
+                access_denied,
+            }
+        }
+    }
 }
 
 /// The parameter check of [`evaluate_message`] on an already evaluated query.

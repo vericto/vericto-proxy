@@ -208,6 +208,58 @@ A value larger than the wire protocol can carry is clamped, with a warning: 64 M
 PostgreSQL, 16 MiB − 1 byte for MySQL. A value that is not a positive integer falls
 back to the default, also with a warning.
 
+## Business policy rules (preview, off by default)
+
+| Variable               | Default | Description                                                    |
+|------------------------|---------|----------------------------------------------------------------|
+| `VERICTO_POLICY_RULES` | `off`   | `off`, `observe` or `enforce`, any case. Any other value fails startup |
+
+A preview of principal-aware policies (CEL inside the custom-rule YAML, engine
+4.4.0), for workspaces the control plane has enabled it for. **With `off` (the
+default) nothing below happens**: the rule sync does not announce `cel/1`, nothing
+is compiled, the StartupMessage and `SET vericto.*` reach the database as they
+come, statements are evaluated exactly as in 4.14.3 and telemetry carries no new
+field.
+
+With `observe` or `enforce`:
+
+- **Rule sync.** Every `GET /sync/rules` carries `X-Vericto-Policy-Language: cel/1`.
+  The response's `principals` section and its rules are compiled once per sync. A
+  malformed `principals` section is ignored (every session is then unmatched); it
+  never fails the sync.
+- **Principal.** Resolved once per session (again only when a sync changes the
+  bundle, or a MySQL COM_CHANGE_USER changes the user) from the database user
+  (`db_user`, `db_user_pattern`: medium trust), `application_name` (Postgres) or
+  the `program_name` connect attribute (MySQL), and the listener (weak trust). The
+  strongest identifying signal wins, `narrow` signals must also match and never
+  raise trust, and two principals at the same top trust are ambiguous: the
+  session is then `unknown` with `weak` trust. A session nothing matches is
+  `unknown`, `weak`. The client address is not used.
+- **Session context.** `vericto.ticket` and `vericto.tenant` (1 to 128
+  characters) come from the Postgres StartupMessage (`options=-c vericto.ticket=OPS-1`,
+  or a `vericto.ticket` parameter), from MySQL connect attributes, or from
+  `SET vericto.ticket = 'OPS-1'` sent on its own as a simple query. The proxy
+  consumes them: they never reach the database. Each is set once per session: a
+  second `SET`, a `RESET` or a `set_config` of it is blocked
+  (`VERICTO-SESSION-CONTEXT`), as is any other `vericto.*` name, a `SET LOCAL`, or
+  a `SET vericto.*` sent as a prepared statement or together with other
+  statements. A startup setting the proxy cannot accept refuses the connection.
+  The proxy answers a consumed `SET` itself, with the transaction state the server
+  reported last (Postgres ReadyForQuery `I` / `T` / `E`; MySQL status flags
+  `SERVER_STATUS_IN_TRANS` and autocommit), so it may be sent inside a
+  transaction block. In a failed Postgres transaction block it gets 25P02, as from
+  the server, and the value is not taken. Like every reply the proxy writes
+  itself, it assumes the client waits for the previous statement's answer.
+- **`observe`.** The verdict is the one without policies; what a policy would
+  have blocked is reported as `FLAGGED` with the policy's code. When the bundle
+  has policies, each statement is evaluated twice (with and without them).
+- **`enforce`.** Policies decide with the rest of the rules
+  (`evaluate_with_context`); a statement the engine cannot read is blocked when an
+  enforced blocking policy may apply to the session.
+- **Telemetry.** Each event adds `principal_id`, `principal_type`,
+  `principal_trust`, `principal_via`, `application_name`, `policy_bundle_version`,
+  `ticket_id` and `session_tenant` (no client address).
+
 ## Health check (optional)
 
 | Variable               | Default | Description                                   |

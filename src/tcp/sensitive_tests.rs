@@ -100,6 +100,7 @@ pub(super) fn config_with(
             database_id: "00000000-0000-0000-0000-000000000001".to_string(),
         }),
         max_query_bytes: crate::tcp::query_limit::DEFAULT_MAX_QUERY_BYTES,
+        policy_rules: Default::default(),
     });
     (cfg, queue)
 }
@@ -916,6 +917,7 @@ fn a_vericto_086_block_on_postgres_is_42501() {
         suggested_safe_query: None,
         kind: crate::tcp::protocol::QueryKind::Simple,
         client_seq: 0,
+        tx: None,
     });
     assert_eq!(block.bytes[0], b'E');
     let len = i32::from_be_bytes(block.bytes[1..5].try_into().unwrap()) as usize;

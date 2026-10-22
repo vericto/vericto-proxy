@@ -150,6 +150,19 @@ impl WireProtocol for MysqlProtocol {
         }
     }
 
+    /// An OK_Packet: no rows, no warnings, and the status flags the server
+    /// last reported (`SERVER_STATUS_IN_TRANS`, `SERVER_STATUS_AUTOCOMMIT`, …).
+    /// MySQL has no failed-transaction state: an error leaves the transaction
+    /// usable, so there is no 25P02 equivalent.
+    fn build_set_ok(&self, client_seq: u8, tx: &crate::tcp::tx_state::ServerTxState) -> Vec<u8> {
+        let [lo, hi] = tx.mysql_flags().to_le_bytes();
+        crate::tcp::codec_mysql::MySqlPacket {
+            seq: client_seq.wrapping_add(1),
+            payload: vec![0x00, 0x00, 0x00, lo, hi, 0x00, 0x00],
+        }
+        .encode()
+    }
+
     fn build_block_response(&self, ctx: &BlockContext) -> BlockResponse {
         let message = block_message(ctx.rule_code, ctx.ast_node_path, ctx.suggested_safe_query);
         // The reply to a command packet uses sequence id command_seq + 1.
@@ -177,7 +190,11 @@ fn prepared_or_simple(pkt: &MySqlPacket) -> QueryKind {
 }
 
 /// Block message shown to the client (same wording as the Postgres path).
-fn block_message(rule_code: &str, ast_node_path: &str, suggestion: Option<&str>) -> String {
+pub(crate) fn block_message(
+    rule_code: &str,
+    ast_node_path: &str,
+    suggestion: Option<&str>,
+) -> String {
     let base = format!("Vericto blocked this query [{rule_code}] — AST node: {ast_node_path}");
     match suggestion {
         Some(s) => format!("{base}. Suggestion: {s}"),
@@ -301,6 +318,7 @@ mod tests {
             suggested_safe_query: None,
             kind: QueryKind::Simple,
             client_seq: 0,
+            tx: None,
         };
         let resp = p.build_block_response(&ctx);
         assert!(!resp.skip_until_sync);
