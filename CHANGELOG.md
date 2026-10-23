@@ -7,6 +7,77 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [4.16.0] — 2026-10-23
+
+**Security: with business policy rules on, the proxy applies only signed sync
+bundles.** With `VERICTO_POLICY_RULES=off` (the default) nothing changes: no header
+is read, nothing is hashed, the rules cache is read and written as in 4.15.3, and
+`/metrics` carries no new series. The per-statement path is untouched in every mode.
+
+Up to 4.15.3 the proxy trusted any `/sync/rules` body that reached it over TLS with
+its API key, and any rules cache it found on its volume. With business policies the
+bundle decides more than which standard rules run: a policy can block, flag or
+exempt statements per principal. Whoever could alter the bundle in transit (a
+TLS-intercepting middlebox with a trusted certificate) or at rest (write access to
+the shared spool volume that holds the rules cache) could therefore loosen or
+replace the workspace's policies on every proxy that reads it. Since vericto-fmw M3
+the control plane signs the body it sends to a proxy announcing `cel/1`
+(`X-Vericto-Bundle-Signature`, Ed25519 over a domain-separated SHA-256 digest of the
+exact body). 4.16.0 verifies that signature.
+
+### Added
+
+- **Bundle signature verification** (`src/tcp/bundle_signature.rs`), with policy
+  rules on. A response is applied only when its signature verifies with a trusted
+  key; otherwise it is not applied, not cached, and its ETag is not adopted (the
+  next poll asks for a full body again), and the last good bundle stays in effect.
+  The rules cache stores the signature with the body and is verified on load. With
+  no good bundle at all (a first start, a refused cache) the built-in ruleset stays
+  in effect, without the workspace's rules or policies, and readiness is not held
+  back: the same fail-safe as an unreachable control plane. Refusing traffic
+  instead would turn a key mix-up into an outage; applying the unverified bundle
+  would defeat the check.
+- **Pinned public keys.** The binary embeds the public key each Vericto API
+  publishes (`https://api.vericto.com`: `vericto-production-2026`;
+  `https://api-staging.vericto.com`: `vericto-staging-2026`), selected by
+  `VERICTO_API_URL`. `VERICTO_BUNDLE_SIGNING_KEYS` (JSON) or
+  `VERICTO_BUNDLE_SIGNING_KEYS_FILE` replace them, for another control plane or a
+  rotation ahead of a release. A malformed override, or both set, fails startup
+  rather than silently trusting the embedded keys. Any other API address with no
+  override trusts no key: every bundle is refused, with a warning at startup. An
+  unknown control plane is never trusted by default.
+- **Rotation.** Several keys can be trusted at once and the header's `key-id`
+  picks one. The order is: the new public key reaches the proxies first, then the
+  control plane switches its active key, then the old key is dropped. Switching the
+  control plane first leaves proxies on their last good bundle (stale, never open)
+  until they hold the new key.
+- **Observability.** Each refusal logs `alert=bundle_signature_rejected` with
+  `reason` (`missing`, `malformed`, `unsupported_scheme`, `digest_mismatch`,
+  `unknown_key_id`, `bad_signature`, `no_trusted_key`), `key_id` and `source`
+  (`sync` or `cache`). `/metrics` adds `vericto_proxy_bundle_signature_verified`,
+  `vericto_proxy_bundle_signature_accepted_total` and
+  `vericto_proxy_bundle_signature_rejected_total{reason}`, only with policy rules on.
+
+### Upgrading
+
+- **Upgrade the control plane first.** vericto-fmw before the M3 follow-up signs
+  bundles only with its own `POLICY_RULES_ENABLED` on; a 4.16.0 proxy with
+  `VERICTO_POLICY_RULES` on would then refuse every bundle and stay on the built-in
+  ruleset. Vericto's hosted API is upgraded before this release is published.
+- **The first restart with the flag on waits for a sync.** A rules cache written by
+  4.15.x has no signature, so with the flag on 4.16.0 ignores it at startup and
+  runs the built-in ruleset until its first sync. With the control plane reachable
+  that is the first poll.
+- A cache written by 4.16.0 still loads on 4.15.x (the new field is ignored), so a
+  rollback keeps its last good rules.
+
+### Security
+
+- `cargo update` within the declared ranges (compatible versions only), so fixes
+  published since 4.15.3 are in: among others `tokio-util` 0.7.20, `webpki-roots`
+  1.0.11 and `zeroize` 1.9.1. `cargo deny check` and `cargo audit --deny warnings`
+  pass on the result. No code change from it.
+
 ## [4.15.3] — 2026-10-23
 
 **Performance: less CPU per statement on the always-on path.** No behaviour change:

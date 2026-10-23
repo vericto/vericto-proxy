@@ -16,6 +16,7 @@ use arc_swap::ArcSwap;
 use serde::Deserialize;
 
 use crate::config::ControlPlaneConfig;
+use crate::tcp::bundle_signature::{BundleSource, BundleVerifier, Keyring, SIGNATURE_HEADER};
 use crate::tcp::rules_cache::RulesCache;
 use vericto_engine::{
     AccessPolicyMap, EnforcementAction, EnforcementPolicy, ParseErrorAction, Rule, RuleType,
@@ -110,6 +111,27 @@ struct SyncResponse {
 pub struct PolicyRulesSync {
     pub mode: crate::tcp::policy_rules::PolicyRulesMode,
     pub bundle: crate::tcp::policy_rules::SharedPolicyRules,
+    /// The bundle-signature check (4.16.0), used only with the mode on. `None`
+    /// with the mode on trusts no key: every bundle is refused (fail safe).
+    pub verifier: Option<Arc<BundleVerifier>>,
+}
+
+impl PolicyRulesSync {
+    /// Whether a bundle may be applied: always with the mode off (nothing is read
+    /// or hashed), only with a signature that verifies with the mode on.
+    fn accepts(&self, body: &[u8], header: Option<&str>, source: BundleSource) -> bool {
+        if !self.mode.is_on() {
+            return true;
+        }
+        match &self.verifier {
+            Some(v) => v.check(body, header, source),
+            None => BundleVerifier::new(Keyring::new(
+                Vec::new(),
+                crate::tcp::bundle_signature::KeySource::None,
+            ))
+            .check(body, header, source),
+        }
+    }
 }
 
 /// What a sync says about the monthly quota (see `telemetry::quota`).
@@ -465,8 +487,23 @@ pub async fn run_with_policy_rules(
     // the control plane is down keeps the workspace's rules and policy instead of
     // falling back to the built-in ruleset. Its ETag goes on the first request: if
     // nothing changed meanwhile the API answers 304 and the cached copy stays.
+    //
+    // With policy rules on, the cached body is verified like a live one (4.16.0):
+    // a file anyone with write access to the volume could edit is not a trust
+    // anchor. A cache that does not verify (a 4.15.x file has no signature) is
+    // ignored, and so is its ETag, so the first request gets a full body.
     let cache = RulesCache::from_config(&cfg);
-    if let Some(cached) = cache.as_ref().and_then(RulesCache::load) {
+    // Whether a synced bundle (live or cached) is in effect, for the log of a
+    // refused one: without it the built-in ruleset is what runs.
+    let mut have_bundle = false;
+    let cached = cache.as_ref().and_then(RulesCache::load).filter(|c| {
+        policy_rules.accepts(
+            c.body.as_bytes(),
+            c.signature.as_deref(),
+            BundleSource::Cache,
+        )
+    });
+    if let Some(cached) = cached {
         match serde_json::from_str::<SyncResponse>(&cached.body) {
             Ok(body) => {
                 let applied = apply(
@@ -483,6 +520,7 @@ pub async fn run_with_policy_rules(
                 last_quota = applied.quota;
                 apply_quota(last_quota, quota_gate.as_deref());
                 etag = cached.etag;
+                have_bundle = true;
                 tracing::info!(
                     count = applied.count,
                     monitor_mode = applied.monitor_mode,
@@ -527,16 +565,52 @@ pub async fn run_with_policy_rules(
                     .get("etag")
                     .and_then(|v| v.to_str().ok())
                     .map(|s| s.to_string());
+                // The bundle signature (4.16.0), read only with policy rules on.
+                let signature = policy_rules
+                    .mode
+                    .is_on()
+                    .then(|| {
+                        res.headers()
+                            .get(SIGNATURE_HEADER)
+                            .and_then(|v| v.to_str().ok())
+                            .map(str::to_string)
+                    })
+                    .flatten();
                 // Read the body as text so the exact bytes accepted can be cached.
-                match res
-                    .text()
-                    .await
-                    .map_err(|e| e.to_string())
-                    .and_then(|text| {
-                        serde_json::from_str::<SyncResponse>(&text)
-                            .map(|body| (text, body))
-                            .map_err(|e| e.to_string())
-                    }) {
+                // With policy rules on, as raw bytes that must be UTF-8 (JSON is),
+                // so the bytes verified are exactly the bytes received: `text()`
+                // decodes by the declared charset, lossily.
+                let received = if policy_rules.mode.is_on() {
+                    res.bytes()
+                        .await
+                        .map_err(|e| e.to_string())
+                        .and_then(|b| String::from_utf8(b.to_vec()).map_err(|e| e.to_string()))
+                } else {
+                    res.text().await.map_err(|e| e.to_string())
+                };
+                if let Ok(text) = &received
+                    && !policy_rules.accepts(
+                        text.as_bytes(),
+                        signature.as_deref(),
+                        BundleSource::Sync,
+                    )
+                {
+                    // Not applied, not cached, and its ETag not adopted: the next
+                    // poll asks again with the last good ETag and gets a full body.
+                    if !have_bundle {
+                        tracing::warn!(
+                            "No verified sync bundle yet: the built-in ruleset stays in effect, \
+                             without the workspace's rules or business policies"
+                        );
+                    }
+                    readiness.mark_ready();
+                    continue;
+                }
+                match received.and_then(|text| {
+                    serde_json::from_str::<SyncResponse>(&text)
+                        .map(|body| (text, body))
+                        .map_err(|e| e.to_string())
+                }) {
                     Ok((text, body)) => {
                         let applied = apply(
                             body,
@@ -554,9 +628,10 @@ pub async fn run_with_policy_rules(
                         // Cached only after it parsed and was applied: the file always
                         // holds a response this proxy has enforced, never a bad one.
                         if let Some(cache) = &cache {
-                            cache.store(new_etag.as_deref(), &text);
+                            cache.store(new_etag.as_deref(), &text, signature.as_deref());
                         }
                         etag = new_etag;
+                        have_bundle = true;
                         tracing::info!(
                             count = applied.count,
                             monitor_mode = applied.monitor_mode,
@@ -1489,6 +1564,10 @@ mod tests {
             mode: PolicyRulesMode,
             body: &'static str,
         ) -> (Vec<Option<String>>, Arc<PolicyRules>, usize) {
+            // The bodies are signed (4.16.0): with the mode on, an unsigned one is
+            // never applied (see the bundle-signature tests below).
+            let signer = crate::tcp::bundle_signature::test_support::TestSigner::new("k");
+            let signature = signer.header(body.as_bytes());
             let seen: Arc<Mutex<Vec<Option<String>>>> = Arc::new(Mutex::new(Vec::new()));
             let seen_by_api = Arc::clone(&seen);
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1497,13 +1576,14 @@ mod tests {
                 "/api/v1/sync/rules",
                 get(move |headers: HeaderMap| {
                     let seen = Arc::clone(&seen_by_api);
+                    let signature = signature.clone();
                     async move {
                         seen.lock().unwrap().push(
                             headers
                                 .get(POLICY_LANGUAGE_HEADER)
                                 .map(|v| v.to_str().unwrap().to_string()),
                         );
-                        body
+                        ([(SIGNATURE_HEADER, signature)], body)
                     }
                 }),
             );
@@ -1526,6 +1606,9 @@ mod tests {
             let policy_rules = PolicyRulesSync {
                 mode,
                 bundle: Default::default(),
+                verifier: Some(Arc::new(BundleVerifier::new(
+                    crate::tcp::bundle_signature::test_support::ring_of(&[&signer]),
+                ))),
             };
             let ready = crate::tcp::healthz::Readiness::new();
             let sync = tokio::spawn(run_with_policy_rules(
@@ -1573,5 +1656,489 @@ mod tests {
             "the sync was applied"
         );
         assert!(bundle.principals.entries.is_empty());
+    }
+
+    // ── Bundle signatures (4.16.0) ───────────────────────────────────────────
+
+    mod bundle_signatures {
+        use super::*;
+        use crate::config::BufferMode;
+        use crate::tcp::bundle_signature::test_support::{TestSigner, ring_of};
+        use crate::tcp::policy_rules::{PolicyRules, PolicyRulesMode};
+        use axum::{
+            Router,
+            http::{HeaderMap, StatusCode, header},
+            response::IntoResponse,
+            routing::get,
+        };
+        use std::sync::Mutex;
+
+        /// A policy bundle: one custom rule `code`, one business policy.
+        fn body(version: &str, code: &str) -> String {
+            serde_json::json!({
+                "version": version,
+                "rules": [
+                    {"rule_id": "c-1", "code": code, "severity": "high", "rule_type": "custom",
+                     "default_action": "block", "ast_condition_yaml": "node_type: DropStmt"},
+                    {"rule_id": "r-refunds", "code": "POL-014", "severity": "high", "rule_type": "custom",
+                     "default_action": "block",
+                     "ast_condition_yaml": "rule: refund-cap\napplies_to: { ops: [insert], tables: [\"public.refunds\"] }\ndeny_if: stmt.values(\"public.refunds.amount\").exists(v, double(v) > 200.0)\naction: block\n"}
+                ],
+                "policy": {"severity_actions": {"high": "block"}}
+            })
+            .to_string()
+        }
+
+        /// What the fake API answers: a body, its signature header, and its ETag.
+        #[derive(Clone, Default)]
+        struct Served {
+            body: String,
+            signature: Option<String>,
+            etag: String,
+        }
+
+        struct Api {
+            served: Arc<Mutex<Served>>,
+            /// The If-None-Match of every request, in order.
+            seen: Arc<Mutex<Vec<Option<String>>>>,
+            url: String,
+            server: tokio::task::JoinHandle<()>,
+        }
+
+        impl Api {
+            async fn start(first: Served) -> Self {
+                let served = Arc::new(Mutex::new(first));
+                let seen: Arc<Mutex<Vec<Option<String>>>> = Arc::default();
+                let (s2, seen2) = (Arc::clone(&served), Arc::clone(&seen));
+                let app = Router::new().route(
+                    "/api/v1/sync/rules",
+                    get(move |headers: HeaderMap| {
+                        let (served, seen) = (Arc::clone(&s2), Arc::clone(&seen2));
+                        async move {
+                            let inm = headers
+                                .get(header::IF_NONE_MATCH)
+                                .map(|v| v.to_str().unwrap().to_string());
+                            seen.lock().unwrap().push(inm.clone());
+                            let now = served.lock().unwrap().clone();
+                            let etag = format!("\"{}\"", now.etag);
+                            if inm.as_deref() == Some(etag.as_str()) {
+                                return StatusCode::NOT_MODIFIED.into_response();
+                            }
+                            let mut h = HeaderMap::new();
+                            h.insert(header::ETAG, etag.parse().unwrap());
+                            if let Some(sig) = now.signature {
+                                h.insert(SIGNATURE_HEADER, sig.parse().unwrap());
+                            }
+                            (h, now.body).into_response()
+                        }
+                    }),
+                );
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let url = format!("http://{}", listener.local_addr().unwrap());
+                let server = tokio::spawn(async move {
+                    let _ = axum::serve(listener, app).await;
+                });
+                Self {
+                    served,
+                    seen,
+                    url,
+                    server,
+                }
+            }
+
+            fn serve(&self, next: Served) {
+                *self.served.lock().unwrap() = next;
+            }
+
+            fn requests(&self) -> usize {
+                self.seen.lock().unwrap().len()
+            }
+
+            fn last_if_none_match(&self) -> Option<String> {
+                self.seen.lock().unwrap().last().cloned().flatten()
+            }
+
+            /// Waits until `n` more requests than now have been answered, plus a beat
+            /// for the syncer to handle the last one.
+            async fn polls(&self, n: usize) {
+                let target = self.requests() + n;
+                tokio::time::timeout(Duration::from_secs(10), async {
+                    while self.requests() < target {
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                })
+                .await
+                .expect("the syncer kept polling");
+                tokio::time::sleep(Duration::from_millis(30)).await;
+            }
+        }
+
+        fn signed(signer: &TestSigner, version: &str, code: &str) -> Served {
+            let b = body(version, code);
+            Served {
+                signature: Some(signer.header(b.as_bytes())),
+                body: b,
+                etag: version.into(),
+            }
+        }
+
+        fn cfg(
+            api_url: &str,
+            cache: Option<std::path::PathBuf>,
+            every: Duration,
+        ) -> ControlPlaneConfig {
+            ControlPlaneConfig {
+                api_url: api_url.into(),
+                api_key: "vk_test".into(),
+                database_id: Some("db-1".into()),
+                rules_sync_interval: every,
+                rules_cache_path: cache,
+                buffer_mode: BufferMode::Memory,
+                disk_spool_path: String::new(),
+                memory_capacity: 10,
+                batch_size: 10,
+                flush_interval: Duration::from_secs(5),
+                spool: crate::config::SpoolTuning::default(),
+                delivery: crate::config::DeliveryTuning::default(),
+            }
+        }
+
+        struct Proxy {
+            ruleset: SharedRuleset,
+            bundle: crate::tcp::policy_rules::SharedPolicyRules,
+            verifier: Arc<BundleVerifier>,
+            ready: Arc<crate::tcp::healthz::Readiness>,
+            task: tokio::task::JoinHandle<()>,
+        }
+
+        impl Proxy {
+            fn start(cfg: ControlPlaneConfig, mode: PolicyRulesMode, keyring: Keyring) -> Self {
+                let ruleset: SharedRuleset = Arc::new(ArcSwap::from_pointee(
+                    crate::tcp::evaluator::default_ruleset(),
+                ));
+                let verifier = Arc::new(BundleVerifier::new(keyring));
+                let sync = PolicyRulesSync {
+                    mode,
+                    bundle: Default::default(),
+                    verifier: Some(Arc::clone(&verifier)),
+                };
+                let ready = crate::tcp::healthz::Readiness::new();
+                let task = tokio::spawn(run_with_policy_rules(
+                    cfg,
+                    ruleset.clone(),
+                    Arc::new(ArcSwap::from_pointee(EnforcementPolicy::default())),
+                    Arc::new(ArcSwap::from_pointee(AccessPolicyMap::default())),
+                    Arc::new(ArcSwap::from_pointee(TelemetryQueryMode::default())),
+                    sync.clone(),
+                    ready.clone(),
+                    None,
+                ));
+                Self {
+                    ruleset,
+                    bundle: sync.bundle,
+                    verifier,
+                    ready,
+                    task,
+                }
+            }
+
+            fn codes(&self) -> Vec<String> {
+                self.ruleset.load().iter().map(|r| r.code.clone()).collect()
+            }
+
+            fn bundle(&self) -> Arc<PolicyRules> {
+                self.bundle.load_full()
+            }
+
+            fn rejected(&self, reason: &str) -> u64 {
+                self.verifier.stats.rejected(reason)
+            }
+        }
+
+        fn built_in_codes() -> Vec<String> {
+            crate::tcp::evaluator::default_ruleset()
+                .into_iter()
+                .map(|r| r.code)
+                .collect()
+        }
+
+        fn cached_body(path: &std::path::Path) -> String {
+            let file: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+            file["body"].as_str().unwrap().to_string()
+        }
+
+        /// A valid bundle is applied and cached with its signature. A tampered one,
+        /// one signed by an untrusted key id and one signed by another key under the
+        /// trusted id are refused: the last good bundle stays in memory and on disk,
+        /// and the refused ETag is never adopted, so every poll asks again.
+        #[tokio::test]
+        async fn only_verified_bundles_are_applied_and_the_last_good_one_is_kept() {
+            let signer = TestSigner::new("k-2026");
+            let api = Api::start(signed(&signer, "v1", "ACME-001")).await;
+            let dir = tempfile::tempdir().unwrap();
+            let cache = dir.path().join("rules-cache.json");
+            let proxy = Proxy::start(
+                cfg(&api.url, Some(cache.clone()), Duration::from_millis(40)),
+                PolicyRulesMode::Enforce,
+                ring_of(&[&signer]),
+            );
+            proxy.ready.wait_ready().await;
+            api.polls(1).await;
+
+            assert_eq!(proxy.codes(), vec!["ACME-001", "POL-014"]);
+            assert_eq!(proxy.bundle().policies.len(), 1);
+            assert_eq!(proxy.bundle().version.as_deref(), Some("v1"));
+            assert_eq!(proxy.verifier.stats.accepted(), 1);
+            assert!(proxy.verifier.stats.verified_in_effect());
+            let good = cached_body(&cache);
+            let file: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(&cache).unwrap()).unwrap();
+            assert!(
+                file["signature"]
+                    .as_str()
+                    .unwrap()
+                    .contains("key-id=k-2026")
+            );
+
+            // 1. Tampered: v2's body under v1's signature.
+            let tampered = Served {
+                signature: Some(signer.header(body("v1", "ACME-001").as_bytes())),
+                body: body("v2", "EVIL-001"),
+                etag: "v2".into(),
+            };
+            api.serve(tampered);
+            api.polls(3).await;
+            assert_eq!(proxy.codes(), vec!["ACME-001", "POL-014"], "last good kept");
+            assert_eq!(proxy.bundle().version.as_deref(), Some("v1"));
+            assert!(proxy.rejected("digest_mismatch") >= 2);
+            assert_eq!(cached_body(&cache), good, "the cache is untouched");
+            assert_eq!(
+                api.last_if_none_match().as_deref(),
+                Some("\"v1\""),
+                "the refused ETag is not adopted"
+            );
+
+            // 2. Signed with a key id this proxy does not trust.
+            let stranger = TestSigner::new("k-stranger");
+            api.serve(signed(&stranger, "v3", "EVIL-003"));
+            api.polls(2).await;
+            assert!(proxy.rejected("unknown_key_id") >= 1);
+            // 3. Another key under the trusted id.
+            let impostor = TestSigner::new("k-2026");
+            api.serve(signed(&impostor, "v4", "EVIL-004"));
+            api.polls(2).await;
+            assert!(proxy.rejected("bad_signature") >= 1);
+            // 4. No signature at all.
+            api.serve(Served {
+                signature: None,
+                body: body("v5", "EVIL-005"),
+                etag: "v5".into(),
+            });
+            api.polls(2).await;
+            assert!(proxy.rejected("missing") >= 1);
+
+            assert_eq!(proxy.codes(), vec!["ACME-001", "POL-014"]);
+            assert_eq!(cached_body(&cache), good);
+            assert_eq!(proxy.verifier.stats.accepted(), 1);
+
+            // 5. A valid bundle again is applied at once.
+            api.serve(signed(&signer, "v6", "ACME-006"));
+            api.polls(2).await;
+            assert_eq!(proxy.codes(), vec!["ACME-006", "POL-014"]);
+            assert_eq!(cached_body(&cache), body("v6", "ACME-006"));
+
+            proxy.task.abort();
+            api.server.abort();
+        }
+
+        /// Rotation: with both keys trusted, bundles of the old and of the new key
+        /// verify; once the old key is dropped from the ring, its bundles are refused.
+        #[tokio::test]
+        async fn key_rotation_trusts_every_key_in_the_ring() {
+            let old = TestSigner::new("vericto-2026");
+            let new = TestSigner::new("vericto-2027");
+            let api = Api::start(signed(&old, "v1", "OLD-001")).await;
+            let proxy = Proxy::start(
+                cfg(&api.url, None, Duration::from_millis(40)),
+                PolicyRulesMode::Observe,
+                ring_of(&[&old, &new]),
+            );
+            proxy.ready.wait_ready().await;
+            api.polls(1).await;
+            assert_eq!(proxy.codes()[0], "OLD-001");
+            // The control plane switches its active key.
+            api.serve(signed(&new, "v2", "NEW-002"));
+            api.polls(2).await;
+            assert_eq!(proxy.codes()[0], "NEW-002");
+            proxy.task.abort();
+
+            // A proxy that trusts only the new key refuses the old key's bundles.
+            api.serve(signed(&old, "v3", "OLD-003"));
+            let after = Proxy::start(
+                cfg(&api.url, None, Duration::from_secs(3600)),
+                PolicyRulesMode::Enforce,
+                ring_of(&[&new]),
+            );
+            after.ready.wait_ready().await;
+            after.task.abort();
+            assert_eq!(after.codes(), built_in_codes());
+            assert_eq!(after.rejected("unknown_key_id"), 1);
+            api.server.abort();
+        }
+
+        /// The first sync, with no good bundle yet (no cache) and an unsigned or
+        /// invalid response: the built-in ruleset stays, no policy is compiled,
+        /// nothing is cached, and the proxy still gets ready (the same fail-safe as
+        /// an unreachable control plane: never an unverified bundle, never an outage).
+        #[tokio::test]
+        async fn a_first_sync_with_no_verified_bundle_keeps_the_built_in_ruleset() {
+            let signer = TestSigner::new("k");
+            let unsigned = Served {
+                signature: None,
+                body: body("v1", "ACME-001"),
+                etag: "v1".into(),
+            };
+            let stranger = TestSigner::new("other");
+            for (served, reason, keyring) in [
+                (unsigned.clone(), "missing", ring_of(&[&signer])),
+                (
+                    signed(&stranger, "v1", "ACME-001"),
+                    "unknown_key_id",
+                    ring_of(&[&signer]),
+                ),
+                (
+                    signed(&signer, "v1", "ACME-001"),
+                    "no_trusted_key",
+                    Keyring::embedded_for("https://self-hosted.example"),
+                ),
+            ] {
+                let api = Api::start(served).await;
+                let dir = tempfile::tempdir().unwrap();
+                let cache = dir.path().join("rules-cache.json");
+                let proxy = Proxy::start(
+                    cfg(&api.url, Some(cache.clone()), Duration::from_secs(3600)),
+                    PolicyRulesMode::Enforce,
+                    keyring,
+                );
+                tokio::time::timeout(Duration::from_secs(5), proxy.ready.wait_ready())
+                    .await
+                    .expect("ready even without a verified bundle");
+                proxy.task.abort();
+                api.server.abort();
+                assert_eq!(proxy.codes(), built_in_codes(), "{reason}");
+                let bundle = proxy.bundle();
+                assert!(
+                    bundle.rules.is_none() && bundle.policies.is_empty(),
+                    "{reason}"
+                );
+                assert!(!cache.exists(), "{reason}: nothing cached");
+                assert_eq!(proxy.rejected(reason), 1, "{reason}");
+                assert!(!proxy.verifier.stats.verified_in_effect());
+            }
+        }
+
+        /// With the flag off nothing is verified: an unsigned body is applied and
+        /// cached exactly as before 4.16.0, and the verifier is never consulted.
+        #[tokio::test]
+        async fn with_the_flag_off_bundles_are_applied_unverified() {
+            let api = Api::start(Served {
+                signature: None,
+                body: body("v1", "ACME-001"),
+                etag: "v1".into(),
+            })
+            .await;
+            let dir = tempfile::tempdir().unwrap();
+            let cache = dir.path().join("rules-cache.json");
+            let proxy = Proxy::start(
+                cfg(&api.url, Some(cache.clone()), Duration::from_secs(3600)),
+                PolicyRulesMode::Off,
+                Keyring::embedded_for("https://self-hosted.example"),
+            );
+            proxy.ready.wait_ready().await;
+            proxy.task.abort();
+            api.server.abort();
+            assert_eq!(proxy.codes(), vec!["ACME-001", "POL-014"]);
+            assert!(
+                proxy.bundle().rules.is_none(),
+                "nothing compiled with the flag off"
+            );
+            assert_eq!(cached_body(&cache), body("v1", "ACME-001"));
+            let file = std::fs::read_to_string(&cache).unwrap();
+            assert!(!file.contains("\"signature\""), "{file}");
+            assert_eq!(proxy.verifier.stats.accepted(), 0);
+            for reason in crate::tcp::bundle_signature::REASONS {
+                assert_eq!(proxy.rejected(reason), 0, "{reason}");
+            }
+        }
+
+        /// The rules cache is verified when it is loaded. A verified cache resumes
+        /// during an outage; a tampered one, or a 4.15.x one without a signature, is
+        /// ignored with the flag on (its ETag too, so the API sends a full body),
+        /// while the flag off still resumes from the unsigned one.
+        #[tokio::test]
+        async fn the_rules_cache_is_verified_on_load() {
+            let signer = TestSigner::new("k");
+            let dir = tempfile::tempdir().unwrap();
+            let cache_path = dir.path().join("rules-cache.json");
+            let unreachable = "http://127.0.0.1:9".to_string();
+            let link = cfg(
+                &unreachable,
+                Some(cache_path.clone()),
+                Duration::from_secs(3600),
+            );
+            let cache = RulesCache::from_config(&link).unwrap();
+
+            let resume = |mode: PolicyRulesMode| {
+                let proxy = Proxy::start(link.clone(), mode, ring_of(&[&signer]));
+                async move {
+                    proxy.ready.wait_ready().await;
+                    proxy.task.abort();
+                    proxy
+                }
+            };
+
+            // Verified cache, control plane down: resumed.
+            let good = body("v1", "ACME-001");
+            cache.store(Some("\"v1\""), &good, Some(&signer.header(good.as_bytes())));
+            let proxy = resume(PolicyRulesMode::Enforce).await;
+            assert_eq!(proxy.codes(), vec!["ACME-001", "POL-014"]);
+            assert_eq!(proxy.bundle().policies.len(), 1);
+            assert_eq!(proxy.verifier.stats.accepted(), 1);
+
+            // Tampered body on disk: ignored.
+            let evil = body("v1", "EVIL-001");
+            cache.store(Some("\"v1\""), &evil, Some(&signer.header(good.as_bytes())));
+            let proxy = resume(PolicyRulesMode::Enforce).await;
+            assert_eq!(proxy.codes(), built_in_codes());
+            assert_eq!(proxy.rejected("digest_mismatch"), 1);
+
+            // A 4.15.x cache (no signature): ignored with the flag on, used with it off.
+            cache.store(Some("\"v1\""), &good, None);
+            let proxy = resume(PolicyRulesMode::Observe).await;
+            assert_eq!(proxy.codes(), built_in_codes());
+            assert_eq!(proxy.rejected("missing"), 1);
+            let proxy = resume(PolicyRulesMode::Off).await;
+            assert_eq!(proxy.codes(), vec!["ACME-001", "POL-014"]);
+
+            // An ignored cache does not lend its ETag: the API answers with a body.
+            let api = Api::start(signed(&signer, "v1", "ACME-001")).await;
+            cache.store(Some("\"v1\""), &good, None);
+            let proxy = Proxy::start(
+                cfg(
+                    &api.url,
+                    Some(cache_path.clone()),
+                    Duration::from_secs(3600),
+                ),
+                PolicyRulesMode::Enforce,
+                ring_of(&[&signer]),
+            );
+            proxy.ready.wait_ready().await;
+            proxy.task.abort();
+            api.server.abort();
+            assert_eq!(api.seen.lock().unwrap()[0], None, "no If-None-Match");
+            assert_eq!(proxy.codes(), vec!["ACME-001", "POL-014"]);
+            assert!(proxy.verifier.stats.verified_in_effect());
+        }
     }
 }

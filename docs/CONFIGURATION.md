@@ -213,6 +213,8 @@ back to the default, also with a warning.
 | Variable               | Default | Description                                                    |
 |------------------------|---------|----------------------------------------------------------------|
 | `VERICTO_POLICY_RULES` | `off`   | `off`, `observe` or `enforce`, any case. Any other value fails startup |
+| `VERICTO_BUNDLE_SIGNING_KEYS` | — (the key embedded for `VERICTO_API_URL`) | 4.16.0+. The public keys a sync bundle may be signed with, as JSON: `[{"key_id": "…", "public_key": "<PEM, or base64 of the 32-byte key>"}]`. Replaces the embedded key. A malformed value fails startup. Read only with policy rules on |
+| `VERICTO_BUNDLE_SIGNING_KEYS_FILE` | — | 4.16.0+. A path to a file with the same JSON (a mounted secret or config map). Setting both variables fails startup |
 
 A preview of principal-aware policies (CEL inside the custom-rule YAML, engine
 4.4.0), for workspaces the control plane has enabled it for. **With `off` (the
@@ -227,6 +229,35 @@ With `observe` or `enforce`:
   The response's `principals` section and its rules are compiled once per sync. A
   malformed `principals` section is ignored (every session is then unmatched); it
   never fails the sync.
+- **Signed bundles (4.16.0).** The rule sync applies a response only when its
+  `X-Vericto-Bundle-Signature` header verifies: Ed25519 over SHA-256 of
+  `vericto-sync-bundle/1\n` followed by the body exactly as received, with the key
+  the header's `key-id` names. The keys are public. By default the proxy trusts
+  the key the Vericto API at its `VERICTO_API_URL` publishes, embedded in the
+  binary (`https://api.vericto.com`: `vericto-production-2026`;
+  `https://api-staging.vericto.com`: `vericto-staging-2026`; both readable at
+  `GET /api/v1/meta/export-signing-key`). Any other API address trusts no key until
+  `VERICTO_BUNDLE_SIGNING_KEYS` or `VERICTO_BUNDLE_SIGNING_KEYS_FILE` lists one,
+  and logs a warning at startup.
+
+  A response that is unsigned, malformed, signed by a key id the proxy does not
+  trust, or whose signature or digest does not match is **not applied**: the last
+  good bundle stays in effect, the rules cache is not rewritten, and its ETag is
+  not adopted, so the next poll asks for a full body again. Each refusal logs a
+  warning (`alert=bundle_signature_rejected`, with `reason` and `key_id`) and counts
+  in `vericto_proxy_bundle_signature_rejected_total{reason}` (see
+  [Metrics](#metrics)). The rules cache keeps the signature with the body and is
+  verified the same way when it is loaded; a cache that does not verify is ignored.
+  With no good bundle yet (a first start, or a cache written by 4.15.x, which has
+  no signature), the built-in ruleset stays in effect without the workspace's rules
+  or policies, and the proxy still becomes ready: never an unverified bundle, never
+  an outage. Verification runs at sync time only, never per statement.
+
+  **Key rotation.** Several keys can be trusted at once. Give the proxies the new
+  public key first (a release that embeds both, or the override with both), then
+  switch the control plane's active signing key; drop the old key from the proxies
+  later. A proxy that does not hold the key a bundle names keeps its last good
+  bundle until it does.
 - **Principal.** Resolved once per session (again only when a sync changes the
   bundle, or a MySQL COM_CHANGE_USER changes the user) from the database user
   (`db_user`, `db_user_pattern`: medium trust), `application_name` (Postgres) or
@@ -327,6 +358,8 @@ the same figures. All names start with `vericto_proxy_`:
 | `vericto_proxy_telemetry_quota_paused` | gauge | 1 while telemetry is paused for the monthly quota |
 | `vericto_proxy_telemetry_requests_in_flight` | gauge | Telemetry requests outstanding |
 | `vericto_proxy_info{version,buffer}` / `vericto_proxy_telemetry_enabled` | gauge | Build and buffer; whether the control-plane link is on |
+| `vericto_proxy_bundle_signature_verified` | gauge | 4.16.0+, Prometheus only, policy rules on only: 1 once a verified sync bundle is in effect, 0 while the built-in ruleset is |
+| `vericto_proxy_bundle_signature_accepted_total` / `_rejected_total{reason}` | counter | Same conditions. Bundles (responses and the rules cache) whose signature verified, and those refused; `reason` is `missing`, `malformed`, `unsupported_scheme`, `digest_mismatch`, `unknown_key_id`, `bad_signature` or `no_trusted_key` |
 
 - **Prometheus**: `VERICTO_METRICS_PROMETHEUS=true` serves `GET /metrics` on the
   health-check listener (`VERICTO_HEALTHZ_PORT`), never on the database port.
