@@ -113,6 +113,8 @@ pub struct HealthzExtras {
     pub metrics: bool,
     /// The telemetry pipeline, when the control-plane link is on.
     pub stats: Option<StatsSource>,
+    /// The bundle-signature counters (4.16.0), only with policy rules on.
+    pub bundle_signatures: Option<std::sync::Arc<crate::tcp::bundle_signature::SignatureStats>>,
 }
 
 /// `VERICTO_HEALTHZ_ADDR`: the address the health-check listener binds, default
@@ -211,7 +213,10 @@ async fn respond(head: &[u8], extras: &HealthzExtras) -> Vec<u8> {
             Some(s) => tokio::task::spawn_blocking(move || s.pipeline()).await.ok(),
             None => None,
         };
-        let body = crate::telemetry::metrics::render_prometheus(snapshot.as_ref());
+        let mut body = crate::telemetry::metrics::render_prometheus(snapshot.as_ref());
+        if let Some(sig) = &extras.bundle_signatures {
+            body.push_str(&sig.render_prometheus());
+        }
         return http_response("200 OK", "text/plain; version=0.0.4; charset=utf-8", &body);
     }
     http_response("404 Not Found", "text/plain; charset=utf-8", "not found\n")
@@ -435,12 +440,29 @@ mod tests {
         let on = serve(HealthzExtras {
             metrics: true,
             stats: None,
+            bundle_signatures: None,
         })
         .await;
         let page = get(on, "/metrics").await;
         assert!(page.starts_with("HTTP/1.1 200 OK"), "{page}");
         assert!(page.contains("text/plain; version=0.0.4"));
         assert!(page.contains("vericto_proxy_telemetry_enabled 0"));
+        // Policy rules off: no bundle-signature series at all.
+        assert!(!page.contains("bundle_signature"), "{page}");
+
+        let stats = std::sync::Arc::new(crate::tcp::bundle_signature::SignatureStats::default());
+        stats.record_rejected(&crate::tcp::bundle_signature::Rejection::Missing);
+        let signed = serve(HealthzExtras {
+            metrics: true,
+            stats: None,
+            bundle_signatures: Some(stats),
+        })
+        .await;
+        let page = get(signed, "/metrics").await;
+        assert!(
+            page.contains("vericto_proxy_bundle_signature_rejected_total{reason=\"missing\"} 1"),
+            "{page}"
+        );
         assert!(get(on, "/").await.starts_with("HTTP/1.1 404"));
         assert!(get(on, "/metrics/../x").await.starts_with("HTTP/1.1 404"));
     }

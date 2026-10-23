@@ -8,6 +8,7 @@
 //! query passes through the AST evaluation engine before reaching the real
 //! database.
 
+pub mod bundle_signature;
 pub mod codec;
 pub mod codec_mysql;
 pub mod evaluator;

@@ -152,6 +152,7 @@ async fn main() {
     };
     let mut shutdown_flush: Option<ShutdownFlush> = None;
     let mut metrics_stats: Option<telemetry::heartbeat::StatsSource> = None;
+    let mut bundle_verifier: Option<Arc<tcp::bundle_signature::BundleVerifier>> = None;
     let telemetry_sink = match control_plane {
         Some(mut cp) => {
             // One spool directory per proxy on a shared volume (4.12.0,
@@ -225,6 +226,56 @@ async fn main() {
                 });
             }
 
+            // Bundle signatures (4.16.0): with policy rules on, the syncer applies
+            // only bundles signed by a trusted key. The keyring is resolved here,
+            // once; a malformed override stops the proxy instead of trusting less
+            // (or more) than the operator meant.
+            bundle_verifier = if tcp_opts.policy_rules.is_on() {
+                match tcp::bundle_signature::Keyring::from_vars(&cp.api_url, |k| {
+                    std::env::var(k).ok()
+                }) {
+                    Ok(keyring) => {
+                        if keyring.is_empty() {
+                            tracing::warn!(
+                                alert = "bundle_signature_no_trusted_key",
+                                api_url = %cp.api_url,
+                                "VERICTO_POLICY_RULES is on but no bundle-signing key is trusted for this \
+                                 VERICTO_API_URL: every sync bundle will be refused and the built-in ruleset \
+                                 stays in effect. Set VERICTO_BUNDLE_SIGNING_KEYS or \
+                                 VERICTO_BUNDLE_SIGNING_KEYS_FILE to the control plane's public key(s)"
+                            );
+                        } else {
+                            tracing::info!(
+                                key_ids = ?keyring.key_ids(),
+                                source = ?keyring.source(),
+                                "Sync bundles must carry a valid Ed25519 signature (VERICTO_POLICY_RULES is on)"
+                            );
+                        }
+                        Some(Arc::new(tcp::bundle_signature::BundleVerifier::new(
+                            keyring,
+                        )))
+                    }
+                    Err(e) => {
+                        tracing::error!("{e}");
+                        std::process::exit(1);
+                    }
+                }
+            } else {
+                if [
+                    tcp::bundle_signature::KEYS_ENV,
+                    tcp::bundle_signature::KEYS_FILE_ENV,
+                ]
+                .iter()
+                .any(|k| std::env::var(k).is_ok_and(|v| !v.trim().is_empty()))
+                {
+                    tracing::info!(
+                        "VERICTO_BUNDLE_SIGNING_KEYS(_FILE) is set but VERICTO_POLICY_RULES is off: \
+                         sync bundles are not verified, the keys are ignored"
+                    );
+                }
+                None
+            };
+
             // Rule syncer: polls GET /sync/rules and swaps the ruleset and
             // policy in place. Flips `readiness` after its first attempt.
             let sync_cfg = cp.clone();
@@ -236,6 +287,7 @@ async fn main() {
             let sync_policy_rules = crate::tcp::rules_sync::PolicyRulesSync {
                 mode: tcp_opts.policy_rules,
                 bundle: policy_rules.clone(),
+                verifier: bundle_verifier.clone(),
             };
             tokio::spawn(async move {
                 crate::tcp::rules_sync::run_with_policy_rules(
@@ -284,6 +336,7 @@ async fn main() {
         let extras = crate::tcp::healthz::HealthzExtras {
             metrics: metrics_cfg.prometheus,
             stats: metrics_stats.clone(),
+            bundle_signatures: bundle_verifier.as_ref().map(|v| Arc::clone(&v.stats)),
         };
         tokio::spawn(async move {
             if let Err(e) = crate::tcp::healthz::run_healthz(

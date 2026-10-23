@@ -37,6 +37,11 @@ struct CacheFile {
     etag: Option<String>,
     /// The `/sync/rules` response body, verbatim.
     body: String,
+    /// Its `X-Vericto-Bundle-Signature` header, when it had one (4.16.0). Optional
+    /// in the file, so files written before it load, and proxies before 4.16.0
+    /// read files that carry it (they ignore unknown fields).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    signature: Option<String>,
 }
 
 /// A response read back from the cache.
@@ -45,6 +50,8 @@ pub struct CachedSync {
     pub etag: Option<String>,
     pub body: String,
     pub saved_at: String,
+    /// The body's bundle signature, verified by the syncer with policy rules on.
+    pub signature: Option<String>,
 }
 
 /// Last-good ruleset store for one control-plane link.
@@ -100,6 +107,7 @@ impl RulesCache {
             etag: file.etag,
             body: file.body,
             saved_at: file.saved_at,
+            signature: file.signature,
         })
     }
 
@@ -107,13 +115,14 @@ impl RulesCache {
     /// place, so a crash mid-write leaves the previous copy, never a truncated one.
     /// Failures are logged and otherwise ignored: the cache is an optimization for
     /// restarts, and the live ruleset is already in memory.
-    pub fn store(&self, etag: Option<&str>, body: &str) {
+    pub fn store(&self, etag: Option<&str>, body: &str, signature: Option<&str>) {
         let file = CacheFile {
             format: FORMAT,
             link: self.link.clone(),
             saved_at: chrono::Utc::now().to_rfc3339(),
             etag: etag.map(str::to_string),
             body: body.to_string(),
+            signature: signature.map(str::to_string),
         };
         if let Err(e) = write_atomic(&self.path, &file) {
             tracing::warn!(file = %self.path.display(), error = %e, "Failed to write rules cache");
@@ -209,15 +218,43 @@ mod tests {
         let cache = RulesCache::from_config(&cfg(&path, "k1", Some("db1"))).unwrap();
         assert!(cache.load().is_none());
 
-        cache.store(Some("\"v1\""), r#"{"version":"1","rules":[]}"#);
+        cache.store(Some("\"v1\""), r#"{"version":"1","rules":[]}"#, None);
         let got = cache.load().unwrap();
         assert_eq!(got.etag.as_deref(), Some("\"v1\""));
         assert_eq!(got.body, r#"{"version":"1","rules":[]}"#);
 
         // A later store replaces it; no temporary file is left behind.
-        cache.store(None, "{}");
+        cache.store(None, "{}", None);
         assert_eq!(cache.load().unwrap().body, "{}");
         assert_eq!(fs::read_dir(path.parent().unwrap()).unwrap().count(), 1);
+    }
+
+    /// The bundle signature (4.16.0) is stored next to the body; a file written
+    /// without one (4.15.x) still loads, with no signature.
+    #[test]
+    fn round_trips_the_signature_and_reads_files_without_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rules.json");
+        let cache = RulesCache::from_config(&cfg(&path, "k1", None)).unwrap();
+        cache.store(
+            Some("\"v2\""),
+            "{}",
+            Some("scheme=ed25519-sha256; key-id=k"),
+        );
+        assert_eq!(
+            cache.load().unwrap().signature.as_deref(),
+            Some("scheme=ed25519-sha256; key-id=k")
+        );
+        let raw = fs::read_to_string(&path).unwrap();
+        assert!(raw.contains("\"signature\""));
+
+        cache.store(None, "{}", None);
+        let raw = fs::read_to_string(&path).unwrap();
+        assert!(
+            !raw.contains("signature"),
+            "no field without a signature: {raw}"
+        );
+        assert_eq!(cache.load().unwrap().signature, None);
     }
 
     #[test]
@@ -227,7 +264,7 @@ mod tests {
         let key = "vk_live_supersecretvalue123";
         RulesCache::from_config(&cfg(&path, key, None))
             .unwrap()
-            .store(None, "{}");
+            .store(None, "{}", None);
         let raw = fs::read_to_string(&path).unwrap();
         assert!(!raw.contains(key));
     }
@@ -238,7 +275,7 @@ mod tests {
         let path = dir.path().join("rules.json");
         RulesCache::from_config(&cfg(&path, "k1", Some("db1")))
             .unwrap()
-            .store(None, "{}");
+            .store(None, "{}", None);
 
         let other_key = RulesCache::from_config(&cfg(&path, "k2", Some("db1"))).unwrap();
         assert!(other_key.load().is_none());
@@ -273,7 +310,7 @@ mod tests {
         let path = dir.path().join("rules.json");
         RulesCache::from_config(&cfg(&path, "k", None))
             .unwrap()
-            .store(None, "{}");
+            .store(None, "{}", None);
         let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
     }
@@ -287,7 +324,7 @@ mod tests {
         let path = dir.path().join(crate::config::RULES_CACHE_FILE);
         RulesCache::from_config(&cfg(&path, "k", None))
             .unwrap()
-            .store(None, "{}");
+            .store(None, "{}", None);
 
         let spool = DiskQueue::new(dir.path().to_string_lossy().into_owned(), 10).unwrap();
         assert!(spool.drain_batch(10).events.is_empty());
