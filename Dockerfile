@@ -62,18 +62,21 @@ COPY third-party ./third-party
 RUN sh third-party/build-notices.sh THIRD_PARTY_LICENSES
 
 # ── Stage 4: minimal runtime ──────────────────────────────────────────────────
-FROM debian:bookworm-slim@sha256:7ff6ba31527b9e336162fa061746c366c4b2032f4d2cff2078bea43f78efe3f8 AS runner
+# Chainguard glibc-dynamic (since 4.15.2, from debian:bookworm-slim): glibc,
+# libgcc_s, the CA bundle and nothing else. No shell, no package manager, no
+# coreutils, so the base carries no OS packages for a scanner to report beyond
+# those three. The binary links only libc, libm and libgcc_s (checked with the
+# image's own `ld.so --list` for 4.15.2); TLS is rustls with the webpki-roots
+# store compiled in, so OpenSSL is not needed and the image's CA bundle is not
+# read (`UPSTREAM_SSLROOTCERT` is a file the deployment mounts).
+#
+# Only the `latest` tag is free on cgr.dev, so it is pinned by digest and
+# Dependabot (docker, weekly) proposes the new digest; Chainguard does not
+# promise to keep old digests, so a stale pin can stop pulling.
+FROM cgr.dev/chainguard/glibc-dynamic:latest@sha256:00696e56634cf72d966ee0e0f26224c83a192569035caf1e31297f77b0e85212 AS runner
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates \
-    libssl3 \
-    && rm -rf /var/lib/apt/lists/*
-
-RUN groupadd --system --gid 1001 vericto && \
-    useradd --system --uid 1001 --gid vericto vericto
-
+# Owned by root and not writable by the user the proxy runs as.
 COPY --from=builder /app/target/release/vericto-proxy /usr/local/bin/vericto-proxy
-RUN chown vericto:vericto /usr/local/bin/vericto-proxy
 
 # The Functional Source License requires that anyone who receives the software
 # also receives its terms (or a link to them) and its copyright notices, and the
@@ -82,7 +85,10 @@ RUN chown vericto:vericto /usr/local/bin/vericto-proxy
 COPY LICENSE NOTICE /usr/share/doc/vericto-proxy/
 COPY --from=builder /app/THIRD_PARTY_LICENSES /usr/share/doc/vericto-proxy/
 
-USER vericto
+# Chainguard's non-root user (`nonroot`, 65532:65532). Up to 4.15.1 the image ran as
+# vericto (1001:1001): a volume written by an older image needs `chown -R 65532:65532`,
+# or run this one with `--user 1001:1001`.
+USER 65532:65532
 
 # `PROXY_EVAL_PORT` and `EXPOSE 5434` date from when evaluation was an HTTP call to a
 # sidecar. The engine runs in-process now and the variable is not read anywhere in the
@@ -93,19 +99,20 @@ ENV RUST_BACKTRACE=0
 EXPOSE 5433
 
 # The health listener is plain TCP: it accepts a connection and closes it without
-# exchanging any bytes (src/tcp/healthz.rs), and it binds `VERICTO_HEALTHZ_PORT`. So the
-# probe is a TCP connect rather than an HTTP GET.
+# exchanging any bytes (src/tcp/healthz.rs), and it binds `VERICTO_HEALTHZ_PORT`.
+# `vericto-proxy healthcheck` makes that TCP connect (to 127.0.0.1, or to
+# `VERICTO_HEALTHZ_ADDR` when it names one address) and exits 0 or 1. The image has
+# no shell, so the check is the binary itself, in exec form.
 #
 # Both deployments already check it this way and do not rely on this directive:
-# docker-compose.yml defines its own TCP check, and on ECS the verdict comes from the
+# docker-compose.yml defines its own check, and on ECS the verdict comes from the
 # NLB target group with `HealthCheckProtocol: TCP`. Matching them here keeps the image
 # usable on its own, which is what `docker run` and `docker ps` report against.
 #
 # The listener is opt-in, so with `VERICTO_HEALTHZ_PORT` unset there is nothing to
 # probe and the container reports healthy: the absence of an optional port is not a
-# failure. Using bash's `exec 3<>` keeps the runtime image free of curl.
+# failure.
 HEALTHCHECK --interval=15s --timeout=5s --start-period=10s --retries=3 \
-    CMD bash -c 'if [ -z "${VERICTO_HEALTHZ_PORT:-}" ]; then exit 0; fi; \
-        exec 3<>/dev/tcp/127.0.0.1/"${VERICTO_HEALTHZ_PORT}" && exec 3<&- && exec 3>&-' || exit 1
+    CMD ["/usr/local/bin/vericto-proxy", "healthcheck"]
 
 CMD ["/usr/local/bin/vericto-proxy"]

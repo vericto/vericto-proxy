@@ -1,4 +1,4 @@
-# Keeps the SHA-pinned GitHub Actions in ci.yml and release.yml and the
+# Keeps the SHA-pinned GitHub Actions in the workflows and the
 # digest-pinned base images in the Dockerfile current, and proposes Cargo
 # updates once a month in a single grouped PR.
 #
@@ -35,16 +35,19 @@ updates:
       cargo:
         patterns: ["*"]
 
-  # Base image digests in the Dockerfile. The Rust image stays on the toolchain
-  # line of rust-toolchain.toml: only its digest moves, not 1.88.
+  # Base image digests in the Dockerfile (and Dockerfile.local). The Rust image
+  # stays on the toolchain line of rust-toolchain.toml: only its digest moves, not
+  # 1.88. The runtime base is cgr.dev/chainguard/glibc-dynamic:latest pinned by
+  # digest: `latest` is the only free tag, so there is no version to bump, only the
+  # digest, and Chainguard rebuilds it often and does not promise to keep old
+  # digests. Weekly keeps the pin close to what cgr.dev serves; the weekly image
+  # scan (image-scan.yml) fails when the pin falls behind a fix.
   - package-ecosystem: docker
     directory: /
     schedule:
-      interval: monthly
+      interval: weekly
     commit-message:
       prefix: chore(docker)
     ignore:
       - dependency-name: rust
         update-types: ["version-update:semver-major", "version-update:semver-minor"]
-      - dependency-name: debian
-        update-types: ["version-update:semver-major"]

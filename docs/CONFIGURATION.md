@@ -265,7 +265,7 @@ With `observe` or `enforce`:
 | Variable               | Default | Description                                   |
 |------------------------|---------|-----------------------------------------------|
 | `VERICTO_HEALTHZ_PORT` | — (off) | TCP port for load-balancer health checks      |
-| `VERICTO_HEALTHZ_ADDR` | `0.0.0.0` | Address the health-check listener binds (an IP; an invalid value stops the proxy at startup). The image's `HEALTHCHECK` probes `127.0.0.1`: with another address, probe that one instead |
+| `VERICTO_HEALTHZ_ADDR` | `0.0.0.0` | Address the health-check listener binds (an IP; an invalid value stops the proxy at startup). `vericto-proxy healthcheck` (the image's `HEALTHCHECK`) probes `127.0.0.1` when this is `0.0.0.0`, `::1` when `::`, and this address otherwise |
 
 The listener accepts each connection and closes it without exchanging any bytes, so
 a probe is a plain TCP connect. (Since 4.12.0 it closes when the peer does, or after
@@ -277,6 +277,25 @@ It opens only once warm-up is done: at startup without the control-plane link, o
 after the first rule-sync attempt (successful or not) with it. Until then probes get
 connection refused. The image's `HEALTHCHECK` probes this port when it is set. A
 value that is not a valid port number is ignored, and the listener stays off.
+
+`vericto-proxy healthcheck` (4.15.2 and later) is that probe as a command, for the
+image, which has no shell: it connects to the listener with a 3-second timeout,
+closes, and exits `0` on success, `1` on failure or on a `VERICTO_HEALTHZ_PORT` that
+is not a port number, and `0` when the variable is unset or empty (nothing to probe).
+Use it in exec form wherever a container health check is declared:
+
+```yaml
+# Docker Compose
+healthcheck:
+  test: ["CMD", "/usr/local/bin/vericto-proxy", "healthcheck"]
+```
+
+```json
+"healthCheck": { "command": ["CMD", "/usr/local/bin/vericto-proxy", "healthcheck"] }
+```
+
+The command reads the same `VERICTO_HEALTHZ_PORT` and `VERICTO_HEALTHZ_ADDR` as the
+proxy, so it needs no arguments.
 
 ## Observability
 
