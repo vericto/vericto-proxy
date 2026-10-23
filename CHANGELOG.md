@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [4.15.3] — 2026-10-23
+
+**Performance: less CPU per statement on the always-on path.** No behaviour change:
+same verdicts, same bytes to the database and the client, same telemetry content.
+
+The M2 release gate measured 4.15.0 with `VERICTO_POLICY_RULES=off` at +3.6% proxy
+CPU per transaction against 4.14.3 on MySQL (oltp_read_only, 0.5 vCPU). With the flag
+off, 4.15.0 runs the same number of instructions per statement as 4.14.3 (within
+0.2%; the policy paths take none), so the difference is code layout and cache
+behaviour of the larger binary, not extra work. This release takes work out of the
+per-statement path instead:
+
+### Changed
+
+- **Telemetry batches are serialized straight from the events.** The request body
+  of `POST /ingest/events` used to be built as a `serde_json::Value` first, which
+  copied every field of every event (one event per statement) into a map and a
+  string of its own before writing it out. It is now written directly. The body is
+  the same JSON document; only the order of the keys inside an event changes (the
+  declaration order instead of alphabetical), which JSON does not give any meaning.
+- **A flagged statement's rule code and AST path are moved, not copied,** into the
+  decision the session acts on.
+- Together, on a fixed MySQL oltp_read_only replay (16 statements per transaction):
+  **-10.4% user-space instructions per transaction** against 4.14.3, 4.15.0 and 4.15.1
+  (3.35 M against 3.73 M, callgrind), with the same system calls.
+
 ## [4.15.2] — 2026-10-22
 
 **Security: the runtime image moves to Chainguard `glibc-dynamic`, with no shell.**
