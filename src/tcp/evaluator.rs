@@ -243,13 +243,12 @@ fn decide(outcome: EvaluationOutcome, dialect: Dialect, policy: &EnforcementPoli
             sensitive_columns: outcome.sensitive_columns,
             access_denied: outcome.access_denied,
         },
+        // The outcome is ours: its strings move into the observation (no copy per
+        // flagged statement).
         Decision::Flag | Decision::Allow => TcpDecision::Forward {
             observation: outcome.action.map(|action| Observation {
-                rule_code: outcome
-                    .rule_code
-                    .clone()
-                    .unwrap_or_else(|| "VERICTO".to_string()),
-                ast_node_path: outcome.ast_node_path.clone().unwrap_or_default(),
+                rule_code: outcome.rule_code.unwrap_or_else(|| "VERICTO".to_string()),
+                ast_node_path: outcome.ast_node_path.unwrap_or_default(),
                 severity: outcome.severity.unwrap_or(Severity::Medium),
                 action,
                 parse_error: None,

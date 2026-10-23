@@ -587,11 +587,17 @@ impl Backoff {
 /// The request body, serialized (and compressed) on the blocking pool so a
 /// 500-event batch never occupies a runtime thread the query path also uses.
 async fn encode_body(events: &[TelemetryEvent], gzip: bool) -> Result<Vec<u8>, DeliveryError> {
-    let json = serde_json::to_vec(&serde_json::json!({ "events": events })).map_err(|e| {
-        DeliveryError::Retryable {
+    // `{"events": [...]}`, serialized straight from the events: building a
+    // `serde_json::Value` first copied every field of every event (one per
+    // statement) into a map and a string of its own, only to drop them.
+    #[derive(serde::Serialize)]
+    struct EventsBody<'a> {
+        events: &'a [TelemetryEvent],
+    }
+    let json =
+        serde_json::to_vec(&EventsBody { events }).map_err(|e| DeliveryError::Retryable {
             reason: format!("serialize: {e}"),
-        }
-    })?;
+        })?;
     if !gzip {
         return Ok(json);
     }
@@ -897,6 +903,49 @@ mod tests {
             "dialect": "postgres", "status": "ALLOWED", "occurred_at": "2026-10-13T00:00:00Z"
         }))
         .unwrap()
+    }
+
+    /// The request body is serialized straight from the events (4.15.3): it is
+    /// the same JSON as the `{"events": [...]}` value it used to be built from,
+    /// for a minimal event and for one with every optional field set, plain and
+    /// gzip-compressed.
+    #[tokio::test]
+    async fn encode_body_is_the_events_document() {
+        use std::io::Read;
+        let full: crate::telemetry::TelemetryEvent = serde_json::from_value(serde_json::json!({
+            "event_id": "e-full", "database_id": "db-1", "query_text": "UPDATE t SET a = 1",
+            "dialect": "mysql", "status": "BLOCKED", "occurred_at": "2026-10-13T00:00:00Z",
+            "rule_code": "VERICTO-001", "ast_node_path": "UpdateStmt > WhereClause = NULL",
+            "severity": "critical", "enforcement_action": "block", "latency_ms": 0.042,
+            "parse_error": null, "client_ip": "10.0.0.7", "rewritten_query": "SELECT 1",
+            "violations": [{"rule_code": "VERICTO-001", "severity": "critical",
+                "enforcement_action": "block", "ast_node_path": "UpdateStmt > WhereClause = NULL"}],
+            "sensitive_columns": [{"schema": null, "table": "customers", "column": "email", "policy": "mask"}],
+            "db_user": "app", "access_policy_mode": "enforce",
+            "access_denied": [{"schema": "public", "table": "secrets", "column": null, "needed": "read"}],
+            "principal_id": "bot", "principal_type": "agent", "principal_trust": "medium",
+            "principal_via": "db_user", "application_name": "orm", "policy_bundle_version": "v1",
+            "ticket_id": "OPS-1", "session_tenant": "acme"
+        }))
+        .unwrap();
+        let events = vec![event("e-min".into()), full];
+        let expected = serde_json::json!({ "events": events });
+
+        let Ok(plain) = encode_body(&events, false).await else {
+            panic!("plain body")
+        };
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&plain).unwrap(),
+            expected
+        );
+        let Ok(gz) = encode_body(&events, true).await else {
+            panic!("gzip body")
+        };
+        let mut unzipped = Vec::new();
+        flate2::read::GzDecoder::new(&gz[..])
+            .read_to_end(&mut unzipped)
+            .unwrap();
+        assert_eq!(unzipped, plain);
     }
 
     async fn wait_for(mut done: impl FnMut() -> bool) {
