@@ -53,44 +53,22 @@ RUN sed -i -E 's|vericto-engine = \{ git = "https://github.com/[^"]+/vericto-eng
 # Build.
 RUN cargo build --release
 
-# Stage 2: Runtime — minimal Debian
-FROM debian:bookworm-slim AS runner
-
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates \
-    libssl3 \
-    && rm -rf /var/lib/apt/lists/*
-
-RUN groupadd --system --gid 1001 vericto && \
-    useradd --system --uid 1001 --gid vericto vericto
+# Stage 2: Runtime — the production Dockerfile's base (see the notes there): no
+# shell, so the health check is the binary's own `healthcheck` subcommand.
+FROM cgr.dev/chainguard/glibc-dynamic:latest@sha256:00696e56634cf72d966ee0e0f26224c83a192569035caf1e31297f77b0e85212 AS runner
 
 COPY --from=builder /app/target/release/vericto-proxy /usr/local/bin/vericto-proxy
-RUN chown vericto:vericto /usr/local/bin/vericto-proxy
 
-USER vericto
+# Chainguard's non-root user (65532:65532), as in the production image.
+USER 65532:65532
 
-# `PROXY_EVAL_PORT` and `EXPOSE 5434` date from when evaluation was an HTTP call to a
-# sidecar. The engine runs in-process now and the variable is not read anywhere in the
-# source, so the image no longer advertises a port it does not serve.
 ENV RUST_LOG=info
 ENV RUST_BACKTRACE=0
 
 EXPOSE 5433
 
-# The health listener is plain TCP: it accepts a connection and closes it without
-# exchanging any bytes (src/tcp/healthz.rs), and it binds `VERICTO_HEALTHZ_PORT`. So the
-# probe is a TCP connect rather than an HTTP GET.
-#
-# Both deployments already check it this way and do not rely on this directive:
-# docker-compose.yml defines its own TCP check, and on ECS the verdict comes from the
-# NLB target group with `HealthCheckProtocol: TCP`. Matching them here keeps the image
-# usable on its own, which is what `docker run` and `docker ps` report against.
-#
-# The listener is opt-in, so with `VERICTO_HEALTHZ_PORT` unset there is nothing to
-# probe and the container reports healthy: the absence of an optional port is not a
-# failure. Using bash's `exec 3<>` keeps the runtime image free of curl.
+# A TCP connect to the healthz listener; exit 0 with VERICTO_HEALTHZ_PORT unset.
 HEALTHCHECK --interval=15s --timeout=5s --start-period=10s --retries=3 \
-    CMD bash -c 'if [ -z "${VERICTO_HEALTHZ_PORT:-}" ]; then exit 0; fi; \
-        exec 3<>/dev/tcp/127.0.0.1/"${VERICTO_HEALTHZ_PORT}" && exec 3<&- && exec 3>&-' || exit 1
+    CMD ["/usr/local/bin/vericto-proxy", "healthcheck"]
 
 CMD ["/usr/local/bin/vericto-proxy"]

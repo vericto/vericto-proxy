@@ -22,6 +22,9 @@ jobs:
     permissions:
       contents: read
       packages: write
+      # Keyless (Sigstore) signing of the SBOM attestation of this platform's image.
+      id-token: write
+      attestations: write
     strategy:
       fail-fast: false
       matrix:
@@ -58,6 +61,43 @@ jobs:
             org.opencontainers.image.description=Vericto SQL security proxy — deterministic AST parsing
             org.opencontainers.image.licenses=FSL-1.1-ALv2
 
+      # The gate runs before anything is pushed: the image is built once into a
+      # local archive, scanned, and only then built again (every layer from the
+      # builder's cache) and pushed by digest.
+      - name: Build for the scan (not pushed)
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          target: runner
+          platforms: ${{ matrix.platform }}
+          tags: vericto-proxy:scan
+          push: false
+          labels: ${{ steps.meta.outputs.labels }}
+          provenance: false
+          cache-from: type=gha,scope=${{ matrix.platform }}
+          outputs: type=docker,dest=${{ runner.temp }}/image.tar
+
+      # Fails on a Critical or High finding that has a fix available; findings with
+      # no fix yet are printed and do not block (see ci.yml, container-scan).
+      - name: Scan with Grype (fail on fixable Critical/High)
+        env:
+          # anchore/grype v0.121.0, pinned by digest (multi-arch index).
+          GRYPE_IMAGE: docker.io/anchore/grype:v0.121.0@sha256:621d56d1d68106b787022c81546f7e0a36202a25d1239f0c20195fab8c16f7ea
+        run: |
+          docker run --rm -v "$RUNNER_TEMP:/scan:ro" "$GRYPE_IMAGE" \
+            docker-archive:/scan/image.tar --by-cve -o table
+          docker run --rm -v "$RUNNER_TEMP:/scan:ro" "$GRYPE_IMAGE" \
+            docker-archive:/scan/image.tar --by-cve --only-fixed --fail-on high -o table
+
+      - name: Generate the SBOM (SPDX JSON, Syft)
+        env:
+          # anchore/syft v1.55.0, pinned by digest (multi-arch index).
+          SYFT_IMAGE: docker.io/anchore/syft:v1.55.0@sha256:4cc92b64ca74ffca4c94d4c8fcc01f217731375300be14d0b6eeb2e82eaa110a
+        run: |
+          docker run --rm -v "$RUNNER_TEMP:/scan:ro" "$SYFT_IMAGE" \
+            docker-archive:/scan/image.tar -o spdx-json > "$RUNNER_TEMP/sbom.spdx.json"
+          jq -e '.spdxVersion and (.packages | length > 0)' "$RUNNER_TEMP/sbom.spdx.json" >/dev/null
+
       - name: Build and push digest
         id: build
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
@@ -73,6 +113,26 @@ jobs:
           cache-to: type=gha,mode=max,scope=${{ matrix.platform }}
           # Output digest only — no tag yet (merged in next job)
           outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
+
+      # Stored in GHCR next to the platform image and in GitHub's attestation store.
+      # Its subject is the platform digest, not the multi-arch index: verify with
+      # `gh attestation verify oci://ghcr.io/vericto/vericto-proxy@<platform digest>
+      # --repo vericto/vericto-proxy --predicate-type https://spdx.dev/Document/v2.3`.
+      - name: Attest the SBOM
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          sbom-path: ${{ runner.temp }}/sbom.spdx.json
+          push-to-registry: true
+
+      - name: Upload the SBOM
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: sbom-${{ matrix.platform == 'linux/amd64' && 'amd64' || 'arm64' }}
+          path: ${{ runner.temp }}/sbom.spdx.json
+          if-no-files-found: error
+          retention-days: 90
 
       - name: Export digest
         run: |

@@ -1,0 +1,66 @@
+name: Weekly image scan
+
+# New CVEs are published against images that have not changed. Once a week this
+# rebuilds the runtime image from main and scans it, and scans the image last
+# released (`latest` on GHCR), both platforms, with the same gate as ci.yml and
+# release.yml: a Critical or High finding with a fix available fails the run.
+#
+# A failure on the rebuilt image means the pinned base digest is behind (merge the
+# Dependabot `chore(docker)` PR, or bump it by hand); a failure on the released
+# image only means a patch release is due. Nothing is pushed.
+on:
+  schedule:
+    - cron: "17 6 * * 1" # Mondays 06:17 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  scan:
+    name: scan (${{ matrix.platform }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-latest
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+    env:
+      # anchore/grype v0.121.0, pinned by digest (multi-arch index).
+      GRYPE_IMAGE: docker.io/anchore/grype:v0.121.0@sha256:621d56d1d68106b787022c81546f7e0a36202a25d1239f0c20195fab8c16f7ea
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Rebuild the runtime image from main
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          target: runner
+          platforms: ${{ matrix.platform }}
+          push: false
+          provenance: false
+          cache-from: type=gha,scope=weekly-${{ matrix.platform }}
+          cache-to: type=gha,mode=max,scope=weekly-${{ matrix.platform }}
+          outputs: type=docker,dest=${{ runner.temp }}/image.tar
+
+      - name: Scan the rebuilt image
+        run: |
+          docker run --rm -v "$RUNNER_TEMP:/scan:ro" "$GRYPE_IMAGE" \
+            docker-archive:/scan/image.tar --by-cve -o table
+          docker run --rm -v "$RUNNER_TEMP:/scan:ro" "$GRYPE_IMAGE" \
+            docker-archive:/scan/image.tar --by-cve --only-fixed --fail-on high -o table
+
+      - name: Scan the released image (ghcr.io/vericto/vericto-proxy:latest)
+        if: ${{ !cancelled() }}
+        env:
+          PLATFORM: ${{ matrix.platform }}
+        run: |
+          docker run --rm "$GRYPE_IMAGE" \
+            registry:ghcr.io/vericto/vericto-proxy:latest --platform "$PLATFORM" \
+            --by-cve --only-fixed --fail-on high -o table

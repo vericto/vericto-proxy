@@ -225,9 +225,120 @@ fn http_response(status: &str, content_type: &str, body: &str) -> Vec<u8> {
     .into_bytes()
 }
 
+/// Longest the `healthcheck` subcommand waits for the TCP connect. Below the
+/// image's `HEALTHCHECK --timeout` (5s) and the ECS task health check timeout.
+pub const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Where the `healthcheck` subcommand connects, from `VERICTO_HEALTHZ_PORT` and
+/// `VERICTO_HEALTHZ_ADDR` as read through `env`. `Ok(None)`: no port is set, so
+/// the listener is off and there is nothing to probe. A listener bound to all
+/// interfaces is probed on loopback; one bound to a specific address, on it.
+pub fn probe_target(
+    env: &dyn Fn(&str) -> Option<String>,
+) -> Result<Option<std::net::SocketAddr>, String> {
+    let Some(port) = env("VERICTO_HEALTHZ_PORT").filter(|v| !v.trim().is_empty()) else {
+        return Ok(None);
+    };
+    // The proxy ignores an unparseable port and leaves the listener off; the probe
+    // says so instead of reporting healthy for a port that was asked for.
+    let port: u16 = port.trim().parse().map_err(|_| {
+        format!("VERICTO_HEALTHZ_PORT={port:?} is not a port number: the healthz listener is off")
+    })?;
+    let addr = match bind_addr_from(env("VERICTO_HEALTHZ_ADDR").as_deref())? {
+        IpAddr::V4(a) if a.is_unspecified() => IpAddr::from([127, 0, 0, 1]),
+        IpAddr::V6(a) if a.is_unspecified() => IpAddr::from(std::net::Ipv6Addr::LOCALHOST),
+        a => a,
+    };
+    Ok(Some((addr, port).into()))
+}
+
+/// `vericto-proxy healthcheck`: the container health check, for images without a
+/// shell (the runtime image has none since 4.15.2). Connects to the healthz
+/// listener and closes, as a load-balancer TCP probe does, and returns the exit
+/// code: 0 when the connect succeeds or no `VERICTO_HEALTHZ_PORT` is set (an
+/// optional listener that is off is not a failure), 1 otherwise. It never
+/// contacts the upstream database.
+pub fn healthcheck_command(env: &dyn Fn(&str) -> Option<String>) -> i32 {
+    let target = match probe_target(env) {
+        Ok(Some(target)) => target,
+        Ok(None) => return 0,
+        Err(e) => {
+            eprintln!("healthcheck: {e}");
+            return 1;
+        }
+    };
+    match std::net::TcpStream::connect_timeout(&target, PROBE_TIMEOUT) {
+        Ok(_) => 0,
+        Err(e) => {
+            eprintln!("healthcheck: {target}: {e}");
+            1
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn lookup(vars: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> + use<> {
+        let vars: Vec<(String, String)> = vars
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        move |key| vars.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone())
+    }
+
+    #[test]
+    fn the_probe_target_follows_the_listener_configuration() {
+        assert_eq!(probe_target(&lookup(&[])).unwrap(), None);
+        assert_eq!(
+            probe_target(&lookup(&[("VERICTO_HEALTHZ_PORT", " ")])).unwrap(),
+            None
+        );
+        let t = |vars: &[(&str, &str)]| probe_target(&lookup(vars)).unwrap().unwrap().to_string();
+        assert_eq!(t(&[("VERICTO_HEALTHZ_PORT", "8081")]), "127.0.0.1:8081");
+        assert_eq!(
+            t(&[
+                ("VERICTO_HEALTHZ_PORT", "8081"),
+                ("VERICTO_HEALTHZ_ADDR", "::")
+            ]),
+            "[::1]:8081"
+        );
+        assert_eq!(
+            t(&[
+                ("VERICTO_HEALTHZ_PORT", "8081"),
+                ("VERICTO_HEALTHZ_ADDR", "10.0.3.7")
+            ]),
+            "10.0.3.7:8081"
+        );
+        assert!(probe_target(&lookup(&[("VERICTO_HEALTHZ_PORT", "-1")])).is_err());
+        assert!(
+            probe_target(&lookup(&[
+                ("VERICTO_HEALTHZ_PORT", "8081"),
+                ("VERICTO_HEALTHZ_ADDR", "localhost")
+            ]))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn the_healthcheck_command_succeeds_only_against_an_open_listener() {
+        // No port configured: the optional listener is off, which is healthy.
+        assert_eq!(healthcheck_command(&lookup(&[])), 0);
+        assert_eq!(
+            healthcheck_command(&lookup(&[("VERICTO_HEALTHZ_PORT", "x")])),
+            1
+        );
+
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port().to_string();
+        let open = lookup(&[("VERICTO_HEALTHZ_PORT", &port)]);
+        assert_eq!(healthcheck_command(&open), 0);
+
+        // The same port once nothing listens on it (warm-up, or a dead process).
+        drop(listener);
+        assert_eq!(healthcheck_command(&open), 1);
+    }
 
     #[test]
     fn readiness_starts_not_ready_and_flips_once() {

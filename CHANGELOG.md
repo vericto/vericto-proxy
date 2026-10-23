@@ -7,6 +7,65 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [4.15.2] — 2026-10-22
+
+**Security: the runtime image moves to Chainguard `glibc-dynamic`, with no shell.**
+The proxy's behaviour, configuration and wire traffic are 4.15.1's. What changes is
+the image around the binary, and with it how a container health check is written
+and which user the process runs as (see Upgrading).
+
+### Security
+
+- **Runtime base image: `cgr.dev/chainguard/glibc-dynamic:latest@sha256:00696e56…b0e85212`**
+  (Wolfi: glibc 2.44, libgcc and libstdc++ 16.2.0, the CA bundle; 7 packages), from
+  `debian:bookworm-slim@sha256:7ff6ba31…78efe3f8`. The binary links only libc, libm
+  and libgcc_s, all provided by the base (checked with the image's own
+  `ld.so --list`), and TLS is rustls with the compiled-in webpki-roots store, so
+  `libssl3` and `ca-certificates` are no longer installed. Scanned on 2026-10-22 with
+  Trivy 0.76.1 and Grype 0.121.0, both platforms: **0 findings of any severity**
+  (4.15.1: 1 Critical, 12 High unique CVEs with Trivy, 1 Critical, 20 High with
+  Grype, none of them with a Debian 12 fix). This closes the residual util-linux,
+  zlib, glibc, OpenSSL and perl-base findings listed under 4.15.1.
+- **The image has no shell, package manager or coreutils**, which removes them as
+  tools for anyone who gets code execution in the container.
+- **Container scan gate in CI and before release.** `ci.yml` builds the image on
+  every pull request and push and scans it with Grype (pinned by digest);
+  `release.yml` scans each platform image **before it is pushed**. Both fail on a
+  Critical or High finding that has a fix available. A weekly workflow
+  (`image-scan.yml`) rebuilds main and scans it and the released `latest` image.
+- **SBOM.** Each released platform image carries a Sigstore-signed SPDX SBOM
+  attestation (Syft) for its platform digest, also uploaded as a workflow artifact:
+  `gh attestation verify oci://ghcr.io/vericto/vericto-proxy@<platform digest> --repo vericto/vericto-proxy --predicate-type https://spdx.dev/Document/v2.3`.
+- **Dependabot (docker) runs weekly** (it was monthly), so the digest pin follows
+  what cgr.dev serves: only `latest` is free, and Chainguard does not promise to keep
+  old digests.
+
+### Added
+
+- **`vericto-proxy healthcheck`**: the container health check as a subcommand,
+  since the image has no shell. It connects to the healthz listener
+  (`VERICTO_HEALTHZ_PORT`, on `127.0.0.1` or the address `VERICTO_HEALTHZ_ADDR`
+  names), closes, and exits 0 on success, 1 on failure or on a port that is not a
+  number, and 0 when the port is unset (the listener is optional). It never
+  contacts the database. The image's `HEALTHCHECK` uses it in exec form.
+
+### Upgrading
+
+- **Health checks must call the binary**, in exec form:
+  `["CMD", "/usr/local/bin/vericto-proxy", "healthcheck"]` (Docker Compose
+  `healthcheck.test`, ECS `healthCheck.command`, Kubernetes `exec` probes). A
+  `CMD-SHELL` check, `bash -c '... /dev/tcp/...'`, `curl` or `wget` fails in this
+  image and marks the container unhealthy. NLB/ALB TCP target-group checks are
+  unaffected. **Change the check and the image together:** up to 4.15.1 the binary
+  ignores its arguments, so `vericto-proxy healthcheck` against an older image starts
+  a second proxy, which fails to bind the ports already in use and exits 1.
+- **The process runs as `65532:65532`** (Chainguard's `nonroot`), not `1001:1001`. A
+  host or named volume written by an older image (for example a disk telemetry spool)
+  needs `chown -R 65532:65532`, or run the container with `--user 1001:1001`. An EFS
+  access point with a `PosixUser` enforces its own uid and is not affected.
+- **`docker exec <container> sh` and ECS Exec shells no longer work.** Copy files out
+  with `docker cp`; `/metrics` and the EMF line report the telemetry spool.
+
 ## [4.15.1] — 2026-10-22
 
 **Security: the runtime image moves to the current `debian:bookworm-slim`.** No code

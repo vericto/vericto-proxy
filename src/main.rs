@@ -40,6 +40,14 @@ use crate::tcp::rules_sync::{
 
 #[tokio::main]
 async fn main() {
+    // `vericto-proxy healthcheck` (4.15.2): the container health check, since the
+    // runtime image has no shell. Any other argument is ignored, as before.
+    if std::env::args().nth(1).as_deref() == Some("healthcheck") {
+        std::process::exit(crate::tcp::healthz::healthcheck_command(&|key| {
+            std::env::var(key).ok()
+        }));
+    }
+
     init_tracing();
 
     // Install the process-default rustls crypto provider (ring) before any TLS
