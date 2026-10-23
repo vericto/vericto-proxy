@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [4.15.1] — 2026-10-22
+
+**Security: the runtime image moves to the current `debian:bookworm-slim`.** No code
+change; the binary, the configuration and the behaviour are exactly 4.15.0's.
+
+### Security
+
+- **Runtime base image bumped** to `debian:bookworm-slim@sha256:7ff6ba31…78efe3f8`
+  (Debian 12.15 with the `perl-base 5.36.0-7+deb12u4` security update), from
+  `sha256:7c7b2c96…6ccc587`. Amazon ECR scanning of the 4.15.0 image reported 26
+  findings (5 Critical, 13 High) in four base packages; the 5 Critical and all the
+  `perl-base` findings (8 CVEs, among them CVE-2026-42496, CVE-2026-13221,
+  CVE-2026-8376, CVE-2026-12087 and CVE-2026-57433) are fixed by this base.
+- **Still open, no Debian 12 fix published yet:** `util-linux 2.38.1-5+deb12u3`
+  (5 High, 1 Medium), `zlib 1.2.13.dfsg-1` (CVE-2026-85091, High) and
+  `glibc 2.36-9+deb12u14` (1 Medium, 2 Low). Dependabot (docker) moves the digest
+  again when Debian ships them. Debian 13 (trixie) was evaluated and not adopted: it
+  still reports High findings in glibc and zlib and is a major base change.
+
 ## [4.15.0] — 2026-10-21
 
 **Business policy rules, behind `VERICTO_POLICY_RULES` (default `off`).** With the
