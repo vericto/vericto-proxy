@@ -41,6 +41,9 @@ pub enum StartupPacket {
     SslRequest,
     /// The client requests GSSAPI encryption. We respond declining ('N').
     GssRequest,
+    /// A `CancelRequest` (code 80877102) for the session holding this key.
+    /// Handled before any TLS requirement: see `tcp::cancel`.
+    CancelRequest(crate::tcp::cancel::BackendKey),
     /// The real `StartupMessage`. Contains the complete bytes (len + body) to
     /// forward to the upstream unmodified.
     Startup { raw: Vec<u8>, params: StartupParams },
@@ -111,6 +114,16 @@ where
     match code {
         SSL_REQUEST_CODE => Ok(StartupPacket::SslRequest),
         GSS_REQUEST_CODE => Ok(StartupPacket::GssRequest),
+        crate::tcp::cancel::CANCEL_REQUEST_CODE => {
+            crate::tcp::cancel::BackendKey::parse(&body[4..])
+                .map(StartupPacket::CancelRequest)
+                .ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("invalid CancelRequest length: {len}"),
+                    )
+                })
+        }
         _ => {
             // The real StartupMessage. Rebuild the original bytes for forwarding.
             let mut raw = Vec::with_capacity(body_len + 4);

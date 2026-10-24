@@ -11,9 +11,13 @@
 //! - **MySQL:** the status flags of the last OK / EOF packet
 //!   (`SERVER_STATUS_IN_TRANS`, `SERVER_STATUS_AUTOCOMMIT`, …).
 //!
-//! Only built with VERICTO_POLICY_RULES on: with it off the relay is the plain
-//! byte copy of 4.14.3. The trackers never change a byte of the stream; they
-//! only frame it. The relay feeds a chunk before writing it to the client, so
+//! Postgres: always built (since 4.16.1; up to 4.16.0 only with
+//! VERICTO_POLICY_RULES on, so a statement the proxy refused with the flag off
+//! was answered with `I` even inside a transaction block). MySQL: only built
+//! with policy rules on, the only time the proxy writes a reply that carries
+//! status flags (the OK of a consumed `SET vericto.*`); its refusals are ERR
+//! packets, which carry none. The trackers never change a byte of the stream;
+//! they only frame it. The relay feeds a chunk before writing it to the client, so
 //! by the time the client can send its next message the state is current.
 //! Like every reply the proxy writes itself, this assumes the client waits for
 //! the answer to one statement before sending a `SET vericto.*` (no pipelining
@@ -101,6 +105,10 @@ impl ServerTxState {
 /// `ReadyForQuery` status. Every backend message after the StartupMessage is
 /// `tag(1) + length(4, itself included) + body`, so framing from the first byte
 /// of the relay is exact.
+///
+/// Until the first `ReadyForQuery` (the startup phase) it also keeps the body
+/// of the `BackendKeyData` ('K'), the key a `CancelRequest` for this session
+/// presents (see `tcp::cancel`).
 #[derive(Debug, Default)]
 pub struct PgTxTracker {
     header: [u8; 5],
@@ -109,6 +117,12 @@ pub struct PgTxTracker {
     remaining: usize,
     /// The current message is a ReadyForQuery whose status byte is next.
     in_ready: bool,
+    /// A ReadyForQuery has been seen: the startup phase is over.
+    started: bool,
+    /// The body of the BackendKeyData being read, during the startup phase.
+    key_body: Option<Vec<u8>>,
+    /// The BackendKeyData once read, until taken.
+    backend_key: Option<crate::tcp::cancel::BackendKey>,
 }
 
 impl PgTxTracker {
@@ -116,14 +130,33 @@ impl PgTxTracker {
         Self::default()
     }
 
+    /// The session's `BackendKeyData`, once the server has sent it (taken once).
+    pub fn take_backend_key(&mut self) -> Option<crate::tcp::cancel::BackendKey> {
+        self.backend_key.take()
+    }
+
     pub fn feed(&mut self, mut bytes: &[u8], state: &ServerTxState) {
         while !bytes.is_empty() {
+            if self.started && self.remaining == 0 && self.header_len == 0 {
+                bytes = Self::skip_whole_messages(bytes, state);
+                if bytes.is_empty() {
+                    return;
+                }
+            }
             if self.remaining > 0 {
                 if self.in_ready {
                     state.set_pg_status(bytes[0]);
                     self.in_ready = false;
+                    self.started = true;
                 }
                 let n = self.remaining.min(bytes.len());
+                if let Some(body) = self.key_body.as_mut() {
+                    body.extend_from_slice(&bytes[..n]);
+                    if self.remaining == n {
+                        self.backend_key = crate::tcp::cancel::BackendKey::parse(body);
+                        self.key_body = None;
+                    }
+                }
                 self.remaining -= n;
                 bytes = &bytes[n..];
                 continue;
@@ -142,8 +175,38 @@ impl PgTxTracker {
                 ]) as usize;
                 self.remaining = len.saturating_sub(4);
                 self.in_ready = self.header[0] == b'Z' && self.remaining == 1;
+                if !self.started
+                    && self.header[0] == b'K'
+                    && (8..=4 + crate::tcp::cancel::MAX_SECRET_LEN).contains(&self.remaining)
+                {
+                    self.key_body = Some(Vec::with_capacity(self.remaining));
+                }
             }
         }
+    }
+
+    /// The relay's usual case after the startup phase: walks the messages that
+    /// lie whole in `bytes` in place (one header read each, no copy) and records
+    /// the last ReadyForQuery status among them. Returns the tail that starts
+    /// with a message this chunk does not hold whole, for the byte-wise path.
+    fn skip_whole_messages<'a>(bytes: &'a [u8], state: &ServerTxState) -> &'a [u8] {
+        let mut pos = 0;
+        let mut status = None;
+        while let Some(header) = bytes.get(pos..pos + 5) {
+            let len = u32::from_be_bytes([header[1], header[2], header[3], header[4]]) as usize;
+            let end = pos + 1 + len.max(4);
+            if end > bytes.len() {
+                break;
+            }
+            if header[0] == b'Z' && len == 5 {
+                status = Some(bytes[pos + 5]);
+            }
+            pos = end;
+        }
+        if let Some(s) = status {
+            state.set_pg_status(s);
+        }
+        &bytes[pos..]
     }
 }
 
@@ -476,6 +539,71 @@ mod tests {
             assert_eq!(state.pg_status(), PG_FAILED_TRANSACTION, "chunk {chunk}");
             assert!(
                 seen.contains(&PG_IN_TRANSACTION) || chunk > 12,
+                "chunk {chunk}"
+            );
+        }
+    }
+
+    /// After the startup the relay walks whole messages in place: the same
+    /// statuses as the byte-wise path, whatever the chunking.
+    #[test]
+    fn pg_tracks_ready_for_query_after_the_startup_across_any_chunking() {
+        let mut stream = pg(b'K', &[0, 0, 0, 7, 1, 2, 3, 4]);
+        stream.extend(pg(b'Z', b"I"));
+        let mut ends = Vec::new();
+        for (tag, status) in [("BEGIN", b'T'), ("SELECT 1", b'T'), ("ERROR", b'E')] {
+            stream.extend(pg(b'T', b"\x00\x01a\x00\x00\x00\x00\x00\x00\x00\x00\x00\x17\x00\x04\xff\xff\xff\xff\x00\x00"));
+            // A DataRow whose value looks like a ReadyForQuery.
+            stream.extend(pg(b'D', &[0, 1, 0, 0, 0, 6, b'Z', 0, 0, 0, 5, b'X']));
+            stream.extend(pg(b'C', format!("{tag}\0").as_bytes()));
+            stream.extend(pg(b'Z', &[status]));
+            ends.push((stream.len(), status));
+        }
+        stream.extend(pg(b'N', b"SNOTICE\x00\x00"));
+        stream.extend(pg(b'Z', b"I"));
+        ends.push((stream.len(), b'I'));
+        for chunk in 1..=stream.len() {
+            let state = ServerTxState::new();
+            let mut t = PgTxTracker::new();
+            let mut fed = 0;
+            for c in stream.chunks(chunk) {
+                t.feed(c, &state);
+                fed += c.len();
+                // At a ReadyForQuery boundary the state is that one's status.
+                if let Some((_, status)) = ends.iter().find(|(end, _)| *end == fed) {
+                    assert_eq!(state.pg_status(), *status, "chunk {chunk} at {fed}");
+                }
+            }
+            assert_eq!(state.pg_status(), b'I', "chunk {chunk}");
+            assert_eq!(
+                t.take_backend_key().map(|k| k.pid),
+                Some(7),
+                "chunk {chunk}"
+            );
+        }
+    }
+
+    #[test]
+    fn pg_reads_the_backend_key_data_of_the_startup_across_any_chunking() {
+        let mut stream = pg(b'R', &[0, 0, 0, 0]);
+        stream.extend(pg(b'S', b"TimeZone\0UTC\0"));
+        stream.extend(pg(b'K', &[0, 0, 0x10, 0x92, 0xde, 0xad, 0xbe, 0xef]));
+        stream.extend(pg(b'Z', b"I"));
+        // After the startup a 'K' is not a key (the server sends none).
+        stream.extend(pg(b'K', &[0, 0, 0, 1, 1, 1, 1, 1]));
+        for chunk in 1..stream.len() {
+            let state = ServerTxState::new();
+            let mut t = PgTxTracker::new();
+            let mut keys = Vec::new();
+            for c in stream.chunks(chunk) {
+                t.feed(c, &state);
+                keys.extend(t.take_backend_key());
+            }
+            assert_eq!(keys.len(), 1, "chunk {chunk}");
+            assert_eq!(keys[0].pid, 0x1092, "chunk {chunk}");
+            assert_eq!(
+                &keys[0].secret[..],
+                &[0xde, 0xad, 0xbe, 0xef],
                 "chunk {chunk}"
             );
         }

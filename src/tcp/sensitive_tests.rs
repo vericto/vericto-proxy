@@ -101,6 +101,7 @@ pub(super) fn config_with(
         }),
         max_query_bytes: crate::tcp::query_limit::DEFAULT_MAX_QUERY_BYTES,
         policy_rules: Default::default(),
+        cancel_keys: Default::default(),
     });
     (cfg, queue)
 }
@@ -945,7 +946,7 @@ pub(super) async fn connect(cfg: &tokio_postgres::Config) -> tokio_postgres::Cli
 /// Runs `body` against a fresh database seeded with `customers`, reached
 /// through a proxy with [`tags`]. The database is dropped afterwards, also
 /// when `body` panics.
-async fn with_real_pg<F, Fut>(body: F)
+pub(super) async fn with_real_pg<F, Fut>(body: F)
 where
     F: FnOnce(tokio_postgres::Config) -> Fut + Send + 'static,
     Fut: std::future::Future<Output = ()> + Send,

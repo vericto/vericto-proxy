@@ -181,7 +181,7 @@ hop; `PROXY_TLS_MODE` covers the client→proxy hop.
 | `UPSTREAM_SSLMODE`   | `disable` (def) \| `require` \| `verify-ca` \| `verify-full` | TLS to the database, as libpq's `sslmode`: `require` encrypts without verifying the server; `verify-ca` verifies the certificate chain against `UPSTREAM_SSLROOTCERT` but not the hostname; `verify-full` verifies both. Any case; any other value fails startup. `prefer` and `allow` are refused: they connect in plaintext when the server offers no TLS, and the proxy never falls back to plaintext |
 | `UPSTREAM_SSLROOTCERT`| —               | CA bundle (PEM) for `verify-ca` (required) and `verify-full` (optional: without it, the public web roots), on Postgres and MySQL. Read at startup: a missing file, or one without a certificate, fails startup |
 | `UPSTREAM_SSLCERT` / `UPSTREAM_SSLKEY` | —  | Client cert for upstream mutual TLS, on Postgres and MySQL. Read at startup when `UPSTREAM_SSLMODE` is not `disable`: half a pair, a missing file or one without a certificate/key fails startup |
-| `PROXY_TLS_MODE`     | `disable` (def) \| `require` | Terminate client-side TLS. With `require`, a client that does not request TLS is refused (Postgres: SQLSTATE 28000). Any case; any other value fails startup |
+| `PROXY_TLS_MODE`     | `disable` (def) \| `require` | Terminate client-side TLS. With `require`, a client that does not request TLS is refused (Postgres: SQLSTATE 28000), except a Postgres `CancelRequest`, which libpq sends in plaintext (4.16.1+; see [Postgres details](#postgres-details)). Any case; any other value fails startup |
 | `PROXY_TLS_CERT` / `PROXY_TLS_KEY` | —  | Server cert/key presented to clients. Either a **path** to a PEM file or the **PEM contents inline** — inline lets a secrets manager deliver the key, so it never has to be baked into the image |
 
 > **MySQL TLS caveat:** TLS must be on **both** hops or neither — never one. The
@@ -392,7 +392,25 @@ Only two things differ per engine; everything above is shared.
   [Ports](../README.md#ports)).
 - **Block response** is native to each protocol: Postgres `ErrorResponse`
   (`SQLSTATE 42501`), MySQL `ERR_Packet` (`ERROR 1142`). Either way the driver
-  sees a normal SQL error and the connection stays open.
+  sees a normal SQL error and the connection stays open. The statement never
+  reaches the database, so the session's transaction state is the server's:
+  the Postgres `ReadyForQuery` after a refusal reports it (`I`, `T` inside a
+  transaction block, `E` in a failed one; 4.16.1+, with policy rules off too),
+  and a MySQL `ERR_Packet` carries no status flags, so the client keeps those
+  of the server's last OK.
+
+### Postgres details
+
+- **Query cancellation** (psql's Ctrl+C, a driver's cancel API such as JDBC's
+  `Statement.cancel()`) works through the proxy, also with `PROXY_TLS_MODE=require`
+  (4.16.1+). The proxy relays the server's `BackendKeyData` unchanged and
+  forwards a `CancelRequest` (in plaintext, or over TLS as libpq 17's
+  `PQcancelCreate` sends it) on a new connection to the database, over
+  `UPSTREAM_SSLMODE` like any other, only when its process id and secret key are
+  those of a session open on **the same proxy process**. Any other cancel is
+  dropped without an answer, as the server would. Behind a load balancer with
+  more than one proxy replica, a cancel only works when it lands on the replica
+  that holds the session (for example, with source-IP affinity).
 
 ### MySQL details
 
