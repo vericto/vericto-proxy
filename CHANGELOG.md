@@ -7,6 +7,112 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [4.17.1] - 2026-10-24
+
+**PostgreSQL pipelined replies are ordered, and prepared statements follow live
+policy refreshes.** In 4.17.0 the client-reading task wrote a local block directly
+through the same mutex as a relay that copied arbitrary 16 KiB chunks. If a slow
+allowed Query was followed without waiting by a locally blocked Query, the client
+could receive the later `ErrorResponse`/`ReadyForQuery` before the earlier rows;
+the same write could land between the header and body fragments of one large
+backend message. Separately, PostgreSQL SQL was evaluated only at Parse, so an
+already prepared named statement continued under an older ruleset, access policy
+or business-policy context at later Bind/Execute.
+
+### Fixed
+
+- **Ordered PostgreSQL response coordinator.** The frontend registers a bounded
+  response plan before forwarding each message; the backend relay is the only
+  producer of in-session client bytes. It frames backend messages and holds their
+  output position while streaming large bodies, so a local response cannot split
+  a DataRow/COPY message. Async Notice, Notification and ParameterStatus messages
+  remain visible and do not complete a plan. Plans cover simple Query and the
+  extended Parse, Bind, Describe (including ParameterDescription), Execute, Close
+  and Sync response shapes; Flush and COPY continuation messages add no artificial
+  response or round trip. A bounded queue backpressures the frontend rather than
+  silently evicting an association. The frontend `Sync`, not the later backend
+  `ReadyForQuery`, ends plan suppression after an extended error, so messages
+  pipelined immediately after that `Sync` keep their response plans.
+- **Local simple replies use an upstream marker cycle.** A blocked Query or
+  consumed `SET vericto.*` sends a harmless fixed Query upstream, suppresses that
+  cycle and emits the intended local messages immediately before the server's
+  actual ReadyForQuery. Earlier pipelined results therefore finish first and the
+  status remains the server's `I`, `T` or `E`. A marker rejected in a failed
+  transaction preserves PostgreSQL's native 25P02 for a consumed SET.
+- **Local extended errors use PostgreSQL's own recovery.** A blocked Parse, or a
+  stale Bind/Execute rejected after refresh, sends an intentionally invalid Parse
+  upstream. Its ErrorResponse is replaced at that ordered position with Vericto's
+  SQLSTATE 42501; follow-ups and Sync are still forwarded, PostgreSQL performs its
+  native skip-until-Sync; PostgreSQL, not the proxy, supplies ReadyForQuery and
+  transaction-failure semantics. If an earlier backend ErrorResponse already put
+  the sequence into that state, queued later local replacements are discarded up
+  to the real Sync plan, so the earlier error wins.
+- **Prepared SQL refresh.** Named and unnamed statements retain original SQL, the
+  SQL actually prepared upstream and Arc snapshots of their rules, effective
+  policy, policy bundle and session context. Bind re-evaluates when a snapshot
+  changes. Execute does the same and, while business policies are active,
+  re-evaluates on every call so a policy that reads `time.now` cannot preserve a
+  Parse-time allow after its window closes. A newly blocking decision is enforced;
+  if a refreshed mask or `rewrite_limit` would add, remove or change the upstream
+  SQL, the proxy returns `VERICTO-PREPARED-STALE` with a close-and-re-prepare
+  instruction rather than execute the old server-side text. Parse/Bind state
+  commits only on ParseComplete/BindComplete, errors abandon uncertain candidates,
+  CloseComplete commits cleanup, and transaction end clears portals while named
+  statements survive. A portal owns the prepared plan it bound, so closing or
+  replacing the source statement does not change it, as on PostgreSQL. Names,
+  reachable retained SQL and statement/portal counts are bounded; exceeding a
+  bound closes the affected session safely.
+- **COPY and FunctionCall fail-safes.** COPY IN and COPY OUT stay attached to
+  their Query/Execute plan through final completion. COPY BOTH, including
+  streaming replication, is explicitly unsupported by this finite response
+  coordinator and closes the session instead of risking byte interleaving or a
+  false support claim. A FunctionCall denied by an agent-access policy also
+  closes the session: using a simple Query as its ordering marker would destroy
+  PostgreSQL's unnamed prepared statement, a side effect the original message
+  did not have.
+
+### Performance
+
+- A local regression smoke test (`pgbench -S -M extended`, 8 clients, 2
+  workers, PostgreSQL 17, Docker Desktop on Apple Silicon) alternated four
+  8-second runs per version: 4.17.1 averaged 26.3k TPS versus 26.7k for 4.17.0
+  (within 1.4%, with individual runs visibly noisy). This is not a publishable
+  benchmark; it checks that complete backend framing did not introduce an
+  obvious hot-path regression. The reproducible EC2 benchmark remains the
+  release-performance source.
+
+### Compatibility
+
+- MySQL framing, local replies and prepared-statement behavior are unchanged.
+  MySQL prepared SQL is still evaluated when prepared and is not re-evaluated on
+  a later execute after a hot swap.
+- The backend transaction tracker and cancel-key registration still process bytes
+  before those bytes are exposed to the client. A clean upstream EOF closes the
+  session as before; malformed/truncated framing and coordinator mismatches are
+  surfaced and close safely.
+
+### Tests
+
+- Scripted PostgreSQL sessions cover a slow allowed Query followed by a local
+  block, three pipelined simple Queries with the middle blocked, a 32 KiB backend
+  message fragmented at several boundaries around 16 KiB, multiple extended
+  groups with Flush before Sync, a later blocked Parse after an earlier successful
+  group, an earlier backend error suppressing a queued local rejection, and a
+  valid message pipelined immediately after its recovery Sync.
+- Prepared tests cover policy Arc replacement after Parse, unchanged snapshots,
+  time-dependent policies changing without an Arc swap, changed rewrites requiring
+  re-prepare, portals surviving source statement close/replacement, named/unnamed
+  state, backend-acknowledged Parse/Bind/Close lifecycle, transaction-end cleanup,
+  reachable-SQL memory accounting and state bounds. A denied FunctionCall closes
+  without running a Query marker.
+- `src/tcp/article_claims_tests.rs` pins the article's libpg_query 17.7 tree
+  shapes, exact rule codes/paths, documented COPY/version-skew limits and the
+  1,000-run determinism example.
+- `examples/postgres-wire-article` is the public Docker companion: 15 external
+  assertion cases cover PostgreSQL 17/18, simple and extended pipelines,
+  prepared refresh through an ephemeral Ed25519-signed control plane,
+  TLS/SCRAM, cancellation, COPY and large backend frames.
+
 ## [4.17.0] — 2026-10-24
 
 **Bounded reads on the wire: `rewrite_limit` business policies are enforced.**

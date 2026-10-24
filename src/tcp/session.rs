@@ -25,6 +25,7 @@ use tokio::sync::Mutex;
 use vericto_engine::{AccessMode, AccessPolicy, AccessPolicyMap, EnforcementPolicy};
 
 use crate::tcp::client_tls::{ClientRead, ClientWrite};
+use crate::tcp::codec::PgMessage;
 use crate::tcp::evaluator::{
     PolicyEval, TcpDecision, access_command_decision, evaluate_message, evaluate_message_with,
     rewrite_not_enforceable,
@@ -138,7 +139,7 @@ impl SessionAccess {
 
 /// What the session's entrypoint learnt at the handshake, before the
 /// interception loop starts.
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct SessionStart {
     /// The database user the session authenticated as (None when it could not
     /// be read). Selects the session's agent-access policy.
@@ -153,10 +154,13 @@ pub struct SessionStart {
     /// What the session declared at startup (`vericto.ticket`, `vericto.tenant`,
     /// `application_name` / `program_name`). Read only with policy rules on.
     pub declared: crate::tcp::policy_rules::SessionDeclared,
-    /// The transaction state the server last reported, kept by the relay
-    /// (policy rules on; `None` off, and then every reply the proxy writes
-    /// itself says idle, as in 4.14.3).
+    /// The transaction state the server last reported, kept by the PostgreSQL
+    /// relay in every mode since 4.16.1. On MySQL it is present only when the
+    /// policy path needs server status for a locally consumed statement.
     pub tx_state: Option<Arc<crate::tcp::tx_state::ServerTxState>>,
+    /// PostgreSQL only: ordered response plans and prepared-statement state.
+    /// `None` on MySQL, whose existing command/response path is unchanged.
+    pub pg_responses: Option<crate::tcp::pg_response::PgResponseCoordinator>,
 }
 
 /// The schema unqualified names resolve to in a session, as the proxy knows it.
@@ -294,11 +298,12 @@ pub async fn intercept_client_to_server(
 ) -> std::io::Result<()> {
     let client_caps = start.client_caps;
     let tx_state = start.tx_state;
+    let pg_responses = start.pg_responses;
     // What a consumed `SET vericto.*` reports when no relay tracks the state.
     let untracked = crate::tcp::tx_state::ServerTxState::new();
     let mut access = SessionAccess::new(start.user, start.database);
-    // Policy rules (4.15.0): `None` with VERICTO_POLICY_RULES=off, and then
-    // nothing below differs from 4.14.3.
+    // Policy rules (4.15.0): `None` with VERICTO_POLICY_RULES=off; the
+    // protocol ordering and prepared-statement tracking remain active.
     let policy_mode = config.policy_rules.mode;
     let mut session_policy = policy_mode
         .is_on()
@@ -327,7 +332,7 @@ pub async fn intercept_client_to_server(
                 in_command_phase = true;
                 // fall through: this first command-phase message IS classified.
             } else {
-                forward(server_write, &msg.encode()).await?;
+                forward_client_message(server_write, &msg, pg_responses.as_ref(), None).await?;
                 continue;
             }
         }
@@ -360,9 +365,67 @@ pub async fn intercept_client_to_server(
             (bundle, ctx)
         });
 
+        // A prepared statement can outlive the rules, effective access policy,
+        // business-policy bundle or session context under which Parse was
+        // accepted. Bind and Execute re-evaluate only when one of those Arc
+        // snapshots changed. MySQL keeps its existing prepare-time behavior.
+        if let (Some(pg), RawClientMessage::Postgres(message)) = (pg_responses.as_ref(), &msg)
+            && matches!(message.tag, b'B' | b'E')
+        {
+            let rules = config.ruleset.load_full();
+            let policy = access.policy(config);
+            let identity = access.identity(&policy);
+            let current = crate::tcp::pg_response::EvalSnapshot {
+                rules: policy_ctx
+                    .as_ref()
+                    .and_then(|(bundle, _)| bundle.rules.clone())
+                    .unwrap_or(rules),
+                policy,
+                bundle: policy_ctx.as_ref().map(|(bundle, _)| Arc::clone(bundle)),
+                context: policy_ctx.as_ref().map(|(_, ctx)| Arc::clone(ctx)),
+            };
+            if let Some(decision) =
+                refresh_prepared(pg, message, current, policy_mode, config, identity).await?
+            {
+                let TcpDecision::Block {
+                    rule_code,
+                    ast_node_path,
+                    suggested_safe_query,
+                    ..
+                } = &decision
+                else {
+                    unreachable!("prepared refresh only returns a block")
+                };
+                crate::tcp::postgres::log_block(
+                    "<prepared statement>",
+                    proto.dialect(),
+                    rule_code,
+                    ast_node_path,
+                );
+                let block = proto.build_block_response(&BlockContext {
+                    rule_code,
+                    ast_node_path,
+                    suggested_safe_query: suggested_safe_query.as_deref(),
+                    kind: QueryKind::Prepared,
+                    client_seq: message_seq(&msg),
+                    tx: tx_state.as_deref(),
+                });
+                local_block(
+                    proto,
+                    &msg,
+                    server_write,
+                    client_write,
+                    pg_responses.as_ref(),
+                    block,
+                )
+                .await?;
+                continue;
+            }
+        }
+
         match proto.classify(&msg) {
             Classified::Terminate => {
-                forward(server_write, &msg.encode()).await?;
+                forward_client_message(server_write, &msg, pg_responses.as_ref(), None).await?;
                 break;
             }
             Classified::PassThrough => {
@@ -461,14 +524,22 @@ pub async fn intercept_client_to_server(
                             client_seq: message_seq(&msg),
                             tx: tx_state.as_deref(),
                         });
-                        send_to_client(client_write, &block.bytes).await?;
-                        if block.skip_until_sync {
+                        if local_block(
+                            proto,
+                            &msg,
+                            server_write,
+                            client_write,
+                            pg_responses.as_ref(),
+                            block,
+                        )
+                        .await?
+                        {
                             skip_until_sync = true;
                         }
                         continue; // NOT forwarded upstream
                     }
                 }
-                forward(server_write, &msg.encode()).await?;
+                forward_client_message(server_write, &msg, pg_responses.as_ref(), None).await?;
             }
             Classified::Query { sql, kind } => {
                 // `SET vericto.ticket` / `vericto.tenant`: consumed by the proxy,
@@ -494,27 +565,42 @@ pub async fn intercept_client_to_server(
                             ),
                             ContextStatement::NotContext
                         ) {
-                            send_to_client(client_write, &reply.bytes).await?;
-                            if reply.skip_until_sync {
+                            if local_failed_transaction(
+                                &msg,
+                                server_write,
+                                client_write,
+                                pg_responses.as_ref(),
+                                reply,
+                            )
+                            .await?
+                            {
                                 skip_until_sync = true;
                             }
                             continue; // NOT forwarded upstream
                         }
                     }
+                    let mut proposed = sp.declared.clone();
                     match intercept_context_statement(
                         &sql,
                         kind == QueryKind::Prepared,
-                        &mut sp.declared,
+                        &mut proposed,
                     ) {
                         ContextStatement::NotContext => {}
                         ContextStatement::Consumed => {
                             tracing::debug!("SET vericto.* consumed by the proxy");
                             let tx = tx_state.as_deref().unwrap_or(&untracked);
-                            send_to_client(
+                            if local_set_ok(
+                                proto,
+                                &msg,
+                                server_write,
                                 client_write,
-                                &proto.build_set_ok(message_seq(&msg), tx),
+                                pg_responses.as_ref(),
+                                tx,
                             )
-                            .await?;
+                            .await?
+                            {
+                                sp.declared = proposed;
+                            }
                             continue; // NOT forwarded upstream
                         }
                         ContextStatement::Blocked(reason) => {
@@ -551,8 +637,16 @@ pub async fn intercept_client_to_server(
                                 client_seq: message_seq(&msg),
                                 tx: tx_state.as_deref(),
                             });
-                            send_to_client(client_write, &block.bytes).await?;
-                            if block.skip_until_sync {
+                            if local_block(
+                                proto,
+                                &msg,
+                                server_write,
+                                client_write,
+                                pg_responses.as_ref(),
+                                block,
+                            )
+                            .await?
+                            {
                                 skip_until_sync = true;
                             }
                             continue; // NOT forwarded upstream
@@ -568,6 +662,18 @@ pub async fn intercept_client_to_server(
                 let rules = config.ruleset.load_full();
                 let policy = access.policy(config);
                 let identity = access.identity(&policy);
+                let snapshot =
+                    pg_responses
+                        .as_ref()
+                        .map(|_| crate::tcp::pg_response::EvalSnapshot {
+                            rules: policy_ctx
+                                .as_ref()
+                                .and_then(|(bundle, _)| bundle.rules.clone())
+                                .unwrap_or_else(|| Arc::clone(&rules)),
+                            policy: Arc::clone(&policy),
+                            bundle: policy_ctx.as_ref().map(|(bundle, _)| Arc::clone(bundle)),
+                            context: policy_ctx.as_ref().map(|(_, ctx)| Arc::clone(ctx)),
+                        });
 
                 // Admission guard, before any parse. Evaluation cost is linear in
                 // input size, so an oversized statement is refused rather than
@@ -607,8 +713,16 @@ pub async fn intercept_client_to_server(
                             client_seq: message_seq(&msg),
                             tx: tx_state.as_deref(),
                         });
-                        send_to_client(client_write, &block.bytes).await?;
-                        if block.skip_until_sync {
+                        if local_block(
+                            proto,
+                            &msg,
+                            server_write,
+                            client_write,
+                            pg_responses.as_ref(),
+                            block,
+                        )
+                        .await?
+                        {
                             skip_until_sync = true;
                         }
                         continue; // query NOT forwarded upstream
@@ -623,7 +737,15 @@ pub async fn intercept_client_to_server(
                         limit = config.max_query_bytes,
                         "Query exceeds VERICTO_MAX_QUERY_BYTES; forwarded unevaluated (monitor_mode)"
                     );
-                    forward(server_write, &msg.encode()).await?;
+                    let action = stage_parse_action(
+                        pg_responses.as_ref(),
+                        &msg,
+                        &sql,
+                        &sql,
+                        snapshot.clone(),
+                    )?;
+                    forward_client_message(server_write, &msg, pg_responses.as_ref(), action)
+                        .await?;
                     continue;
                 }
 
@@ -694,8 +816,16 @@ pub async fn intercept_client_to_server(
                         client_seq: message_seq(&msg),
                         tx: tx_state.as_deref(),
                     });
-                    send_to_client(client_write, &block.bytes).await?;
-                    if block.skip_until_sync {
+                    if local_block(
+                        proto,
+                        &msg,
+                        server_write,
+                        client_write,
+                        pg_responses.as_ref(),
+                        block,
+                    )
+                    .await?
+                    {
                         skip_until_sync = true;
                     }
                     continue; // query NOT forwarded upstream
@@ -738,7 +868,20 @@ pub async fn intercept_client_to_server(
                                 "Query BOUNDED (LIMIT) at TCP proxy; forwarding the rewritten SQL"
                             }
                         );
-                        forward(server_write, &rewritten_msg.encode()).await?;
+                        let action = stage_parse_action(
+                            pg_responses.as_ref(),
+                            &msg,
+                            &sql,
+                            rewritten,
+                            snapshot.clone(),
+                        )?;
+                        forward_client_message(
+                            server_write,
+                            &rewritten_msg,
+                            pg_responses.as_ref(),
+                            action,
+                        )
+                        .await?;
                         continue;
                     }
                     // Rare: `evaluate` already refuses a rewrite for a dialect
@@ -776,15 +919,24 @@ pub async fn intercept_client_to_server(
                         client_seq: message_seq(&msg),
                         tx: tx_state.as_deref(),
                     });
-                    send_to_client(client_write, &block.bytes).await?;
-                    if block.skip_until_sync {
+                    if local_block(
+                        proto,
+                        &msg,
+                        server_write,
+                        client_write,
+                        pg_responses.as_ref(),
+                        block,
+                    )
+                    .await?
+                    {
                         skip_until_sync = true;
                     }
                     continue;
                 }
 
                 // Allowed / flagged / monitored → forward unchanged.
-                forward(server_write, &msg.encode()).await?;
+                let action = stage_parse_action(pg_responses.as_ref(), &msg, &sql, &sql, snapshot)?;
+                forward_client_message(server_write, &msg, pg_responses.as_ref(), action).await?;
             }
         }
     }
@@ -943,6 +1095,7 @@ async fn run_mysql_session(
             .mode
             .is_on()
             .then(|| Arc::new(crate::tcp::tx_state::ServerTxState::new())),
+        pg_responses: None,
     };
     // Policy rules on (4.15.0): `program_name` and the `vericto.*` connect
     // attributes are read; the `vericto.*` ones are taken out of the response.
@@ -1172,6 +1325,144 @@ fn is_postgres_sync(msg: &RawClientMessage) -> bool {
     matches!(msg, RawClientMessage::Postgres(m) if m.tag == b'S')
 }
 
+async fn local_block(
+    _proto: &dyn WireProtocol,
+    original: &RawClientMessage,
+    server_write: &mut crate::tcp::upstream::UpstreamWrite,
+    client_write: &Arc<Mutex<ClientWrite>>,
+    pg: Option<&crate::tcp::pg_response::PgResponseCoordinator>,
+    block: crate::tcp::protocol::BlockResponse,
+) -> std::io::Result<bool> {
+    if let Some(pg) = pg {
+        if matches!(original, RawClientMessage::Postgres(message) if message.tag == b'F') {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "blocked PostgreSQL FunctionCall closes the session because no side-effect-free ordered response fence exists",
+            ));
+        }
+        let replacement = if block.skip_until_sync {
+            block.bytes
+        } else {
+            postgres_before_ready(block.bytes)?
+        };
+        if block.skip_until_sync {
+            pg.register(
+                crate::tcp::pg_response::PlanKind::Parse,
+                Some(replacement),
+                false,
+                None,
+            )
+            .await?;
+            let invalid = RawClientMessage::Postgres(crate::tcp::pg_response::invalid_parse());
+            forward(server_write, &invalid.encode()).await?;
+        } else {
+            pg.register(
+                crate::tcp::pg_response::PlanKind::Simple,
+                Some(replacement),
+                false,
+                Some(crate::tcp::pg_response::PreparedAction::SimpleQuery),
+            )
+            .await?;
+            forward(server_write, &postgres_marker_query().encode()).await?;
+        }
+        return Ok(false);
+    }
+    let _ = original;
+    send_to_client(client_write, &block.bytes).await?;
+    Ok(block.skip_until_sync)
+}
+
+/// A consumed simple SET is ordered by a harmless upstream cycle. If an
+/// earlier pipelined statement put the transaction into failed state, the
+/// marker's native 25P02 is preserved and the synthetic CommandComplete is not
+/// emitted.
+async fn local_set_ok(
+    proto: &dyn WireProtocol,
+    msg: &RawClientMessage,
+    server_write: &mut crate::tcp::upstream::UpstreamWrite,
+    client_write: &Arc<Mutex<ClientWrite>>,
+    pg: Option<&crate::tcp::pg_response::PgResponseCoordinator>,
+    tx: &crate::tcp::tx_state::ServerTxState,
+) -> std::io::Result<bool> {
+    let bytes = proto.build_set_ok(message_seq(msg), tx);
+    if let Some(pg) = pg {
+        let completion = pg
+            .register_simple_with_completion(
+                postgres_before_ready(bytes)?,
+                true,
+                Some(crate::tcp::pg_response::PreparedAction::SimpleQuery),
+            )
+            .await?;
+        forward(server_write, &postgres_marker_query().encode()).await?;
+        completion.await.map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "PostgreSQL SET response plan was abandoned",
+            )
+        })
+    } else {
+        send_to_client(client_write, &bytes).await?;
+        Ok(true)
+    }
+}
+
+async fn local_failed_transaction(
+    msg: &RawClientMessage,
+    server_write: &mut crate::tcp::upstream::UpstreamWrite,
+    client_write: &Arc<Mutex<ClientWrite>>,
+    pg: Option<&crate::tcp::pg_response::PgResponseCoordinator>,
+    reply: crate::tcp::protocol::BlockResponse,
+) -> std::io::Result<bool> {
+    if let Some(pg) = pg {
+        if reply.skip_until_sync {
+            // PostgreSQL itself supplies 25P02 and enters native extended
+            // skip-until-Sync state; no local replacement is needed.
+            pg.register(crate::tcp::pg_response::PlanKind::Parse, None, false, None)
+                .await?;
+            forward(
+                server_write,
+                &crate::tcp::pg_response::invalid_parse().encode(),
+            )
+            .await?;
+        } else {
+            pg.register(
+                crate::tcp::pg_response::PlanKind::Simple,
+                Some(Vec::new()),
+                true,
+                Some(crate::tcp::pg_response::PreparedAction::SimpleQuery),
+            )
+            .await?;
+            forward(server_write, &postgres_marker_query().encode()).await?;
+        }
+        Ok(false)
+    } else {
+        send_to_client(client_write, &reply.bytes).await?;
+        let _ = msg;
+        Ok(reply.skip_until_sync)
+    }
+}
+
+fn postgres_marker_query() -> PgMessage {
+    PgMessage {
+        tag: b'Q',
+        body: b"SELECT 1 /* vericto ordered response marker */\0".to_vec(),
+    }
+}
+
+fn postgres_before_ready(mut bytes: Vec<u8>) -> std::io::Result<Vec<u8>> {
+    const READY_LEN: usize = 6;
+    if bytes.len() < READY_LEN
+        || bytes[bytes.len() - READY_LEN..bytes.len() - 1] != [b'Z', 0, 0, 0, 5]
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "PostgreSQL simple synthetic response lacks ReadyForQuery",
+        ));
+    }
+    bytes.truncate(bytes.len() - READY_LEN);
+    Ok(bytes)
+}
+
 async fn send_to_client(
     client_write: &Arc<Mutex<ClientWrite>>,
     bytes: &[u8],
@@ -1179,6 +1470,207 @@ async fn send_to_client(
     let mut writer = client_write.lock().await;
     writer.write_all(bytes).await?;
     writer.flush().await
+}
+
+async fn refresh_prepared(
+    pg: &crate::tcp::pg_response::PgResponseCoordinator,
+    message: &PgMessage,
+    current: crate::tcp::pg_response::EvalSnapshot,
+    mode: crate::tcp::policy_rules::PolicyRulesMode,
+    config: &Arc<PgProxyConfig>,
+    identity: EventIdentity,
+) -> std::io::Result<Option<TcpDecision>> {
+    enum Target {
+        Statement(Vec<u8>, crate::tcp::pg_response::PreparedStatement),
+        Portal(Vec<u8>, crate::tcp::pg_response::PreparedStatement),
+    }
+    let target = {
+        let state = pg
+            .prepared()
+            .lock()
+            .map_err(|_| std::io::Error::other("prepared state lock poisoned"))?;
+        match message.tag {
+            b'B' => crate::tcp::pg_response::bind_names(message).and_then(|(_, statement)| {
+                state
+                    .statement(statement)
+                    .map(|prepared| Target::Statement(statement.to_vec(), prepared))
+            }),
+            b'E' => crate::tcp::pg_response::execute_portal(message).and_then(|portal| {
+                state
+                    .statement_for_portal(portal)
+                    .map(|prepared| Target::Portal(portal.to_vec(), prepared))
+            }),
+            _ => None,
+        }
+    };
+    let Some(target) = target else {
+        return Ok(None);
+    };
+    let prepared = match &target {
+        Target::Statement(_, prepared) | Target::Portal(_, prepared) => prepared.clone(),
+    };
+    let time_dependent_execution = message.tag == b'E'
+        && current
+            .bundle
+            .as_ref()
+            .is_some_and(|bundle| !bundle.policies.is_empty());
+    if prepared.snapshot.same_as(&current) && !time_dependent_execution {
+        return Ok(None);
+    }
+
+    let original = prepared.original_sql.clone();
+    let evaluated_sql = original.clone();
+    let config_for_task = Arc::clone(config);
+    let snapshot = current.clone();
+    let decision = tokio::task::spawn_blocking(move || {
+        let start = Instant::now();
+        let decision = match (&snapshot.bundle, &snapshot.context) {
+            (Some(bundle), Some(ctx)) => {
+                let ctx = crate::tcp::policy_rules::at_now(ctx);
+                evaluate_message_with(
+                    &evaluated_sql,
+                    vericto_engine::Dialect::Postgres,
+                    QueryKind::Prepared,
+                    &snapshot.rules,
+                    &snapshot.policy,
+                    Some(&PolicyEval {
+                        mode,
+                        policies: &bundle.policies,
+                        ctx: &ctx,
+                    }),
+                )
+            }
+            _ => evaluate_message(
+                &evaluated_sql,
+                vericto_engine::Dialect::Postgres,
+                QueryKind::Prepared,
+                &snapshot.rules,
+                &snapshot.policy,
+            ),
+        };
+        let desired = match &decision {
+            TcpDecision::Forward {
+                rewritten_query: Some(sql),
+                ..
+            } => sql.as_str(),
+            TcpDecision::Forward { .. } => evaluated_sql.as_ref(),
+            TcpDecision::Block { .. } => "",
+        };
+        let decision = if matches!(decision, TcpDecision::Forward { .. })
+            && desired != prepared.upstream_sql.as_ref()
+        {
+            TcpDecision::Block {
+                rule_code: "VERICTO-PREPARED-STALE".to_string(),
+                ast_node_path: "PreparedStatement > required SQL rewrite changed; close and re-prepare the statement"
+                    .to_string(),
+                suggested_safe_query: None,
+                severity: vericto_engine::Severity::High,
+                violations: Vec::new(),
+                sensitive_columns: Vec::new(),
+                access_denied: Vec::new(),
+            }
+        } else {
+            decision
+        };
+        crate::tcp::postgres::report_telemetry(
+            &config_for_task,
+            &evaluated_sql,
+            vericto_engine::Dialect::Postgres,
+            &decision,
+            start.elapsed().as_micros(),
+            &identity,
+        );
+        decision
+    })
+    .await
+    .map_err(|e| std::io::Error::other(format!("prepared evaluation task failed: {e}")))?;
+
+    if matches!(decision, TcpDecision::Forward { .. }) {
+        let mut state = pg
+            .prepared()
+            .lock()
+            .map_err(|_| std::io::Error::other("prepared state lock poisoned"))?;
+        match target {
+            Target::Statement(name, _) => state.update_snapshot(&name, current),
+            Target::Portal(portal, _) => state.update_portal_snapshot(&portal, current),
+        }
+        Ok(None)
+    } else {
+        Ok(Some(decision))
+    }
+}
+
+fn stage_parse_action(
+    pg: Option<&crate::tcp::pg_response::PgResponseCoordinator>,
+    msg: &RawClientMessage,
+    original_sql: &str,
+    upstream_sql: &str,
+    snapshot: Option<crate::tcp::pg_response::EvalSnapshot>,
+) -> std::io::Result<Option<crate::tcp::pg_response::PreparedAction>> {
+    let (Some(pg), RawClientMessage::Postgres(message), Some(snapshot)) = (pg, msg, snapshot)
+    else {
+        return Ok(None);
+    };
+    if message.tag != b'P' {
+        return Ok(None);
+    }
+    let name = crate::tcp::pg_response::parse_name(message).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "malformed PostgreSQL Parse message",
+        )
+    })?;
+    let id = pg
+        .prepared()
+        .lock()
+        .map_err(|_| std::io::Error::other("prepared state lock poisoned"))?
+        .stage_parse(
+            name,
+            crate::tcp::pg_response::PreparedStatement {
+                original_sql: Arc::from(original_sql),
+                upstream_sql: Arc::from(upstream_sql),
+                snapshot,
+            },
+        )?;
+    Ok(Some(crate::tcp::pg_response::PreparedAction::CommitParse(
+        id,
+    )))
+}
+
+async fn forward_client_message(
+    server_write: &mut crate::tcp::upstream::UpstreamWrite,
+    msg: &RawClientMessage,
+    pg: Option<&crate::tcp::pg_response::PgResponseCoordinator>,
+    action: Option<crate::tcp::pg_response::PreparedAction>,
+) -> std::io::Result<()> {
+    if let (Some(pg), RawClientMessage::Postgres(message)) = (pg, msg) {
+        let action = if action.is_some() {
+            action
+        } else {
+            match message.tag {
+                b'Q' => Some(crate::tcp::pg_response::PreparedAction::SimpleQuery),
+                b'B' => {
+                    let (portal, statement) = crate::tcp::pg_response::bind_names(message)
+                        .ok_or_else(|| {
+                            std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                "malformed PostgreSQL Bind message",
+                            )
+                        })?;
+                    let id = pg
+                        .prepared()
+                        .lock()
+                        .map_err(|_| std::io::Error::other("prepared state lock poisoned"))?
+                        .stage_bind(portal, statement)?;
+                    Some(crate::tcp::pg_response::PreparedAction::CommitBind(id))
+                }
+                b'C' => crate::tcp::pg_response::close_target(message),
+                _ => None,
+            }
+        };
+        pg.register_message(message, action).await?;
+    }
+    forward(server_write, &msg.encode()).await
 }
 
 async fn forward(

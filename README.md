@@ -63,7 +63,7 @@ docker network create vericto-demo
 docker run -d --name vericto-demo-db --network vericto-demo \
   -e POSTGRES_PASSWORD=demo postgres:17
 docker run -d --name vericto-demo-proxy --network vericto-demo \
-  -e UPSTREAM_HOST=vericto-demo-db vericto/vericto-proxy:4.17.0
+  -e UPSTREAM_HOST=vericto-demo-db vericto/vericto-proxy:4.17.1
 until docker exec vericto-demo-db pg_isready -q -h localhost -U postgres; do sleep 1; done
 
 docker run --rm --network vericto-demo postgres:17 \
@@ -75,7 +75,7 @@ docker run --rm --network vericto-demo postgres:17 \
   -c "SELECT id, email FROM users"
 ```
 
-The image comes from Docker Hub; `ghcr.io/vericto/vericto-proxy:4.17.0` serves the
+The image comes from Docker Hub; `ghcr.io/vericto/vericto-proxy:4.17.1` serves the
 same digest (see [Docker](#docker)).
 
 The `DELETE` without a `WHERE` never reaches the database; the one with a `WHERE`
@@ -99,6 +99,10 @@ your own database, see [Docker](#docker) and
 ```bash
 docker rm -f vericto-demo-db vericto-demo-proxy && docker network rm vericto-demo
 ```
+
+For assertion-based coverage of the article's extended protocol, pipelines,
+prepared-policy refresh, TLS/SCRAM, cancellation, COPY and PostgreSQL 18 cases,
+run [`examples/postgres-wire-article/run.sh`](examples/postgres-wire-article/README.md).
 
 ---
 
@@ -145,6 +149,22 @@ needs `VERICTO_POLICY_RULES=enforce`; see
 
 A blocked query is returned as a **native error** for the active protocol (see
 the table above), so no special handling is needed in your application.
+
+**PostgreSQL pipelines and prepared statements (4.17.1).** Local block and
+session-context replies are ordered at the exact position of their upstream
+response cycle, after every earlier pipelined result. Backend messages are framed,
+so even a large row or COPY message is never split by a synthetic reply. Named and
+unnamed prepared SQL is checked again at Bind and Execute after a rules, policy,
+principal or session-context refresh; active time-dependent business policies are checked on
+every Execute. If a mask or `rewrite_limit` would now require different SQL, the
+proxy returns `VERICTO-PREPARED-STALE` and the client must close and prepare the
+statement again. Portals retain the plan they bound even after their source
+statement is closed or replaced. PostgreSQL COPY BOTH/replication is rejected by
+closing the session rather than risk response mis-ordering. A FunctionCall denied
+by an agent-access policy also closes, because a Query-based ordering marker would
+change unnamed-statement state. MySQL behavior is unchanged in this patch: a MySQL
+prepared statement is still checked when prepared, not refreshed when it is later
+executed.
 
 ---
 
@@ -232,7 +252,8 @@ The rest is optional and documented in
   (`VERICTO_MAX_QUERY_BYTES`, 10 MiB by default).
 - **[Business policy rules](docs/CONFIGURATION.md#business-policy-rules-preview-off-by-default)**
   (`VERICTO_POLICY_RULES`, `off` by default): a preview, off unless you turn it
-  on; with it off the proxy behaves exactly as 4.14.3. With it on, the proxy
+  on; with it off the proxy skips principal-aware policy evaluation. PostgreSQL
+  response ordering and prepared-statement tracking remain active. With it on, the proxy
   applies only sync bundles whose Ed25519 signature verifies
   ([`VERICTO_BUNDLE_SIGNING_KEYS`](docs/CONFIGURATION.md#business-policy-rules-preview-off-by-default)
   for a control plane other than Vericto's).
@@ -265,17 +286,17 @@ whichever your environment allows.
 ```bash
 # Postgres. On Linux, add --add-host=host.docker.internal:host-gateway
 docker run --rm -e UPSTREAM_HOST=host.docker.internal -p 5433:5433 \
-  vericto/vericto-proxy:4.17.0
+  vericto/vericto-proxy:4.17.1
 
 # MySQL
 docker run --rm \
   -e VERICTO_WIRE_PROTOCOL=mysql \
   -e UPSTREAM_HOST=host.docker.internal \
   -p 3307:3307 \
-  vericto/vericto-proxy:4.17.0
+  vericto/vericto-proxy:4.17.1
 
 # The same image from GHCR
-docker pull ghcr.io/vericto/vericto-proxy:4.17.0
+docker pull ghcr.io/vericto/vericto-proxy:4.17.1
 ```
 
 Images released from now on carry a build provenance attestation (Sigstore,
@@ -318,7 +339,7 @@ With Docker Compose:
 
 ```yaml
 proxy:
-  image: ${VERICTO_PROXY_IMAGE:-vericto/vericto-proxy:4.17.0}
+  image: ${VERICTO_PROXY_IMAGE:-vericto/vericto-proxy:4.17.1}
   ports:
     - "5433:5433"
   environment:

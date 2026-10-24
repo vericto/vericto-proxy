@@ -8,12 +8,15 @@
 //! query passes through the AST evaluation engine before reaching the real
 //! database.
 
+#[cfg(test)]
+mod article_claims_tests;
 pub mod bundle_signature;
 pub mod cancel;
 pub mod codec;
 pub mod codec_mysql;
 pub mod evaluator;
 pub mod healthz;
+pub mod pg_response;
 pub mod policy_rules;
 pub mod postgres;
 pub mod protocol;
