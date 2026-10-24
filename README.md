@@ -63,7 +63,7 @@ docker network create vericto-demo
 docker run -d --name vericto-demo-db --network vericto-demo \
   -e POSTGRES_PASSWORD=demo postgres:17
 docker run -d --name vericto-demo-proxy --network vericto-demo \
-  -e UPSTREAM_HOST=vericto-demo-db vericto/vericto-proxy:4.16.1
+  -e UPSTREAM_HOST=vericto-demo-db vericto/vericto-proxy:4.16.2
 until docker exec vericto-demo-db pg_isready -q -h localhost -U postgres; do sleep 1; done
 
 docker run --rm --network vericto-demo postgres:17 \
@@ -75,7 +75,7 @@ docker run --rm --network vericto-demo postgres:17 \
   -c "SELECT id, email FROM users"
 ```
 
-The image comes from Docker Hub; `ghcr.io/vericto/vericto-proxy:4.16.1` serves the
+The image comes from Docker Hub; `ghcr.io/vericto/vericto-proxy:4.16.2` serves the
 same digest (see [Docker](#docker)).
 
 The `DELETE` without a `WHERE` never reaches the database; the one with a `WHERE`
@@ -233,6 +233,9 @@ The rest is optional and documented in
   balancers (`VERICTO_HEALTHZ_PORT`).
 - **[Observability](docs/CONFIGURATION.md#observability)**: logs, and
   [metrics](docs/CONFIGURATION.md#metrics) as Prometheus or CloudWatch EMF.
+- **[CPU sizing](docs/CONFIGURATION.md#cpu-sizing)**: capacity per vCPU, when to
+  scale out (CPU at 50–60% of the task's reservation), and `VERICTO_WORKER_THREADS`
+  (by default sized from the container's CPU limit, 1 worker on a 0.5 vCPU task).
 - **[Engine-specific notes](docs/CONFIGURATION.md#engine-specific-notes)**,
   including [MySQL details](docs/CONFIGURATION.md#mysql-details) (TLS, protocol
   compression).
@@ -255,17 +258,17 @@ whichever your environment allows.
 ```bash
 # Postgres. On Linux, add --add-host=host.docker.internal:host-gateway
 docker run --rm -e UPSTREAM_HOST=host.docker.internal -p 5433:5433 \
-  vericto/vericto-proxy:4.16.1
+  vericto/vericto-proxy:4.16.2
 
 # MySQL
 docker run --rm \
   -e VERICTO_WIRE_PROTOCOL=mysql \
   -e UPSTREAM_HOST=host.docker.internal \
   -p 3307:3307 \
-  vericto/vericto-proxy:4.16.1
+  vericto/vericto-proxy:4.16.2
 
 # The same image from GHCR
-docker pull ghcr.io/vericto/vericto-proxy:4.16.1
+docker pull ghcr.io/vericto/vericto-proxy:4.16.2
 ```
 
 Images released from now on carry a build provenance attestation (Sigstore,
@@ -308,7 +311,7 @@ With Docker Compose:
 
 ```yaml
 proxy:
-  image: ${VERICTO_PROXY_IMAGE:-vericto/vericto-proxy:4.16.1}
+  image: ${VERICTO_PROXY_IMAGE:-vericto/vericto-proxy:4.16.2}
   ports:
     - "5433:5433"
   environment:
