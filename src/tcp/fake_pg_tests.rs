@@ -110,6 +110,7 @@ async fn fake_pg_connection(
     loop {
         let m = read_message(&mut sock).await?;
         let mut out = Vec::new();
+        let mut split_reply = false;
         match m.tag {
             b'X' => return Ok(()),
             b'Q' | b'P' => {
@@ -124,7 +125,17 @@ async fn fake_pg_connection(
                     continue;
                 }
                 let upper = sql.to_ascii_uppercase();
-                let (reply, next) = if status == b'E' && upper != "ROLLBACK" && upper != "COMMIT" {
+                let (reply, next) = if upper == "SELECT SLOW_LARGE" {
+                    split_reply = true;
+                    let mut reply = msg(b'D', &vec![b'x'; 32 * 1024 + 37]);
+                    reply.extend(msg(b'C', b"SELECT 1\0"));
+                    (reply, status)
+                } else if upper == "SELECT FROM" {
+                    (
+                        crate::tcp::codec::build_error_response("42601", "syntax error"),
+                        if status == b'I' { b'I' } else { b'E' },
+                    )
+                } else if status == b'E' && upper != "ROLLBACK" && upper != "COMMIT" {
                     (
                         crate::tcp::codec::build_error_response("25P02", "aborted"),
                         b'E',
@@ -154,6 +165,7 @@ async fn fake_pg_connection(
                 }
             }
             b'B' if !skipping => out.extend(msg(b'2', b"")),
+            b'C' if !skipping => out.extend(msg(b'3', b"")),
             b'E' if !skipping => out.extend(msg(b'C', b"SELECT 1\0")),
             b'S' => {
                 skipping = false;
@@ -162,7 +174,21 @@ async fn fake_pg_connection(
             _ => {}
         }
         if !out.is_empty() {
-            sock.write_all(&out).await?;
+            if split_reply {
+                let mut offset = 0;
+                for width in [1usize, 2, 3, 7, 16_383, 5, 8_191, usize::MAX] {
+                    if offset == out.len() {
+                        break;
+                    }
+                    let end = out.len().min(offset.saturating_add(width));
+                    sock.write_all(&out[offset..end]).await?;
+                    sock.flush().await?;
+                    offset = end;
+                    tokio::task::yield_now().await;
+                }
+            } else {
+                sock.write_all(&out).await?;
+            }
         }
     }
 }
@@ -446,6 +472,56 @@ async fn simple_block_status(s: &mut TcpStream, pg: &mut FakePg) -> u8 {
 }
 
 #[tokio::test]
+async fn pipelined_slow_query_finishes_before_a_local_block() {
+    let (mut s, mut pg) = flag_off_session().await;
+    let mut pipeline = pg_query("SELECT slow_large");
+    pipeline.extend(pg_query(DANGEROUS));
+    s.write_all(&pipeline).await.unwrap();
+
+    let row = read_pg(&mut s).await;
+    assert_eq!(row.tag, b'D');
+    assert_eq!(row.body.len(), 32 * 1024 + 37);
+    assert!(row.body.iter().all(|b| *b == b'x'));
+    for tag in [b'C', b'Z', b'E', b'Z'] {
+        assert_eq!(read_pg(&mut s).await.tag, tag);
+    }
+    let seen = [
+        timeout(pg.statements.recv()).await,
+        timeout(pg.statements.recv()).await,
+    ];
+    assert_eq!(seen[0].as_deref(), Some("SELECT slow_large"));
+    assert!(
+        seen[1]
+            .as_deref()
+            .is_some_and(|sql| sql.contains("vericto ordered response marker"))
+    );
+}
+
+#[tokio::test]
+async fn three_pipelined_simple_queries_keep_a_middle_block_in_order() {
+    let (mut s, mut pg) = flag_off_session().await;
+    let mut pipeline = pg_query("SELECT 1");
+    pipeline.extend(pg_query(DANGEROUS));
+    pipeline.extend(pg_query("SELECT 2"));
+    s.write_all(&pipeline).await.unwrap();
+
+    for tag in [b'C', b'Z', b'E', b'Z', b'C', b'Z'] {
+        assert_eq!(read_pg(&mut s).await.tag, tag);
+    }
+    let mut seen = Vec::new();
+    for _ in 0..3 {
+        seen.push(timeout(pg.statements.recv()).await);
+    }
+    assert_eq!(seen[0].as_deref(), Some("SELECT 1"));
+    assert!(
+        seen[1]
+            .as_deref()
+            .is_some_and(|sql| sql.contains("vericto ordered response marker"))
+    );
+    assert_eq!(seen[2].as_deref(), Some("SELECT 2"));
+}
+
+#[tokio::test]
 async fn flag_off_block_while_idle_reports_idle() {
     let (mut s, mut pg) = flag_off_session().await;
     assert_eq!(simple_block_status(&mut s, &mut pg).await, b'I');
@@ -476,6 +552,67 @@ async fn flag_off_block_after_an_error_in_a_transaction_reports_failed() {
 /// Parse/Bind/Execute/Sync of a refused statement: ErrorResponse, the rest
 /// swallowed, and the Sync's ReadyForQuery carries the server's status.
 #[tokio::test]
+async fn an_earlier_extended_error_suppresses_a_later_local_rejection() {
+    let (mut s, _pg) = flag_off_session().await;
+    let mut pipeline = pg_parse("first", "SELECT FROM", &[]);
+    pipeline.extend(pg_parse("blocked", DANGEROUS, &[]));
+    pipeline.extend(msg(b'B', b"\0blocked\0\0\0\0\0\0"));
+    pipeline.extend(msg(b'E', b"\0\0\0\0\0"));
+    pipeline.extend(pg_sync());
+    s.write_all(&pipeline).await.unwrap();
+
+    let e = read_pg(&mut s).await;
+    let (state, message) = pg_error(&e.body);
+    assert_eq!(state, "42601", "the earlier server error wins: {message}");
+    assert!(!message.contains("Vericto"));
+    let z = read_pg(&mut s).await;
+    assert_eq!((z.tag, z.body.as_slice()), (b'Z', &b"I"[..]));
+}
+
+#[tokio::test]
+async fn messages_pipelined_after_recovery_sync_keep_their_response_plans() {
+    let (mut s, mut pg) = flag_off_session().await;
+    s.write_all(&pg_parse("bad", "SELECT FROM", &[]))
+        .await
+        .unwrap();
+    let e = read_pg(&mut s).await;
+    assert_eq!(pg_error(&e.body).0, "42601");
+
+    let mut recovery_and_next = pg_sync();
+    recovery_and_next.extend(pg_query("SELECT 1"));
+    s.write_all(&recovery_and_next).await.unwrap();
+    assert_eq!(read_pg(&mut s).await.body, b"I");
+    assert_eq!(read_pg(&mut s).await.tag, b'C');
+    assert_eq!(read_pg(&mut s).await.body, b"I");
+    assert_eq!(
+        timeout(pg.statements.recv()).await.as_deref(),
+        Some("SELECT FROM")
+    );
+    assert_eq!(
+        timeout(pg.statements.recv()).await.as_deref(),
+        Some("SELECT 1")
+    );
+}
+
+#[tokio::test]
+async fn multiple_extended_groups_and_flush_keep_order_without_round_trips() {
+    let (mut s, _pg) = flag_off_session().await;
+    let mut pipeline = pg_parse("ok", "SELECT 1", &[]);
+    pipeline.extend(msg(b'B', b"p\0ok\0\0\0\0\0\0"));
+    pipeline.extend(msg(b'E', b"p\0\0\0\0\0"));
+    pipeline.extend(pg_parse("blocked", DANGEROUS, &[]));
+    pipeline.extend(msg(b'B', b"q\0blocked\0\0\0\0\0\0"));
+    pipeline.extend(msg(b'E', b"q\0\0\0\0\0"));
+    pipeline.extend(msg(b'H', b""));
+    pipeline.extend(pg_sync());
+    s.write_all(&pipeline).await.unwrap();
+
+    for tag in [b'1', b'2', b'C', b'E', b'Z'] {
+        assert_eq!(read_pg(&mut s).await.tag, tag);
+    }
+}
+
+#[tokio::test]
 async fn flag_off_extended_block_reports_the_real_status_at_sync() {
     let (mut s, _pg) = flag_off_session().await;
     let extended = |sql: &str| {
@@ -495,7 +632,14 @@ async fn flag_off_extended_block_reports_the_real_status_at_sync() {
     }
     assert_eq!(blocked_extended(&mut s, &extended(DANGEROUS)).await, b'I');
     assert_eq!(simple(&mut s, "BEGIN").await.2, b'T');
-    assert_eq!(blocked_extended(&mut s, &extended(DANGEROUS)).await, b'T');
+    assert_eq!(blocked_extended(&mut s, &extended(DANGEROUS)).await, b'E');
+    // The intentionally invalid Parse has PostgreSQL's native transaction
+    // semantics: the transaction is failed until rollback.
+    s.write_all(&extended("SELECT 1")).await.unwrap();
+    assert_eq!(read_pg(&mut s).await.tag, b'E');
+    assert_eq!(read_pg(&mut s).await.body, b"E");
+    assert_eq!(simple(&mut s, "ROLLBACK").await.2, b'I');
+    assert_eq!(simple(&mut s, "BEGIN").await.2, b'T');
     // An allowed extended sequence still gets the server's own replies.
     s.write_all(&extended("SELECT 1")).await.unwrap();
     for want in [b'1', b'2', b'C'] {
@@ -505,6 +649,233 @@ async fn flag_off_extended_block_reports_the_real_status_at_sync() {
     assert_eq!(simple(&mut s, "SELECT 1/0").await.2, b'E');
     assert_eq!(blocked_extended(&mut s, &extended(DANGEROUS)).await, b'E');
     assert_eq!(simple(&mut s, "ROLLBACK").await.2, b'I');
+}
+
+// ── Prepared policy refresh ──────────────────────────────────────────────────
+
+async fn prepared_proxy() -> (TcpStream, FakePg, Arc<PgProxyConfig>) {
+    let pg = fake_pg().await;
+    let cfg = Arc::new(proxy_config(pg.addr));
+    let proxy = spawn_proxy(cfg.clone()).await;
+    let mut s = TcpStream::connect(proxy).await.unwrap();
+    start_session(&mut s).await;
+    (s, pg, cfg)
+}
+
+async fn parse_complete(s: &mut TcpStream, pg: &mut FakePg, name: &str, sql: &str) {
+    s.write_all(&pg_parse(name, sql, &[])).await.unwrap();
+    assert_eq!(timeout(pg.statements.recv()).await.as_deref(), Some(sql));
+    assert_eq!(read_pg(s).await.tag, b'1');
+}
+
+fn bind_execute_sync(portal: &str, statement: &str) -> Vec<u8> {
+    let mut bind = Vec::new();
+    bind.extend_from_slice(portal.as_bytes());
+    bind.push(0);
+    bind.extend_from_slice(statement.as_bytes());
+    bind.extend_from_slice(b"\0\0\0\0\0\0");
+    let mut execute = portal.as_bytes().to_vec();
+    execute.extend_from_slice(b"\0\0\0\0\0");
+    let mut bytes = msg(b'B', &bind);
+    bytes.extend(msg(b'E', &execute));
+    bytes.extend(pg_sync());
+    bytes
+}
+
+#[tokio::test]
+async fn blocked_function_call_closes_without_running_a_query_marker() {
+    let (mut s, _pg, cfg) = prepared_proxy().await;
+    let deny: vericto_engine::AccessPolicyMap = serde_json::from_value(serde_json::json!({
+        "app": { "mode": "enforce", "entries": [] }
+    }))
+    .unwrap();
+    cfg.agent_access.store(Arc::new(deny));
+    s.write_all(&msg(b'F', b"\0\0\0\0")).await.unwrap();
+    let mut byte = [0u8; 1];
+    let read = timeout(s.read(&mut byte)).await.unwrap();
+    assert_eq!(read, 0, "the session closes without a marker response");
+}
+
+async fn time_policy_prepared_proxy(deadline: &str) -> (TcpStream, FakePg, Arc<PgProxyConfig>) {
+    let pg = fake_pg().await;
+    let mut cfg = proxy_config(pg.addr);
+    let mut rules = crate::tcp::evaluator::default_ruleset();
+    rules.push(vericto_engine::Rule {
+        rule_id: "time-policy".into(),
+        code: "POL-TIME".into(),
+        severity: vericto_engine::Severity::High,
+        default_action: vericto_engine::EnforcementAction::Block,
+        rule_type: vericto_engine::RuleType::Custom,
+        ast_condition_yaml: Some(format!(
+            "rule: time-policy\napplies_to: {{ ops: [select] }}\ndeny_if: time.now >= timestamp('{deadline}')\naction: block\n"
+        )),
+    });
+    let rules = Arc::new(rules);
+    cfg.ruleset.store(Arc::clone(&rules));
+    cfg.policy_rules = crate::tcp::policy_rules::PolicyRulesRuntime {
+        mode: crate::tcp::policy_rules::PolicyRulesMode::Enforce,
+        bundle: Arc::new(arc_swap::ArcSwap::from_pointee(
+            crate::tcp::policy_rules::bundle_from_sync(
+                crate::tcp::policy_rules::PolicyRulesMode::Enforce,
+                rules,
+                None,
+                "time-v1",
+            ),
+        )),
+        listener: "127.0.0.1:5433".into(),
+        database_id: Some("00000000-0000-0000-0000-000000000001".into()),
+    };
+    let cfg = Arc::new(cfg);
+    let proxy = spawn_proxy(Arc::clone(&cfg)).await;
+    let mut s = TcpStream::connect(proxy).await.unwrap();
+    start_session(&mut s).await;
+    (s, pg, cfg)
+}
+
+#[tokio::test]
+async fn execute_rechecks_time_dependent_policies_without_an_arc_swap() {
+    let deadline = (chrono::Utc::now() + chrono::Duration::seconds(2))
+        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let (mut s, mut pg, _cfg) = time_policy_prepared_proxy(&deadline).await;
+    parse_complete(&mut s, &mut pg, "named", "SELECT 1").await;
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+
+    s.write_all(&bind_execute_sync("portal", "named"))
+        .await
+        .unwrap();
+    assert_eq!(read_pg(&mut s).await.tag, b'2');
+    let e = read_pg(&mut s).await;
+    let (state, message) = pg_error(&e.body);
+    assert_eq!(state, "42501");
+    assert!(message.contains("POL-TIME"), "{message}");
+    assert_eq!(read_pg(&mut s).await.body, b"I");
+}
+
+#[tokio::test]
+async fn prepared_statement_is_rechecked_after_an_access_policy_swap() {
+    let (mut s, mut pg, cfg) = prepared_proxy().await;
+    parse_complete(&mut s, &mut pg, "named", "SELECT id FROM customers").await;
+    let deny: vericto_engine::AccessPolicyMap = serde_json::from_value(serde_json::json!({
+        "app": { "mode": "enforce", "entries": [] }
+    }))
+    .unwrap();
+    cfg.agent_access.store(Arc::new(deny));
+
+    s.write_all(&bind_execute_sync("portal", "named"))
+        .await
+        .unwrap();
+    let e = read_pg(&mut s).await;
+    let (state, message) = pg_error(&e.body);
+    assert_eq!(state, "42501");
+    assert!(message.contains("VERICTO-087"), "{message}");
+    let z = read_pg(&mut s).await;
+    assert_eq!((z.tag, z.body.as_slice()), (b'Z', &b"I"[..]));
+}
+
+#[tokio::test]
+async fn execute_rechecks_a_portal_after_an_access_policy_swap() {
+    let (mut s, mut pg, cfg) = prepared_proxy().await;
+    parse_complete(&mut s, &mut pg, "named", "SELECT id FROM customers").await;
+    let bind = b"portal\0named\0\0\0\0\0\0".to_vec();
+    s.write_all(&msg(b'B', &bind)).await.unwrap();
+    assert_eq!(read_pg(&mut s).await.tag, b'2');
+
+    let deny: vericto_engine::AccessPolicyMap = serde_json::from_value(serde_json::json!({
+        "app": { "mode": "enforce", "entries": [] }
+    }))
+    .unwrap();
+    cfg.agent_access.store(Arc::new(deny));
+    let mut execute = msg(b'E', b"portal\0\0\0\0\0");
+    execute.extend(pg_sync());
+    s.write_all(&execute).await.unwrap();
+    let e = read_pg(&mut s).await;
+    assert_eq!(pg_error(&e.body).0, "42501");
+    let z = read_pg(&mut s).await;
+    assert_eq!((z.tag, z.body.as_slice()), (b'Z', &b"I"[..]));
+}
+
+#[tokio::test]
+async fn portal_keeps_policy_state_after_its_statement_is_closed() {
+    let (mut s, mut pg, cfg) = prepared_proxy().await;
+    parse_complete(&mut s, &mut pg, "named", "SELECT id FROM customers").await;
+    let mut bind_and_close = msg(b'B', b"portal\0named\0\0\0\0\0\0");
+    bind_and_close.extend(msg(b'C', b"Snamed\0"));
+    s.write_all(&bind_and_close).await.unwrap();
+    assert_eq!(read_pg(&mut s).await.tag, b'2');
+    assert_eq!(read_pg(&mut s).await.tag, b'3');
+
+    let deny: vericto_engine::AccessPolicyMap = serde_json::from_value(serde_json::json!({
+        "app": { "mode": "enforce", "entries": [] }
+    }))
+    .unwrap();
+    cfg.agent_access.store(Arc::new(deny));
+    let mut execute = msg(b'E', b"portal\0\0\0\0\0");
+    execute.extend(pg_sync());
+    s.write_all(&execute).await.unwrap();
+    let e = read_pg(&mut s).await;
+    assert_eq!(pg_error(&e.body).0, "42501");
+    assert_eq!(read_pg(&mut s).await.body, b"I");
+}
+
+#[tokio::test]
+async fn portal_keeps_the_old_unnamed_statement_after_it_is_replaced() {
+    let (mut s, mut pg, cfg) = prepared_proxy().await;
+    parse_complete(&mut s, &mut pg, "", "SELECT id FROM customers").await;
+    s.write_all(&msg(b'B', b"portal\0\0\0\0\0\0\0\0"))
+        .await
+        .unwrap();
+    assert_eq!(read_pg(&mut s).await.tag, b'2');
+    parse_complete(&mut s, &mut pg, "", "SELECT 1").await;
+
+    let deny: vericto_engine::AccessPolicyMap = serde_json::from_value(serde_json::json!({
+        "app": { "mode": "enforce", "entries": [] }
+    }))
+    .unwrap();
+    cfg.agent_access.store(Arc::new(deny));
+    let mut execute = msg(b'E', b"portal\0\0\0\0\0");
+    execute.extend(pg_sync());
+    s.write_all(&execute).await.unwrap();
+    let e = read_pg(&mut s).await;
+    let (_, message) = pg_error(&e.body);
+    assert!(message.contains("VERICTO-087"), "{message}");
+    assert_eq!(read_pg(&mut s).await.body, b"I");
+}
+
+#[tokio::test]
+async fn prepared_statement_with_an_unchanged_snapshot_forwards_bind_and_execute() {
+    let (mut s, mut pg, _cfg) = prepared_proxy().await;
+    parse_complete(&mut s, &mut pg, "named", "SELECT 1").await;
+    s.write_all(&bind_execute_sync("portal", "named"))
+        .await
+        .unwrap();
+    for tag in [b'2', b'C', b'Z'] {
+        assert_eq!(read_pg(&mut s).await.tag, tag);
+    }
+}
+
+#[tokio::test]
+async fn a_changed_prepared_rewrite_requires_reprepare() {
+    let (mut s, mut pg, cfg) = prepared_proxy().await;
+    parse_complete(&mut s, &mut pg, "named", "SELECT email FROM customers").await;
+    let tag: vericto_engine::SensitiveColumn = serde_json::from_value(serde_json::json!({
+        "table": "customers", "column": "email", "policy": "mask", "mask_style": "full"
+    }))
+    .unwrap();
+    let policy = vericto_engine::EnforcementPolicy {
+        sensitive_columns: vec![tag],
+        ..vericto_engine::EnforcementPolicy::default()
+    };
+    cfg.policy.store(Arc::new(policy));
+
+    s.write_all(&bind_execute_sync("portal", "named"))
+        .await
+        .unwrap();
+    let e = read_pg(&mut s).await;
+    let (state, message) = pg_error(&e.body);
+    assert_eq!(state, "42501");
+    assert!(message.contains("VERICTO-PREPARED-STALE"), "{message}");
+    let z = read_pg(&mut s).await;
+    assert_eq!((z.tag, z.body.as_slice()), (b'Z', &b"I"[..]));
 }
 
 // ── MySQL, policy rules off ──────────────────────────────────────────────────

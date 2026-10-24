@@ -215,13 +215,18 @@ async fn run_session(client: TcpStream, config: Arc<PgProxyConfig>) -> std::io::
     // since 4.16.1. It also registers the session's BackendKeyData for cancels.
     let tx_state = Arc::new(crate::tcp::tx_state::ServerTxState::new());
 
-    // Relay server→client (auth, data, notices) without intercepting.
+    // PostgreSQL's response coordinator orders pipelined backend replies and
+    // local replacements. The relay below is the sole in-session client writer.
+    let responses = crate::tcp::pg_response::PgResponseCoordinator::new();
+
+    // Relay server→client (auth, data, notices), framing every backend message.
     let relay_handle = tokio::spawn(relay_server_to_client(
         server_read,
         client_write.clone(),
         relay_wrote.clone(),
         tx_state.clone(),
         Some(config.cancel_keys.clone()),
+        responses.clone(),
     ));
 
     // ── Phase 4: client→server interception loop
@@ -236,29 +241,61 @@ async fn run_session(client: TcpStream, config: Arc<PgProxyConfig>) -> std::io::
     // function's futures closes the sockets, unwinding the client side too.
     let mut relay_handle = relay_handle;
     let result = tokio::select! {
-        r = intercept_client_to_server(&mut client_read, &mut server_write, &client_write, &config, session_user, declared, Some(tx_state)) => {
+        r = intercept_client_to_server(
+            &mut client_read,
+            &mut server_write,
+            &client_write,
+            &config,
+            crate::tcp::session::SessionStart {
+                user: session_user,
+                declared,
+                tx_state: Some(tx_state),
+                pg_responses: Some(responses),
+                ..Default::default()
+            },
+        ) => {
             // Client ended or a block/forward error unwound the loop: stop the relay.
             relay_handle.abort();
             r
         }
-        _ = &mut relay_handle => {
+        relay_result = &mut relay_handle => {
             // Upstream closed/errored: the relay ended. If it never delivered a
             // byte to the client (the upstream died during the connection phase,
             // e.g. mid-auth), the client is still waiting for a startup reply, so
             // send a native ErrorResponse before closing. If bytes were already
             // relayed, the stream is mid-session and injecting one would corrupt
             // it — fall back to a plain close.
+            let relay_error = match relay_result {
+                Ok(Ok(())) => None,
+                Ok(Err(e)) => {
+                    tracing::warn!(error = %e, "PostgreSQL server relay failed; closing the session");
+                    Some(e)
+                }
+                Err(e) => {
+                    let error = std::io::Error::other(format!("PostgreSQL server relay task failed: {e}"));
+                    tracing::error!(error = %error, "PostgreSQL server relay task failed");
+                    Some(error)
+                }
+            };
             if !relay_wrote.load(std::sync::atomic::Ordering::Relaxed) {
                 let mut w = client_write.lock().await;
-                let _ = w
-                    .write_all(&crate::tcp::codec::build_error_response(
+                let send = async {
+                    w.write_all(&crate::tcp::codec::build_error_response(
                         crate::tcp::codec::SQLSTATE_CONNECTION_FAILURE,
                         "Vericto: the database connection was lost",
                     ))
-                    .await;
-                let _ = w.flush().await;
+                    .await?;
+                    w.flush().await
+                }
+                .await;
+                if let Err(e) = send {
+                    tracing::debug!(error = %e, "could not send PostgreSQL connection-loss response");
+                }
             }
-            Ok(())
+            match relay_error {
+                Some(e) => Err(e),
+                None => Ok(()),
+            }
         }
     };
 
@@ -433,36 +470,176 @@ async fn read_startup_message<R: AsyncRead + Unpin>(reader: &mut R) -> std::io::
 /// the session's BackendKeyData is registered there before it reaches the
 /// client, and stays registered until the relay ends (the session closes).
 pub(crate) async fn relay_server_to_client(
-    mut server_read: crate::tcp::upstream::UpstreamRead,
+    server_read: crate::tcp::upstream::UpstreamRead,
     client_write: Arc<Mutex<ClientWrite>>,
     wrote_any: Arc<std::sync::atomic::AtomicBool>,
     tx_state: Arc<crate::tcp::tx_state::ServerTxState>,
     mut cancel_keys: Option<Arc<crate::tcp::cancel::CancelRegistry>>,
-) {
-    let mut buf = vec![0u8; 16 * 1024];
+    responses: crate::tcp::pg_response::PgResponseCoordinator,
+) -> std::io::Result<()> {
+    use crate::tcp::pg_response::BackendDisposition;
+
+    // Backend messages are framed here rather than relayed as read() chunks.
+    // Large DataRow/CopyData bodies are streamed, but one client-write lock is
+    // held for the complete message. Thus neither a local replacement nor any
+    // other producer can appear between its header and body fragments.
     let mut tracker = crate::tcp::tx_state::PgTxTracker::new();
+    // Buffer the upstream reads so framing several tiny extended-protocol
+    // responses does not turn one database read into a syscall per message.
+    let mut server_read = tokio::io::BufReader::with_capacity(64 * 1024, server_read);
     let mut _registration = None;
+    let mut startup = !responses.startup_complete()?;
+    // This relay is the sole in-session producer of PostgreSQL client bytes.
+    // Hold the writer for the session instead of locking and flushing once per
+    // backend message; startup/connection-loss writers run only before it starts
+    // or after it returns.
+    let mut client_writer = client_write.lock().await;
     loop {
-        match server_read.read(&mut buf).await {
-            Ok(0) => break, // upstream closed
-            Ok(n) => {
-                // Before the bytes reach the client: its next message then sees
-                // the state they carry, and a cancel finds its key.
+        let mut header = [0u8; 5];
+        match server_read.read(&mut header[..1]).await {
+            Ok(0) => return Ok(()),
+            Ok(_) => {
+                server_read.read_exact(&mut header[1..]).await?;
+            }
+            Err(e) => return Err(e),
+        }
+        let len = i32::from_be_bytes([header[1], header[2], header[3], header[4]]);
+        if len < 4 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("invalid PostgreSQL backend message length: {len}"),
+            ));
+        }
+        if header[0] == b'Z' && len != 5 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("invalid PostgreSQL ReadyForQuery length: {len}"),
+            ));
+        }
+        let tag = header[0];
+        let mut remaining = len as usize - 4;
+        // BackendKeyData is small and exceptional: retain it until the cancel
+        // key has been registered, then expose it. Every other large body is
+        // streamed below.
+        if startup && tag == b'K' {
+            if !(8..=4 + crate::tcp::cancel::MAX_SECRET_LEN).contains(&remaining) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("invalid PostgreSQL BackendKeyData length: {len}"),
+                ));
+            }
+            let mut body = vec![0; remaining];
+            server_read.read_exact(&mut body).await?;
+            tracker.feed(&header, &tx_state);
+            tracker.feed(&body, &tx_state);
+            if let Some(key) = tracker.take_backend_key()
+                && let Some(registry) = cancel_keys.take()
+            {
+                _registration = Some(registry.register(key));
+            }
+            client_writer.write_all(&header).await?;
+            client_writer.write_all(&body).await?;
+            client_writer.flush().await?;
+            wrote_any.store(true, std::sync::atomic::Ordering::Relaxed);
+            continue;
+        }
+        let disposition = if startup {
+            BackendDisposition::Forward
+        } else {
+            responses.disposition(tag)?
+        };
+        let stream_to_client = matches!(disposition, BackendDisposition::Forward);
+
+        // Tracking precedes exposure to the client. Small messages are written
+        // in one call (header + body); the extended protocol emits several of
+        // them per statement, so separate header/body writes are measurable at
+        // high QPS. Large rows and COPY frames stay streaming and bounded.
+        tracker.feed(&header, &tx_state);
+        let mut body_prefix = [0u8; 1];
+        let mut first = true;
+        let mut buf = vec![0u8; 16 * 1024];
+        if remaining <= buf.len() {
+            server_read.read_exact(&mut buf[..remaining]).await?;
+            if remaining > 0 {
+                body_prefix[0] = buf[0];
+                first = false;
+                tracker.feed(&buf[..remaining], &tx_state);
+            }
+            if stream_to_client {
+                let mut frame = Vec::with_capacity(header.len() + remaining);
+                frame.extend_from_slice(&header);
+                frame.extend_from_slice(&buf[..remaining]);
+                client_writer.write_all(&frame).await?;
+            }
+        } else {
+            if stream_to_client {
+                client_writer.write_all(&header).await?;
+            }
+            while remaining > 0 {
+                let n = remaining.min(buf.len());
+                server_read.read_exact(&mut buf[..n]).await?;
+                if first {
+                    body_prefix[0] = buf[0];
+                    first = false;
+                }
                 tracker.feed(&buf[..n], &tx_state);
-                if cancel_keys.is_some()
-                    && let Some(key) = tracker.take_backend_key()
-                    && let Some(registry) = cancel_keys.take()
-                {
-                    _registration = Some(registry.register(key));
+                if stream_to_client {
+                    client_writer.write_all(&buf[..n]).await?;
                 }
-                let mut writer = client_write.lock().await;
-                if writer.write_all(&buf[..n]).await.is_err() || writer.flush().await.is_err() {
-                    break;
-                }
+                remaining -= n;
+            }
+        }
+        if stream_to_client {
+            client_writer.flush().await?;
+            wrote_any.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+
+        if cancel_keys.is_some()
+            && let Some(key) = tracker.take_backend_key()
+            && let Some(registry) = cancel_keys.take()
+        {
+            _registration = Some(registry.register(key));
+        }
+
+        let ready = (tag == b'Z' && !first).then_some(body_prefix[0]);
+        if startup {
+            if tag == b'Z' {
+                startup = false;
+                responses.complete_startup()?;
+            }
+            continue;
+        }
+
+        // Replacements are emitted only after the backend message has been read
+        // whole. BeforeForward is used for simple cycles: replacement bytes then
+        // the server's actual ReadyForQuery, preserving I/T/E.
+        match disposition {
+            BackendDisposition::Replace(bytes) => {
+                client_writer.write_all(&bytes).await?;
+                client_writer.flush().await?;
                 wrote_any.store(true, std::sync::atomic::Ordering::Relaxed);
             }
-            Err(_) => break,
+            BackendDisposition::BeforeForward(bytes) => {
+                // ReadyForQuery has one body byte. This branch is only selected
+                // for it, but retain the check so malformed server traffic closes
+                // safely instead of manufacturing a frame.
+                if ready.is_none() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "simple replacement did not end at ReadyForQuery",
+                    ));
+                }
+                let mut reply = Vec::with_capacity(bytes.len() + header.len() + 1);
+                reply.extend_from_slice(&bytes);
+                reply.extend_from_slice(&header);
+                reply.extend_from_slice(&body_prefix);
+                client_writer.write_all(&reply).await?;
+                client_writer.flush().await?;
+                wrote_any.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+            BackendDisposition::Forward | BackendDisposition::Suppress => {}
         }
+        responses.finish(tag, ready)?;
     }
 }
 
@@ -476,9 +653,7 @@ async fn intercept_client_to_server(
     server_write: &mut crate::tcp::upstream::UpstreamWrite,
     client_write: &Arc<Mutex<ClientWrite>>,
     config: &Arc<PgProxyConfig>,
-    session_user: Option<String>,
-    declared: crate::tcp::policy_rules::SessionDeclared,
-    tx_state: Option<Arc<crate::tcp::tx_state::ServerTxState>>,
+    start: crate::tcp::session::SessionStart,
 ) -> std::io::Result<()> {
     let proto = crate::tcp::protocol::postgres::PostgresProtocol;
     crate::tcp::session::intercept_client_to_server(
@@ -487,12 +662,7 @@ async fn intercept_client_to_server(
         server_write,
         client_write,
         config,
-        crate::tcp::session::SessionStart {
-            user: session_user,
-            declared,
-            tx_state,
-            ..Default::default()
-        },
+        start,
     )
     .await
 }

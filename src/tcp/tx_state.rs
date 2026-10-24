@@ -16,12 +16,12 @@
 //! was answered with `I` even inside a transaction block). MySQL: only built
 //! with policy rules on, the only time the proxy writes a reply that carries
 //! status flags (the OK of a consumed `SET vericto.*`); its refusals are ERR
-//! packets, which carry none. The trackers never change a byte of the stream;
-//! they only frame it. The relay feeds a chunk before writing it to the client, so
-//! by the time the client can send its next message the state is current.
-//! Like every reply the proxy writes itself, this assumes the client waits for
-//! the answer to one statement before sending a `SET vericto.*` (no pipelining
-//! across it).
+//! packets, which carry none. The trackers never change a byte of either stream.
+//! The PostgreSQL relay
+//! frames complete backend messages and feeds the tracker before exposing each
+//! relevant byte; BackendKeyData is retained until its cancel key is registered.
+//! The ordered response coordinator, rather than a timing assumption about the
+//! client, positions PostgreSQL replies written by the proxy itself.
 
 use std::sync::atomic::{AtomicU8, AtomicU16, AtomicU32, Ordering};
 

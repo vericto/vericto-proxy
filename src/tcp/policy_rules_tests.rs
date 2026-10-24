@@ -680,9 +680,10 @@ use crate::tcp::tx_state::{
 struct Relayed {
     client: tokio::io::DuplexStream,
     db: tokio::io::DuplexStream,
+    tx: Arc<ServerTxState>,
     _tasks: (
         tokio::task::JoinHandle<std::io::Result<()>>,
-        tokio::task::JoinHandle<()>,
+        tokio::task::JoinHandle<std::io::Result<()>>,
     ),
 }
 
@@ -700,12 +701,25 @@ fn relayed(mysql: bool) -> Relayed {
     let mut server_write: crate::tcp::upstream::UpstreamWrite = Box::new(dw);
     let tx = Arc::new(ServerTxState::new());
     let caps = CLIENT_DEPRECATE_EOF;
+    let responses = (!mysql).then(|| {
+        let responses = crate::tcp::pg_response::PgResponseCoordinator::new();
+        responses
+            .complete_startup()
+            .expect("test relay starts after startup");
+        responses
+    });
+    let relay_client_write = client_write.clone();
+    let relay_tx = tx.clone();
     let relay = if mysql {
-        tokio::spawn(crate::tcp::session::relay_upstream_to_client(
-            server_read,
-            client_write.clone(),
-            Some((crate::tcp::tx_state::MySqlTxTracker::new(caps), tx.clone())),
-        ))
+        tokio::spawn(async move {
+            crate::tcp::session::relay_upstream_to_client(
+                server_read,
+                relay_client_write,
+                Some((crate::tcp::tx_state::MySqlTxTracker::new(caps), relay_tx)),
+            )
+            .await;
+            Ok(())
+        })
     } else {
         tokio::spawn(crate::tcp::postgres::relay_server_to_client(
             server_read,
@@ -713,12 +727,15 @@ fn relayed(mysql: bool) -> Relayed {
             Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tx.clone(),
             None,
+            responses.clone().expect("PostgreSQL coordinator"),
         ))
     };
+    let relayed_tx = tx.clone();
     let start = SessionStart {
         user: Some(BOT.into()),
         client_caps: if mysql { caps } else { 0 },
         tx_state: Some(tx),
+        pg_responses: responses,
         ..Default::default()
     };
     let session = tokio::spawn(async move {
@@ -740,6 +757,7 @@ fn relayed(mysql: bool) -> Relayed {
     Relayed {
         client,
         db,
+        tx: relayed_tx,
         _tasks: (session, relay),
     }
 }
@@ -773,6 +791,17 @@ async fn pg_server_round(w: &mut Relayed, sql: &str, tag: &str, status: u8) {
 /// The proxy's own answer to a consumed SET, with its ReadyForQuery status.
 async fn pg_set_status(w: &mut Relayed, sql: &str) -> u8 {
     w.client.write_all(&pg_query(sql)).await.unwrap();
+    let marker = read_pg(&mut w.db).await;
+    assert_eq!(marker.tag, b'Q');
+    assert!(cstr(&marker.body).contains("vericto ordered response marker"));
+    let status = w.tx.pg_status();
+    let mut reply = if status == b'E' {
+        crate::tcp::codec::build_error_response("25P02", "aborted")
+    } else {
+        pg_msg(b'C', b"SELECT 1\0")
+    };
+    reply.extend(pg_msg(b'Z', &[status]));
+    w.db.write_all(&reply).await.unwrap();
     let c = read_pg(&mut w.client).await;
     assert_eq!((c.tag, cstr(&c.body).as_str()), (b'C', "SET"), "{sql}");
     let z = read_pg(&mut w.client).await;
@@ -821,6 +850,11 @@ async fn pg_set_in_a_failed_transaction_is_25p02_and_not_consumed() {
         .write_all(&pg_query("SET vericto.ticket = 'OPS-1'"))
         .await
         .unwrap();
+    let marker = read_pg(&mut w.db).await;
+    assert!(cstr(&marker.body).contains("vericto ordered response marker"));
+    let mut failed = crate::tcp::codec::build_error_response("25P02", "aborted");
+    failed.extend(pg_msg(b'Z', b"E"));
+    w.db.write_all(&failed).await.unwrap();
     let e = read_pg(&mut w.client).await;
     assert_eq!(e.tag, b'E');
     assert_eq!(pg_error(&e.body).0, "25P02");
@@ -836,10 +870,50 @@ async fn pg_set_in_a_failed_transaction_is_25p02_and_not_consumed() {
         .write_all(&pg_query("SET vericto.ticket = 'OPS-3'"))
         .await
         .unwrap();
+    let marker = read_pg(&mut w.db).await;
+    assert!(cstr(&marker.body).contains("vericto ordered response marker"));
+    let mut marker_ok = pg_msg(b'C', b"SELECT 1\0");
+    marker_ok.extend(pg_msg(b'Z', b"I"));
+    w.db.write_all(&marker_ok).await.unwrap();
     let e = read_pg(&mut w.client).await;
     assert_eq!(pg_error(&e.body).0, "42501");
     let z = read_pg(&mut w.client).await;
     assert_eq!(z.body, b"I");
+}
+
+#[tokio::test]
+async fn pg_pipelined_error_does_not_commit_a_consumed_set() {
+    let mut w = relayed(false);
+    pg_server_round(&mut w, "BEGIN", "BEGIN", b'T').await;
+    let mut pipeline = pg_query("SELECT 1/0");
+    pipeline.extend(pg_query("SET vericto.ticket = 'OPS-1'"));
+    w.client.write_all(&pipeline).await.unwrap();
+    assert_eq!(cstr(&read_pg(&mut w.db).await.body), "SELECT 1/0");
+    let marker = read_pg(&mut w.db).await;
+    assert!(cstr(&marker.body).contains("vericto ordered response marker"));
+    let mut replies = crate::tcp::codec::build_error_response("22012", "division by zero");
+    replies.extend(pg_msg(b'Z', b"E"));
+    replies.extend(crate::tcp::codec::build_error_response("25P02", "aborted"));
+    replies.extend(pg_msg(b'Z', b"E"));
+    w.db.write_all(&replies).await.unwrap();
+    for (tag, state) in [
+        (b'E', None),
+        (b'Z', Some(b'E')),
+        (b'E', None),
+        (b'Z', Some(b'E')),
+    ] {
+        let message = read_pg(&mut w.client).await;
+        assert_eq!(message.tag, tag);
+        if let Some(state) = state {
+            assert_eq!(message.body, [state]);
+        }
+    }
+    pg_server_round(&mut w, "ROLLBACK", "ROLLBACK", b'I').await;
+    assert_eq!(
+        pg_set_status(&mut w, "SET vericto.ticket = 'OPS-1'").await,
+        b'I',
+        "the SET rejected with 25P02 was not committed"
+    );
 }
 
 /// Parse/Bind/Execute/Sync of a `SET vericto.*`: refused, swallowed until
@@ -860,16 +934,38 @@ async fn pg_extended_set_reports_the_real_state_at_sync() {
         .write_all(&extended("SET vericto.ticket = 'OPS-1'"))
         .await
         .unwrap();
+    let invalid = read_pg(&mut w.db).await;
+    let query_start = invalid.body.iter().position(|b| *b == 0).unwrap() + 1;
+    assert_eq!(
+        (invalid.tag, cstr(&invalid.body[query_start..]).as_str()),
+        (b'P', "SELECT FROM")
+    );
+    for tag in [b'B', b'E', b'S'] {
+        assert_eq!(read_pg(&mut w.db).await.tag, tag);
+    }
+    let mut native = crate::tcp::codec::build_error_response("42601", "syntax error");
+    native.extend(pg_msg(b'Z', b"E"));
+    w.db.write_all(&native).await.unwrap();
     let e = read_pg(&mut w.client).await;
     assert!(pg_error(&e.body).1.contains(SESSION_CONTEXT_RULE_CODE));
     let z = read_pg(&mut w.client).await;
-    assert_eq!((z.tag, z.body.as_slice()), (b'Z', &b"T"[..]));
+    assert_eq!((z.tag, z.body.as_slice()), (b'Z', &b"E"[..]));
 
+    pg_server_round(&mut w, "ROLLBACK", "ROLLBACK", b'I').await;
+    pg_server_round(&mut w, "BEGIN", "BEGIN", b'T').await;
     pg_server_round(&mut w, "SELECT 1/0", "ERROR", b'E').await;
     w.client
         .write_all(&extended("SET vericto.ticket = 'OPS-1'"))
         .await
         .unwrap();
+    let invalid = read_pg(&mut w.db).await;
+    assert_eq!(invalid.tag, b'P');
+    for tag in [b'B', b'E', b'S'] {
+        assert_eq!(read_pg(&mut w.db).await.tag, tag);
+    }
+    let mut native = crate::tcp::codec::build_error_response("25P02", "aborted");
+    native.extend(pg_msg(b'Z', b"E"));
+    w.db.write_all(&native).await.unwrap();
     let e = read_pg(&mut w.client).await;
     assert_eq!(pg_error(&e.body).0, "25P02");
     let z = read_pg(&mut w.client).await;

@@ -220,9 +220,10 @@ back to the default, also with a warning.
 A preview of principal-aware policies (CEL inside the custom-rule YAML, engine
 4.5.0 since 4.17.0), for workspaces the control plane has enabled it for. **With `off` (the
 default) nothing below happens**: the rule sync does not announce `cel/1`, nothing
-is compiled, the StartupMessage and `SET vericto.*` reach the database as they
-come, statements are evaluated exactly as in 4.14.3 and telemetry carries no new
-field.
+is compiled, and the StartupMessage and `SET vericto.*` reach the database as they
+come. Statements are evaluated without principal-aware business policies and
+telemetry carries no policy fields. PostgreSQL response ordering and prepared
+statement tracking remain active independently of this flag.
 
 With `observe` or `enforce`:
 
@@ -283,8 +284,10 @@ With `observe` or `enforce`:
   reported last (Postgres ReadyForQuery `I` / `T` / `E`; MySQL status flags
   `SERVER_STATUS_IN_TRANS` and autocommit), so it may be sent inside a
   transaction block. In a failed Postgres transaction block it gets 25P02, as from
-  the server, and the value is not taken. Like every reply the proxy writes
-  itself, it assumes the client waits for the previous statement's answer.
+  the server, and the value is not taken. PostgreSQL orders this reply through a
+  harmless upstream response cycle, so an earlier pipelined result finishes first
+  and the server's actual ReadyForQuery supplies `I` / `T` / `E`. MySQL keeps its
+  command-at-a-time synthetic reply behavior.
 - **`observe`.** The verdict is the one without policies; what a policy would
   have blocked is reported as `FLAGGED` with the policy's code. When the bundle
   has policies, each statement is evaluated twice (with and without them).
@@ -313,6 +316,35 @@ With `observe` or `enforce`:
   report the would-be text as the finding's `suggested_safe_query`. Without a
   `rewrite_limit` policy, or with policy rules `off`, nothing is rewritten: the
   built-in VERICTO-050 (`SELECT` without `LIMIT`) only flags.
+- **PostgreSQL prepared refresh (4.17.1).** The proxy retains the original SQL,
+  the SQL actually prepared upstream, and the rules/policy/context snapshot for
+  each named or unnamed statement. Bind re-evaluates after that snapshot changes;
+  Execute does the same and is always re-evaluated while business policies are
+  active, so a policy using `time.now` cannot keep a Parse-time allow
+  after its window closes. A new block is returned in order as SQLSTATE 42501. If
+  the refreshed decision adds, changes or removes a mask or `rewrite_limit`, the
+  old server-side statement cannot be changed in place: the proxy blocks with
+  `VERICTO-PREPARED-STALE` and asks the client to close and prepare it again.
+  Statements and portals are committed only after ParseComplete/BindComplete;
+  CloseComplete commits statement removal, but an existing portal keeps the plan
+  it bound, as PostgreSQL does. Transaction end clears portals while named
+  statements remain. Reachable retained SQL, names, queued response plans and
+  statement/portal counts are bounded; queue saturation applies backpressure
+  instead of evicting an association. This is a PostgreSQL fix. MySQL prepared
+  statements remain evaluated at prepare time.
+- **PostgreSQL pipelining and COPY (4.17.1).** One response plan is registered
+  before each frontend message is forwarded. The backend relay frames each
+  response and is the sole in-session client writer, streaming large bodies
+  without buffering them as a whole. Local simple replies use a harmless upstream
+  Query cycle and keep its real ReadyForQuery; local extended errors replace an
+  intentionally invalid Parse error and let PostgreSQL perform native
+  skip-until-Sync and transaction rollback. Messages pipelined after the
+  frontend Sync retain their plans while the backend ReadyForQuery is in flight.
+  Flush adds no round trip. COPY IN and COPY OUT remain in their Execute/Query
+  plan through final completion. COPY BOTH (including streaming replication)
+  closes the session explicitly: it is not claimed safe under this bounded
+  request/response coordinator. A FunctionCall denied by agent access also closes
+  the session because substituting a Query would alter unnamed-statement state.
 - **Telemetry.** Each event adds `principal_id`, `principal_type`,
   `principal_trust`, `principal_via`, `application_name`, `policy_bundle_version`,
   `ticket_id` and `session_tenant` (no client address).
