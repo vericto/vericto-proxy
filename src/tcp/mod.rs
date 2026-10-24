@@ -341,6 +341,8 @@ mod mysql_auth_tests;
 #[cfg(test)]
 mod policy_rules_tests;
 #[cfg(test)]
+mod rewrite_limit_tests;
+#[cfg(test)]
 mod sensitive_tests;
 #[cfg(test)]
 mod session_tests;

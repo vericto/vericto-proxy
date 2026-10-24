@@ -7,6 +7,88 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [4.17.0] — 2026-10-24
+
+**Bounded reads on the wire: `rewrite_limit` business policies are enforced.**
+vericto-engine 4.5.0 added `action: { rewrite_limit: n }`, a business policy that
+bounds the rows a principal's `SELECT` returns (the dashboard's LIMIT cap template
+in rewrite mode): the engine returns the bounded statement as `rewritten_query`.
+Up to 4.16.2 the proxy, on engine 4.4.0, could not run that policy, and its
+consistency check refused any rewrite that was not a VERICTO-085 mask ("a rewritten
+query was returned but no masked column was read"), so a bound would have blocked
+the very reads it was meant to cap. The control plane therefore withheld these
+policies from every proxy, and an agent's unbounded `SELECT` through the proxy was
+only flagged (VERICTO-050). With 4.17.0 and `VERICTO_POLICY_RULES=enforce` the
+database receives the bounded statement instead of the client's. Nothing changes
+with policy rules `off` (the default) or without a `rewrite_limit` policy.
+
+### Added
+
+- **`rewrite_limit` under `enforce`.** The bounded statement is forwarded in place
+  of the client's in the same message: Postgres simple query and `Parse` (same
+  statement name and parameter types), MySQL `COM_QUERY` and `COM_STMT_PREPARE`.
+  The engine adds `LIMIT n` to the outer query of a top-level `SELECT`, lowers a
+  larger literal `LIMIT` / `FETCH FIRST` / MySQL `LIMIT a, m` (`OFFSET` kept), leaves
+  a smaller one alone, and turns a Postgres `LIMIT $k` into
+  `LIMIT LEAST($k::bigint, n)`, which keeps the parameter's number and type. Writes,
+  `SELECT 1`, aggregate-only projections and `EXPLAIN` are untouched. A MySQL
+  `LIMIT ?` is forwarded as sent and the policy's `on_unknown` decides (default
+  `flag`): its value is only known at execution. Applied on top of a mask when both
+  apply. `observe` and `monitor_mode` forward the original and report the would-be
+  text as the finding's suggestion.
+- **The sync announces the feature**: `X-Vericto-Policy-Language: cel/1, rewrite_limit`
+  (comma-separated, so a control plane that only knows `cel/1` still reads it). The
+  value is checked against the engine's `POLICY_LANGUAGE` and `POLICY_FEATURES` by a
+  test, so a later engine feature cannot go unannounced.
+
+### Changed
+
+- **vericto-engine v4.4.0 → v4.5.0** (git tag). `evaluate()` is unchanged for every
+  input and without a `rewrite_limit` policy `evaluate_with_context()` runs the 4.4.0
+  code plus one emptiness check (engine CHANGELOG [4.5.0]).
+- **Rewrite consistency** (`src/tcp/evaluator.rs`): a rewrite is accounted for by a
+  masked column or by a `rewrite_limit` policy hit with outcome `rewritten`. Policy
+  hits only exist on the policy path, so with policy rules off a rewrite without a
+  mask is refused exactly as before; the hits are only looked at when a rewrite came
+  back without a mask. The other checks stay (an empty rewrite or one with a NUL, a
+  dialect without a rewrite, a prepared statement whose parameters would change).
+- A bound the proxy cannot enforce (the engine's "failure blocks", e.g.
+  `FETCH … WITH TIES`; a rewrite that would change the client's bind parameters; a
+  MySQL packet that cannot carry it) is blocked under the policy's code, with
+  `LIMIT rewrite not enforceable by the proxy: <reason>`; a mask still blocks as
+  VERICTO-085. Never the unbounded original.
+- **Telemetry.** A bounded statement is reported like a mask: the client's text in
+  `query_text`, the bounded one in `rewritten_query`, the policy's finding with
+  action `monitor` and no repeated suggestion. In `sanitized` mode a `rewrite_limit`
+  suggestion (the would-be text under `observe` / `monitor_mode`) is normalized like
+  a VERICTO-085 one, so no literal of the client's statement leaves. The log line
+  says `Query BOUNDED (LIMIT)` instead of `Query MASKED`.
+
+### Documentation
+
+- `docs/CONFIGURATION.md` (business policy rules): the announcement and a "Bounded
+  reads" entry; README: where bounded reads come from and the image tags.
+
+### Tests
+
+- `src/tcp/rewrite_limit_tests.rs`: Postgres simple query and `Parse` (name, types,
+  `LIMIT $2`), MySQL `COM_QUERY` and `COM_STMT_PREPARE` (`LIMIT a, m`, `LIMIT ?`),
+  larger and smaller `LIMIT`, writes and aggregates untouched, other principals,
+  `off`, `observe`, `monitor_mode`, sanitized telemetry, "failure blocks"; and
+  against a real Postgres 17 and MySQL 8.0 (`VERICTO_TEST_PG_URL` /
+  `VERICTO_TEST_MYSQL_URL`): the client gets `n` rows on both protocols of each,
+  `OFFSET` is kept, a smaller `LIMIT` and a bound `LIMIT $1` work, writes and
+  `count(*)` see every row. Evaluator unit tests for the consistency rule and the
+  block attribution.
+
+### Performance
+
+- The always-on path is unchanged: callgrind, pgbench select-only (extended
+  protocol) through one session, policy rules off, no control plane, 1 worker,
+  release builds on rust 1.88 (bookworm), linux/arm64, Postgres 17, 2 repetitions:
+  200,518 / 200,505 user-space instructions per statement for 4.16.2 against
+  200,490 / 200,504 for 4.17.0 (4,000 statements; within 0.02%).
+
 ## [4.16.2] — 2026-10-24
 
 **Async workers sized from the CPU limit, not the CPU count.** Up to 4.16.1 the

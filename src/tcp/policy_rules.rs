@@ -44,8 +44,14 @@ use vericto_engine::policy::{
 };
 
 /// The value of the `X-Vericto-Policy-Language` header the rule sync sends when
-/// policy rules are on: the policy language this proxy evaluates.
-pub const POLICY_LANGUAGE: &str = "cel/1";
+/// policy rules are on: the policy language this proxy evaluates (`cel/1`) and,
+/// as comma-separated tokens, the optional features of it this proxy runs (the
+/// engine's `POLICY_FEATURES`).
+/// Since 4.17.0 (engine 4.5.0): `rewrite_limit`, which the control plane only
+/// sends to a proxy that announces it (an older proxy blocked a rewrite that is
+/// not a mask). Commas, not `;`: a control plane that only knows `cel/1` splits
+/// the header on commas and still reads `cel/1`.
+pub const POLICY_LANGUAGE_ANNOUNCEMENT: &str = "cel/1, rewrite_limit";
 /// The header that announces it on `GET /sync/rules`.
 pub const POLICY_LANGUAGE_HEADER: &str = "X-Vericto-Policy-Language";
 
@@ -999,6 +1005,18 @@ fn split_options(options: &str) -> (String, Vec<(String, String)>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The announcement is the engine's language and features, comma-separated,
+    /// so adopting an engine with another feature cannot leave it unannounced
+    /// (the control plane would withhold the policies that need it) or announce
+    /// one the engine refuses (they would fail closed in their scope).
+    #[test]
+    fn the_announcement_is_the_engines_language_and_features() {
+        let mut tokens = vec![vericto_engine::policy::POLICY_LANGUAGE];
+        tokens.extend_from_slice(vericto_engine::policy::POLICY_FEATURES);
+        assert_eq!(POLICY_LANGUAGE_ANNOUNCEMENT, tokens.join(", "));
+        assert!(POLICY_LANGUAGE_ANNOUNCEMENT.starts_with("cel/1,"));
+    }
 
     fn map(json: serde_json::Value) -> PrincipalMap {
         PrincipalMap::from_sync(Some(json))

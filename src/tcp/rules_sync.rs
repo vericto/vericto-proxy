@@ -547,7 +547,7 @@ pub async fn run_with_policy_rules(
         if policy_rules.mode.is_on() {
             req = req.header(
                 crate::tcp::policy_rules::POLICY_LANGUAGE_HEADER,
-                crate::tcp::policy_rules::POLICY_LANGUAGE,
+                crate::tcp::policy_rules::POLICY_LANGUAGE_ANNOUNCEMENT,
             );
         }
         if let Some(tag) = &etag {
@@ -1538,8 +1538,9 @@ mod tests {
         assert_eq!(restored.for_user("support_agent").unwrap().entries.len(), 3);
     }
 
-    /// The `policy_language: cel/1` announcement and the principals section
-    /// (4.15.0). Off: no header, nothing compiled, the principals ignored, so
+    /// The `policy_language: cel/1` announcement (with `rewrite_limit` since
+    /// 4.17.0) and the principals section (4.15.0). Off: no header, nothing
+    /// compiled, the principals ignored, so
     /// the request and what it puts in effect are those of 4.14.3. On: the
     /// header on every request, and the response compiled into the bundle with
     /// its version. A malformed principals section never fails the sync.
@@ -1636,7 +1637,11 @@ mod tests {
 
         for mode in [PolicyRulesMode::Observe, PolicyRulesMode::Enforce] {
             let (headers, bundle, _) = sync_once(mode, BODY).await;
-            assert_eq!(headers, vec![Some("cel/1".to_string())], "{mode:?}");
+            assert_eq!(
+                headers,
+                vec![Some("cel/1, rewrite_limit".to_string())],
+                "{mode:?}"
+            );
             assert_eq!(bundle.policies.len(), 1, "{mode:?}");
             assert!(
                 bundle.policies.errors().is_empty(),
