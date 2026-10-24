@@ -13,7 +13,7 @@ use vericto_engine::{
     SensitivePolicy, Severity, TouchedColumn,
 };
 
-use vericto_engine::policy::{EvalContext, PolicySet};
+use vericto_engine::policy::{EvalContext, PolicyOutcome, PolicySet};
 
 use crate::tcp::policy_rules::PolicyRulesMode;
 use crate::tcp::protocol::QueryKind;
@@ -33,9 +33,11 @@ pub enum TcpDecision {
         /// observation rather than inside it because a parse-error observation has
         /// no engine violations to report.
         violations: Vec<ReportedViolation>,
-        /// The SQL to send INSTEAD of the original: a `mask` tag was applied
-        /// (Postgres and MySQL). When `Some`, the session forwards this text and never
-        /// the original; `evaluate` has already checked it is consistent.
+        /// The SQL to send INSTEAD of the original: a `mask` tag was applied,
+        /// or (4.17.0, policy rules `enforce`) a `rewrite_limit` business policy
+        /// bounded the statement, on top of the mask when both apply (Postgres
+        /// and MySQL). When `Some`, the session forwards this text and never the
+        /// original; `evaluate` has already checked it is consistent.
         rewritten_query: Option<String>,
         /// Every tagged column the query reads (VERICTO-085), for the audit trail.
         sensitive_columns: Vec<TouchedColumn>,
@@ -80,6 +82,44 @@ impl TcpDecision {
             sensitive_columns,
             access_denied,
         }
+    }
+}
+
+/// A block raised by the proxy itself because the rewrite of a statement
+/// (`rewritten`, when the engine returned one) cannot be enforced as the
+/// engine described it: never the original instead. A mask (or no rewrite at
+/// all) is VERICTO-085, as before 4.17.0; a `rewrite_limit` bound without a
+/// mask is reported under the policy that asked for it, whose finding carries
+/// the bounded text as its suggestion (engine 4.5.0).
+pub fn rewrite_not_enforceable(
+    reason: &str,
+    rewritten: Option<&str>,
+    violations: Vec<ReportedViolation>,
+    sensitive_columns: Vec<TouchedColumn>,
+    access_denied: Vec<DeniedRef>,
+) -> TcpDecision {
+    let masked = sensitive_columns
+        .iter()
+        .any(|c| c.policy == SensitivePolicy::Mask);
+    let bound = rewritten.filter(|_| !masked).and_then(|r| {
+        violations
+            .iter()
+            .find(|v| v.suggested_safe_query.as_deref() == Some(r))
+            .map(|v| (v.rule_code.clone(), v.severity))
+    });
+    match bound {
+        Some((rule_code, severity)) => TcpDecision::Block {
+            ast_node_path: format!(
+                "Policy > {rule_code}: LIMIT rewrite not enforceable by the proxy: {reason}"
+            ),
+            rule_code,
+            suggested_safe_query: None,
+            severity,
+            violations,
+            sensitive_columns,
+            access_denied,
+        },
+        None => TcpDecision::sensitive_block(reason, violations, sensitive_columns, access_denied),
     }
 }
 
@@ -157,7 +197,8 @@ pub struct Observation {
 ///   `Observation` built from the resolved action (None when no rule matched).
 ///   A `Forward` carries the engine's `rewritten_query` when a mask applied;
 ///   if the outcome does not hold together (see [`rewrite_inconsistency`]) the
-///   query is blocked instead.
+///   query is blocked instead. (`rewrite_limit` needs policies: see
+///   [`evaluate_message_with`].)
 /// - Parse error → resolved from `policy.effective_parse_error_for(sql, dialect)`:
 ///   `AllowReport` (fail-open default) forwards with a parse-error
 ///   `Observation`; `Block` (fail-closed opt-in, and forced by any `block` or
@@ -224,10 +265,11 @@ fn decide(outcome: EvaluationOutcome, dialect: Dialect, policy: &EnforcementPoli
     {
         tracing::error!(
             reason,
-            "sensitive-column outcome is inconsistent; blocking rather than forwarding"
+            "rewrite outcome is inconsistent; blocking rather than forwarding"
         );
-        return TcpDecision::sensitive_block(
+        return rewrite_not_enforceable(
             reason,
+            outcome.rewritten_query.as_deref(),
             outcome.violations,
             outcome.sensitive_columns,
             outcome.access_denied,
@@ -294,9 +336,12 @@ pub struct PolicyEval<'a> {
 /// `None`, `off` or an empty policy set: exactly [`evaluate_message`] (an
 /// empty set is what `evaluate_with_context` itself short-cuts to).
 /// `enforce`: the engine's `evaluate_with_context` decides, including the
-/// parse-error block it forces when an enforced blocking policy may apply.
+/// parse-error block it forces when an enforced blocking policy may apply,
+/// and a `rewrite_limit` bound (engine 4.5.0), which forwards the bounded
+/// statement (`rewritten_query`) like a mask.
 /// `observe`: the verdict is [`evaluate`]'s, and what the policies found is
-/// added to it as flags (see [`observed`]).
+/// added to it as flags (see [`observed`]); a `rewrite_limit` is reported
+/// (its would-be text as the finding's suggestion), never applied.
 pub fn evaluate_message_with(
     sql: &str,
     dialect: Dialect,
@@ -487,6 +532,7 @@ fn checked_for_kind(
             Some(reason) => {
                 let TcpDecision::Forward {
                     violations,
+                    rewritten_query,
                     sensitive_columns,
                     access_denied,
                     ..
@@ -494,7 +540,13 @@ fn checked_for_kind(
                 else {
                     unreachable!()
                 };
-                TcpDecision::sensitive_block(&reason, violations, sensitive_columns, access_denied)
+                rewrite_not_enforceable(
+                    &reason,
+                    rewritten_query.as_deref(),
+                    violations,
+                    sensitive_columns,
+                    access_denied,
+                )
             }
         },
         other => other,
@@ -509,6 +561,13 @@ fn checked_for_kind(
 /// The engine guarantees none of these happen (contract §3.2/§3.3); this is the
 /// proxy not taking that on trust for the one decision where trusting it wrongly
 /// leaks the column.
+///
+/// A rewrite is accounted for by a masked column or (engine 4.5.0) by a
+/// `rewrite_limit` policy that bounded the statement (a `Rewritten` policy
+/// hit). Policy hits only exist on the policy path (`evaluate_with_context`,
+/// policy rules `enforce`), so with policy rules off a rewrite without a mask
+/// is refused exactly as before. The hits are only looked at when a rewrite
+/// came back without a mask: nothing is added to any other statement.
 fn rewrite_inconsistency(
     outcome: &EvaluationOutcome,
     dialect: Dialect,
@@ -522,7 +581,18 @@ fn rewrite_inconsistency(
         Some(_) if !matches!(dialect, Dialect::Postgres | Dialect::Mysql) => {
             Some("a rewritten query was returned for a dialect the rewrite does not support")
         }
-        Some(_) if !masked => Some("a rewritten query was returned but no masked column was read"),
+        Some(_)
+            if !masked
+                && !outcome
+                    .policy_hits
+                    .iter()
+                    .any(|h| h.outcome == PolicyOutcome::Rewritten) =>
+        {
+            Some(
+                "a rewritten query was returned but no masked column was read and no LIMIT \
+                 rewrite applied",
+            )
+        }
         Some(sql) if sql.trim().is_empty() || sql.contains('\0') => {
             Some("the rewritten query is empty or not valid wire text")
         }
@@ -589,9 +659,9 @@ fn mysql_parameter_mismatch(original: &str, rewritten: &str) -> Option<String> {
     };
     (before != after).then(|| {
         format!(
-            "masking changes the number of `?` parameters from {before} to {after}, so the \
-             values the client binds would no longer fit; select the column itself, or compute \
-             on it without a parameter"
+            "the rewrite (a mask or a LIMIT bound) changes the number of `?` parameters from \
+             {before} to {after}, so the values the client binds would no longer fit; select \
+             the column itself, or compute on it without a parameter"
         )
     })
 }
@@ -1114,6 +1184,117 @@ mod tests {
             let flag = outcome(None, vec![touched(SensitivePolicy::Flag)]);
             assert_eq!(rewrite_inconsistency(&flag, d, &plain), None);
         }
+    }
+
+    fn limit_hit(outcome: PolicyOutcome) -> vericto_engine::policy::PolicyHit {
+        vericto_engine::policy::PolicyHit {
+            rule_id: "r-cap".into(),
+            rule_code: "POL-CAP".into(),
+            severity: Severity::Low,
+            statement: 0,
+            outcome,
+            requested: vericto_engine::policy::PolicyAction::RewriteLimit,
+            action: Some(EnforcementAction::Monitor),
+            message: "agent reads are capped".into(),
+            reason: None,
+        }
+    }
+
+    /// Engine 4.5.0: a rewrite without a mask is accounted for by a
+    /// `rewrite_limit` policy that bounded the statement, and by nothing else.
+    #[test]
+    fn a_limit_rewrite_is_consistent_only_with_a_rewritten_policy_hit() {
+        let plain = EnforcementPolicy::default();
+        let outcome = |hits: Vec<vericto_engine::policy::PolicyHit>| {
+            let mut o = EvaluationOutcome::allowed();
+            o.rewritten_query = Some("SELECT id FROM orders LIMIT 100".into());
+            o.policy_hits = hits;
+            o
+        };
+        for d in [Dialect::Postgres, Dialect::Mysql] {
+            let bounded = outcome(vec![limit_hit(PolicyOutcome::Rewritten)]);
+            assert_eq!(rewrite_inconsistency(&bounded, d, &plain), None, "{d:?}");
+            for other in [Vec::new(), vec![limit_hit(PolicyOutcome::Violated)]] {
+                assert!(rewrite_inconsistency(&outcome(other), d, &plain).is_some());
+            }
+            let mut empty = outcome(vec![limit_hit(PolicyOutcome::Rewritten)]);
+            empty.rewritten_query = Some(" ".into());
+            assert!(rewrite_inconsistency(&empty, d, &plain).is_some());
+        }
+        for d in [Dialect::Oracle, Dialect::MsSql] {
+            let bounded = outcome(vec![limit_hit(PolicyOutcome::Rewritten)]);
+            assert!(
+                rewrite_inconsistency(&bounded, d, &plain).is_some(),
+                "{d:?}"
+            );
+        }
+    }
+
+    /// Without policies (`evaluate()`, policy rules off) there are no hits, so
+    /// the always-on path refuses a rewrite without a mask exactly as 4.16.2.
+    #[test]
+    fn without_policies_no_select_is_rewritten() {
+        let rules = default_ruleset();
+        let policy = EnforcementPolicy::default();
+        for d in [Dialect::Postgres, Dialect::Mysql] {
+            match evaluate("SELECT id FROM orders", d, &rules, &policy) {
+                TcpDecision::Forward {
+                    rewritten_query, ..
+                } => assert_eq!(rewritten_query, None, "{d:?}"),
+                TcpDecision::Block { .. } => panic!("{d:?}: an unbounded read only flags"),
+            }
+        }
+    }
+
+    /// A LIMIT bound the proxy cannot enforce blocks under the policy's code; a
+    /// mask (with or without a bound on top) stays VERICTO-085.
+    #[test]
+    fn an_unenforceable_rewrite_is_blocked_under_whoever_asked_for_it() {
+        let rewritten = "SELECT id FROM orders LIMIT 100";
+        let violations = || {
+            vec![ReportedViolation {
+                rule_id: "r-cap".into(),
+                rule_code: "POL-CAP".into(),
+                severity: Severity::Low,
+                action: EnforcementAction::Monitor,
+                ast_node_path: "Policy > POL-CAP: agent reads are capped [LIMIT 100]".into(),
+                estimated_rows_affected: None,
+                suggested_safe_query: Some(rewritten.into()),
+            }]
+        };
+        let code = |d: TcpDecision| match d {
+            TcpDecision::Block {
+                rule_code,
+                ast_node_path,
+                ..
+            } => (rule_code, ast_node_path),
+            TcpDecision::Forward { .. } => panic!("must block"),
+        };
+        let (c, path) = code(rewrite_not_enforceable(
+            "why",
+            Some(rewritten),
+            violations(),
+            Vec::new(),
+            Vec::new(),
+        ));
+        assert_eq!(c, "POL-CAP");
+        assert!(path.contains("LIMIT rewrite not enforceable") && path.contains("why"));
+        let (c, _) = code(rewrite_not_enforceable(
+            "why",
+            Some(rewritten),
+            violations(),
+            vec![touched(SensitivePolicy::Mask)],
+            Vec::new(),
+        ));
+        assert_eq!(c, SENSITIVE_RULE_CODE);
+        let (c, _) = code(rewrite_not_enforceable(
+            "why",
+            None,
+            violations(),
+            Vec::new(),
+            Vec::new(),
+        ));
+        assert_eq!(c, SENSITIVE_RULE_CODE);
     }
 
     #[test]

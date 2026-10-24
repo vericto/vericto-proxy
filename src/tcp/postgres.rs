@@ -566,8 +566,9 @@ fn build_telemetry_event(
 /// be unit-tested.
 ///
 /// In sanitized `mode` every SQL text that leaves is normalized first: the
-/// query, the rewritten query of a mask, and a VERICTO-085 suggestion (which
-/// under `monitor_mode` is the would-be rewrite). Sanitizing happens before the
+/// query, the rewritten query of a mask or a `rewrite_limit` bound, and a
+/// VERICTO-085 or `rewrite_limit` suggestion (which under `monitor_mode`, or
+/// policy rules `observe`, is the would-be rewrite). Sanitizing happens before the
 /// size cut, because a cut statement no longer parses and would only ever be
 /// reported as redacted.
 fn build_event(
@@ -688,13 +689,20 @@ fn build_event(
         .iter()
         .take(crate::telemetry::MAX_REPORTED_VIOLATIONS)
         .map(|v| {
-            let sensitive = v.rule_code == SENSITIVE_RULE_CODE;
             let suggestion = v.suggested_safe_query.as_deref().and_then(|s| {
-                if sensitive && Some(s) == rewritten {
-                    // A successful mask repeats the rewritten SQL here; the event
-                    // already carries it in `rewritten_query`.
+                // A `rewrite_limit` finding (engine 4.5.0) carries the bounded
+                // statement, the client's text with its literals, as its
+                // suggestion: treated like a VERICTO-085 one. Only policy findings
+                // have a `Policy > ` path, and `rewrite_limit` is the only policy
+                // action that suggests anything. Looked at only for a finding
+                // with a suggestion.
+                let rewrite =
+                    v.rule_code == SENSITIVE_RULE_CODE || v.ast_node_path.starts_with("Policy > ");
+                if rewrite && Some(s) == rewritten {
+                    // A successful mask or LIMIT bound repeats the rewritten SQL
+                    // here; the event already carries it in `rewritten_query`.
                     None
-                } else if sensitive && sanitized {
+                } else if rewrite && sanitized {
                     Some(sanitize_suggestion(s, dialect))
                 } else {
                     Some(s.to_string())

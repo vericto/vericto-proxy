@@ -218,7 +218,7 @@ back to the default, also with a warning.
 | `VERICTO_BUNDLE_SIGNING_KEYS_FILE` | — | 4.16.0+. A path to a file with the same JSON (a mounted secret or config map). Setting both variables fails startup |
 
 A preview of principal-aware policies (CEL inside the custom-rule YAML, engine
-4.4.0), for workspaces the control plane has enabled it for. **With `off` (the
+4.5.0 since 4.17.0), for workspaces the control plane has enabled it for. **With `off` (the
 default) nothing below happens**: the rule sync does not announce `cel/1`, nothing
 is compiled, the StartupMessage and `SET vericto.*` reach the database as they
 come, statements are evaluated exactly as in 4.14.3 and telemetry carries no new
@@ -226,7 +226,10 @@ field.
 
 With `observe` or `enforce`:
 
-- **Rule sync.** Every `GET /sync/rules` carries `X-Vericto-Policy-Language: cel/1`.
+- **Rule sync.** Every `GET /sync/rules` carries
+  `X-Vericto-Policy-Language: cel/1, rewrite_limit` (4.17.0; `cel/1` alone up to
+  4.16.2). The control plane sends policies that use `rewrite_limit` only to a
+  proxy that announces it.
   The response's `principals` section and its rules are compiled once per sync. A
   malformed `principals` section is ignored (every session is then unmatched); it
   never fails the sync.
@@ -288,6 +291,28 @@ With `observe` or `enforce`:
 - **`enforce`.** Policies decide with the rest of the rules
   (`evaluate_with_context`); a statement the engine cannot read is blocked when an
   enforced blocking policy may apply to the session.
+- **Bounded reads (`rewrite_limit`, 4.17.0).** A policy with
+  `action: { rewrite_limit: n }` (the dashboard's LIMIT cap template in rewrite
+  mode) bounds the reads of the principals it applies to. Under `enforce` the
+  proxy forwards the bounded statement in place of the client's, in the same
+  message: Postgres simple query and `Parse` (same statement name and parameter
+  types), MySQL `COM_QUERY` and `COM_STMT_PREPARE`. The engine adds `LIMIT n` to
+  the outer query of a top-level `SELECT`, lowers a larger literal `LIMIT` /
+  `FETCH FIRST` / MySQL `LIMIT a, m` (keeping `OFFSET`), leaves a smaller one as
+  it is, and turns a Postgres `LIMIT $k` into `LIMIT LEAST($k::bigint, n)` (the
+  parameter keeps its number and type). Writes, `SELECT 1`, aggregate-only
+  projections without `GROUP BY` and `EXPLAIN` are not touched. A MySQL
+  `LIMIT ?` is only known at execution: the statement is forwarded as sent and the
+  policy's `on_unknown` decides (default `flag`). A statement the engine cannot
+  bound safely (`FETCH … WITH TIES`) is blocked with the policy's code, as is a
+  rewrite the proxy cannot carry or that would change the client's bind
+  parameters: never the unbounded original. Applied on top of a VERICTO-085 mask
+  when both apply. The event keeps the client's statement in `query_text` and the
+  bounded one in `rewritten_query` (sanitized like the query in `sanitized`
+  mode). `observe` and the workspace's `monitor_mode` forward the original and
+  report the would-be text as the finding's `suggested_safe_query`. Without a
+  `rewrite_limit` policy, or with policy rules `off`, nothing is rewritten: the
+  built-in VERICTO-050 (`SELECT` without `LIMIT`) only flags.
 - **Telemetry.** Each event adds `principal_id`, `principal_type`,
   `principal_trust`, `principal_via`, `application_name`, `policy_bundle_version`,
   `ticket_id` and `session_tenant` (no client address).
