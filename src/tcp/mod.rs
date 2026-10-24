@@ -9,6 +9,7 @@
 //! database.
 
 pub mod bundle_signature;
+pub mod cancel;
 pub mod codec;
 pub mod codec_mysql;
 pub mod evaluator;
@@ -208,6 +209,7 @@ pub async fn run_pg_proxy(
             vericto_engine::Dialect::Postgres,
         ),
         policy_rules: policy_runtime(&opts, policy_rules),
+        cancel_keys: Default::default(),
     });
 
     let addr = format!("0.0.0.0:{}", opts.listen_port);
@@ -299,6 +301,7 @@ pub async fn run_mysql_proxy(
             vericto_engine::Dialect::Mysql,
         ),
         policy_rules: policy_runtime(&opts, policy_rules),
+        cancel_keys: Default::default(),
     });
 
     let addr = format!("0.0.0.0:{}", opts.listen_port);
@@ -331,6 +334,8 @@ pub mod rules_sync;
 
 #[cfg(test)]
 mod access_tests;
+#[cfg(test)]
+mod fake_pg_tests;
 #[cfg(test)]
 mod mysql_auth_tests;
 #[cfg(test)]

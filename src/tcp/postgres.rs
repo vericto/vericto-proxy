@@ -5,7 +5,8 @@
 //!
 //! Terminates the PostgreSQL wire protocol transparently: the client (Prisma,
 //! SQLAlchemy, psql, ...) connects believing it talks to Postgres. The proxy:
-//!   1. Negotiates the startup phase (declines TLS/GSS, forwards StartupMessage).
+//!   1. Negotiates the startup phase (declines TLS/GSS, forwards StartupMessage;
+//!      a CancelRequest is forwarded on its own, see `tcp::cancel`).
 //!   2. Opens an upstream connection to the real Postgres and forwards startup.
 //!   3. Relays server→client untouched.
 //!   4. Intercepts client→server: extracts the SQL from Query ('Q') and Parse
@@ -66,6 +67,9 @@ pub struct PgProxyConfig {
     /// Business policy rules (`VERICTO_POLICY_RULES`, default off): the mode,
     /// the synced principals and compiled policies, the listener (since 4.15.0).
     pub policy_rules: crate::tcp::policy_rules::PolicyRulesRuntime,
+    /// The `BackendKeyData` relayed to each open Postgres session: a
+    /// `CancelRequest` is forwarded only for one of them (4.16.1).
+    pub cancel_keys: Arc<crate::tcp::cancel::CancelRegistry>,
 }
 
 /// Where the TCP proxy pushes evaluation telemetry (non-blocking).
@@ -93,7 +97,19 @@ async fn run_session(client: TcpStream, config: Arc<PgProxyConfig>) -> std::io::
     // The StartupMessage `user` is the session's identity for the agent-access
     // allowlists: the role the server authenticates, fixed for the session.
     let (mut client_read, mut client_write, startup_raw, startup) =
-        negotiate_startup(client, config.client_tls_acceptor.as_ref()).await?;
+        match negotiate_startup(client, config.client_tls_acceptor.as_ref()).await? {
+            Negotiated::Session {
+                read,
+                write,
+                raw,
+                params,
+            } => (read, write, raw, params),
+            // A CancelRequest is a connection of its own: forwarded (or not),
+            // then closed without an answer.
+            Negotiated::Cancel(key) => {
+                return crate::tcp::cancel::handle_cancel_request(&config, key).await;
+            }
+        };
     let session_user = startup.user;
 
     // Policy rules on (4.15.0): the `vericto.*` settings and `application_name`
@@ -193,13 +209,11 @@ async fn run_session(client: TcpStream, config: Arc<PgProxyConfig>) -> std::io::
     // corrupt the protocol; before then we can still surface a typed error.
     let relay_wrote = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
-    // Policy rules on (4.15.0): the relay also follows the ReadyForQuery status,
-    // so the replies the proxy writes itself carry the real transaction state.
-    let tx_state = config
-        .policy_rules
-        .mode
-        .is_on()
-        .then(|| Arc::new(crate::tcp::tx_state::ServerTxState::new()));
+    // The relay follows the ReadyForQuery status, so the replies the proxy
+    // writes itself (a refused statement, a consumed `SET vericto.*`) carry the
+    // real transaction state: with policy rules on since 4.15.0, in every mode
+    // since 4.16.1. It also registers the session's BackendKeyData for cancels.
+    let tx_state = Arc::new(crate::tcp::tx_state::ServerTxState::new());
 
     // Relay server→client (auth, data, notices) without intercepting.
     let relay_handle = tokio::spawn(relay_server_to_client(
@@ -207,6 +221,7 @@ async fn run_session(client: TcpStream, config: Arc<PgProxyConfig>) -> std::io::
         client_write.clone(),
         relay_wrote.clone(),
         tx_state.clone(),
+        Some(config.cancel_keys.clone()),
     ));
 
     // ── Phase 4: client→server interception loop
@@ -221,7 +236,7 @@ async fn run_session(client: TcpStream, config: Arc<PgProxyConfig>) -> std::io::
     // function's futures closes the sockets, unwinding the client side too.
     let mut relay_handle = relay_handle;
     let result = tokio::select! {
-        r = intercept_client_to_server(&mut client_read, &mut server_write, &client_write, &config, session_user, declared, tx_state) => {
+        r = intercept_client_to_server(&mut client_read, &mut server_write, &client_write, &config, session_user, declared, Some(tx_state)) => {
             // Client ended or a block/forward error unwound the loop: stop the relay.
             relay_handle.abort();
             r
@@ -277,8 +292,22 @@ pub(crate) fn startup_context(
     Ok((ctx.raw, declared))
 }
 
+/// What the startup phase of a client connection turned out to be.
+enum Negotiated {
+    /// A session: the client transport halves, the raw StartupMessage bytes and
+    /// its parameters.
+    Session {
+        read: ClientRead,
+        write: ClientWrite,
+        raw: Vec<u8>,
+        params: StartupParams,
+    },
+    /// A CancelRequest for the session holding this key.
+    Cancel(crate::tcp::cancel::BackendKey),
+}
+
 /// Negotiates the startup phase and returns the client transport halves, the
-/// raw StartupMessage bytes and its parameters.
+/// raw StartupMessage bytes and its parameters, or the key of a CancelRequest.
 ///
 /// When `acceptor` is `Some` and the client sends an `SSLRequest`, the proxy
 /// answers `'S'`, performs the server-side TLS handshake, and reads the
@@ -289,10 +318,15 @@ pub(crate) fn startup_context(
 /// sent in plaintext (the client skipped `SSLRequest`, e.g. `sslmode=disable`)
 /// is refused with a native `ErrorResponse` (28000) and never reaches the
 /// upstream — the MySQL path refuses the same case (`session.rs`).
+///
+/// A `CancelRequest` is taken before that requirement, in plaintext or after
+/// TLS: libpq's `PQcancel` never negotiates TLS for it, and the packet opens
+/// no session (see `tcp::cancel`). Up to 4.16.0 it was read as a
+/// StartupMessage, so with `require` it was refused and the query ran on.
 async fn negotiate_startup(
     mut client: TcpStream,
     acceptor: Option<&tokio_rustls::TlsAcceptor>,
-) -> std::io::Result<(ClientRead, ClientWrite, Vec<u8>, StartupParams)> {
+) -> std::io::Result<Negotiated> {
     loop {
         match read_startup_packet(&mut client).await? {
             StartupPacket::SslRequest => {
@@ -303,8 +337,15 @@ async fn negotiate_startup(
                     client.flush().await?;
                     let (mut read, write) =
                         crate::tcp::client_tls::accept_tls(acceptor, client).await?;
-                    let (raw, params) = read_startup_message(&mut read).await?;
-                    return Ok((read, write, raw, params));
+                    return Ok(match read_startup_message(&mut read).await? {
+                        AfterTls::Startup(raw, params) => Negotiated::Session {
+                            read,
+                            write,
+                            raw,
+                            params,
+                        },
+                        AfterTls::Cancel(key) => Negotiated::Cancel(key),
+                    });
                 }
                 // TLS not enabled: decline ('N') and keep negotiating in plaintext.
                 client.write_all(b"N").await?;
@@ -315,6 +356,7 @@ async fn negotiate_startup(
                 client.write_all(b"N").await?;
                 client.flush().await?;
             }
+            StartupPacket::CancelRequest(key) => return Ok(Negotiated::Cancel(key)),
             StartupPacket::Startup { raw, params } => {
                 if acceptor.is_some() {
                     tracing::warn!(
@@ -340,17 +382,28 @@ async fn negotiate_startup(
                     "StartupMessage received"
                 );
                 let (read, write) = tokio::io::split(client);
-                return Ok((Box::new(read), Box::new(write), raw, params));
+                return Ok(Negotiated::Session {
+                    read: Box::new(read),
+                    write: Box::new(write),
+                    raw,
+                    params,
+                });
             }
         }
     }
 }
 
+/// The packet a client sends after the TLS handshake.
+enum AfterTls {
+    Startup(Vec<u8>, StartupParams),
+    Cancel(crate::tcp::cancel::BackendKey),
+}
+
 /// Reads a single startup packet expecting the StartupMessage (used after a TLS
-/// handshake, where the next message must be the StartupMessage).
-async fn read_startup_message<R: AsyncRead + Unpin>(
-    reader: &mut R,
-) -> std::io::Result<(Vec<u8>, StartupParams)> {
+/// handshake, where the next message must be the StartupMessage, or a
+/// CancelRequest from a client that encrypts it, such as libpq 17's
+/// `PQcancelCreate`).
+async fn read_startup_message<R: AsyncRead + Unpin>(reader: &mut R) -> std::io::Result<AfterTls> {
     match read_startup_packet(reader).await? {
         StartupPacket::Startup { raw, params } => {
             tracing::debug!(
@@ -358,8 +411,9 @@ async fn read_startup_message<R: AsyncRead + Unpin>(
                 database = ?params.database,
                 "StartupMessage received (over TLS)"
             );
-            Ok((raw, params))
+            Ok(AfterTls::Startup(raw, params))
         }
+        StartupPacket::CancelRequest(key) => Ok(AfterTls::Cancel(key)),
         _ => Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             "expected StartupMessage after TLS handshake",
@@ -374,22 +428,32 @@ async fn read_startup_message<R: AsyncRead + Unpin>(
 /// whether it is still safe to inject a native `ErrorResponse`: once server
 /// bytes have reached the client (auth/rows in flight), injecting one would
 /// corrupt the protocol stream, so it must fall back to a plain close.
+///
+/// `tx_state` receives the status of every ReadyForQuery. With `cancel_keys`,
+/// the session's BackendKeyData is registered there before it reaches the
+/// client, and stays registered until the relay ends (the session closes).
 pub(crate) async fn relay_server_to_client(
     mut server_read: crate::tcp::upstream::UpstreamRead,
     client_write: Arc<Mutex<ClientWrite>>,
     wrote_any: Arc<std::sync::atomic::AtomicBool>,
-    tx_state: Option<Arc<crate::tcp::tx_state::ServerTxState>>,
+    tx_state: Arc<crate::tcp::tx_state::ServerTxState>,
+    mut cancel_keys: Option<Arc<crate::tcp::cancel::CancelRegistry>>,
 ) {
     let mut buf = vec![0u8; 16 * 1024];
-    let mut tracker = tx_state.map(|s| (crate::tcp::tx_state::PgTxTracker::new(), s));
+    let mut tracker = crate::tcp::tx_state::PgTxTracker::new();
+    let mut _registration = None;
     loop {
         match server_read.read(&mut buf).await {
             Ok(0) => break, // upstream closed
             Ok(n) => {
                 // Before the bytes reach the client: its next message then sees
-                // the state they carry.
-                if let Some((t, state)) = tracker.as_mut() {
-                    t.feed(&buf[..n], state);
+                // the state they carry, and a cancel finds its key.
+                tracker.feed(&buf[..n], &tx_state);
+                if cancel_keys.is_some()
+                    && let Some(key) = tracker.take_backend_key()
+                    && let Some(registry) = cancel_keys.take()
+                {
+                    _registration = Some(registry.register(key));
                 }
                 let mut writer = client_write.lock().await;
                 if writer.write_all(&buf[..n]).await.is_err() || writer.flush().await.is_err() {
@@ -1683,6 +1747,7 @@ mod tests {
             telemetry: None,
             max_query_bytes: crate::tcp::query_limit::DEFAULT_MAX_QUERY_BYTES,
             policy_rules: Default::default(),
+            cancel_keys: Default::default(),
         })
     }
 

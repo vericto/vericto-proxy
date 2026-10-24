@@ -711,7 +711,8 @@ fn relayed(mysql: bool) -> Relayed {
             server_read,
             client_write.clone(),
             Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            Some(tx.clone()),
+            tx.clone(),
+            None,
         ))
     };
     let start = SessionStart {

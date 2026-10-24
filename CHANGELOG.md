@@ -7,6 +7,61 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [4.16.1] — 2026-10-24
+
+**Two Postgres wire-protocol fixes.** Nothing changes in configuration, telemetry or
+`/metrics`; MySQL is unchanged.
+
+### Fixed
+
+- **A cancel request works with `PROXY_TLS_MODE=require`.** A client cancels a running
+  query by sending a `CancelRequest` (code 80877102) on a new connection, and libpq's
+  `PQcancel` (psql's Ctrl+C, most drivers) sends it in plaintext. The proxy read it as
+  a StartupMessage, so with `require` it answered 28000 and the query ran on. The
+  proxy now takes a `CancelRequest` before the TLS requirement applies, in plaintext
+  or after TLS (libpq 17's `PQcancelCreate` encrypts it), and forwards it to the
+  database on a new connection, over `UPSTREAM_SSLMODE` like any other, never
+  answering it, as the server does not.
+  - **Only for a session of this proxy.** The proxy still relays the server's
+    `BackendKeyData` to the client unchanged, and now records the key of each open
+    session (`src/tcp/cancel.rs`): a `CancelRequest` is forwarded only when its
+    process id and secret (compared in constant time) are those of a session that
+    is open on the same proxy process. A wrong secret, a wrong pid, a closed
+    session's key: dropped, nothing reaches the database. Up to 4.16.0, with
+    `disable`, any packet with that code was forwarded as it came.
+  - With more than one proxy replica behind a load balancer, a cancel works when it
+    reaches the replica that holds the session (for example, source-IP affinity).
+- **The ReadyForQuery of a statement the proxy refuses reports the real
+  transaction status with `VERICTO_POLICY_RULES=off`** (the default). It always said
+  `I` (idle), also inside a transaction block (`T`) or a failed one (`E`), in the
+  simple protocol and at the `Sync` that ends a refused extended sequence; a
+  driver that tracks the status (libpq's `PQtransactionStatus`, connection pools
+  that check it before reuse) then took an open transaction for an idle
+  connection. Since the statement never reaches the database, the status is the
+  server's last one: the relay now follows it with the tracker that policy rules
+  on already used (4.15.0), in every mode. The client-side loop does no new work
+  per statement, and the tracker now walks the messages a read holds whole in
+  place (one header read each, no copy, no allocation, no lock), so the relay
+  costs what it did: on a fixed replay of 2,000 Postgres statements through one
+  session (callgrind, user-space instructions, linux/arm64, 3 runs each),
+  233,055 per statement for 4.16.0 and 233,047 for 4.16.1.
+  - **MySQL needs no change:** its counterpart is the status flags of an OK / EOF
+    packet (`SERVER_STATUS_IN_TRANS`, `SERVER_STATUS_AUTOCOMMIT`), and the proxy's
+    refusal is an `ERR_Packet`, which carries none, so the client keeps the flags of
+    the server's last OK, still true because the statement never ran. Checked
+    against MySQL 8.0 (inside `BEGIN`, after an error, with autocommit off).
+
+### Tests
+
+- `src/tcp/fake_pg_tests.rs` drives the real session entrypoint against a scripted
+  Postgres: a plaintext cancel under `require` is forwarded byte for byte, also one
+  sent over TLS; a wrong secret, pid or length is ignored; a cancel while no query
+  runs is forwarded and the session runs on; a closed session's key is ignored; a
+  refusal reports `I` idle, `T` inside `BEGIN`, `E` after an error, in the simple
+  and the extended protocol; the MySQL refusal is the same `ERR_Packet` in each
+  state. `real_pg_client_cancel_through_the_proxy` (with `VERICTO_TEST_PG_URL`)
+  cancels a running statement with tokio-postgres's cancel token: 57014.
+
 ## [4.16.0] — 2026-10-23
 
 **Security: with business policy rules on, the proxy applies only signed sync

@@ -102,9 +102,11 @@ pub struct BlockContext<'a> {
     /// Sequence id of the blocked message (MySQL needs command_seq + 1 for the
     /// reply; Postgres ignores this).
     pub client_seq: u8,
-    /// The transaction state the server last reported, with policy rules on
-    /// (4.15.0): the Postgres reply's ReadyForQuery then carries it. `None`
-    /// (policy rules off): ReadyForQuery says idle, as in 4.14.3.
+    /// The transaction state the server last reported: the Postgres reply's
+    /// ReadyForQuery carries it. Always `Some` on Postgres since 4.16.1 (up to
+    /// 4.16.0 only with policy rules on; off, ReadyForQuery said idle). MySQL:
+    /// `Some` with policy rules on; its refusal (an ERR_Packet) carries no
+    /// status either way. `None`: ReadyForQuery says idle.
     pub tx: Option<&'a crate::tcp::tx_state::ServerTxState>,
 }
 

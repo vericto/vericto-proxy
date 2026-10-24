@@ -1302,7 +1302,7 @@ pub(crate) mod test_pki {
             }
         }
 
-        fn roots(&self) -> RootCertStore {
+        pub(crate) fn roots(&self) -> RootCertStore {
             let mut roots = RootCertStore::empty();
             roots.add(self.issuer.der().clone()).unwrap();
             roots
