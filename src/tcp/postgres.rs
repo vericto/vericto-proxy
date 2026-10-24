@@ -56,6 +56,9 @@ pub struct PgProxyConfig {
     /// Hot-swappable agent-access allowlists (VERICTO-087) keyed by database user,
     /// shared with the rule syncer. Each session applies its own user's policy.
     pub agent_access: crate::tcp::rules_sync::SharedAccessPolicies,
+    /// Hot-swappable kill-switch blocks (VERICTO-105, since 4.18.0), shared with
+    /// the rule syncer. `None` while no block is active.
+    pub kill_switch: crate::tcp::kill_switch::SharedKillSwitch,
     /// Hot-swappable telemetry query mode (raw | sanitized) shared with the syncer.
     pub telemetry_mode: crate::tcp::rules_sync::SharedTelemetryMode,
     /// Optional telemetry sink: when set, each evaluation is reported. The
@@ -1009,7 +1012,10 @@ fn build_event(
                 // with a suggestion.
                 let rewrite =
                     v.rule_code == SENSITIVE_RULE_CODE || v.ast_node_path.starts_with("Policy > ");
-                if rewrite && Some(s) == rewritten {
+                if v.rule_code == vericto_engine::ACCESS_RULE_CODE {
+                    // Engine 4.6.0 names the denied references in it.
+                    Some(redaction.suggestion(s))
+                } else if rewrite && Some(s) == rewritten {
                     // A successful mask or LIMIT bound repeats the rewritten SQL
                     // here; the event already carries it in `rewritten_query`.
                     None
@@ -1098,6 +1104,7 @@ fn build_event(
         policy_bundle_version: policy_field(identity, |p| &p.policy_bundle_version),
         ticket_id: policy_field(identity, |p| &p.ticket_id),
         session_tenant: policy_field(identity, |p| &p.session_tenant),
+        kill_switch_id: None,
     }
 }
 
@@ -1206,6 +1213,17 @@ impl<'a> AccessRedaction<'a> {
         )
     }
 
+    /// A VERICTO-087 suggestion (engine 4.6.0+), which names the denied
+    /// references: unchanged, or built again by the engine from the redacted
+    /// names, as [`Self::path`] is.
+    fn suggestion(&self, original: &str) -> String {
+        match &self.redacted {
+            None => original.to_string(),
+            Some(list) => vericto_engine::access_suggested_fix(list)
+                .unwrap_or_else(|| "<suggestion redacted>".to_string()),
+        }
+    }
+
     /// The `access_denied` field: capped and with every name bounded to the
     /// ingest schema's limits, so one long name cannot reject the batch.
     fn payload(&self) -> Vec<crate::telemetry::AccessDeniedPayload> {
@@ -1274,6 +1292,55 @@ pub(crate) fn report_telemetry(
         **config.telemetry_mode.load(),
         identity,
     );
+    sink.queue.push(event);
+}
+
+/// The decision of a statement the kill switch refused: VERICTO-105, critical,
+/// block, with the block's message as the only violation's text.
+pub(crate) fn kill_switch_decision(block: &crate::tcp::kill_switch::KillBlock) -> TcpDecision {
+    use crate::tcp::kill_switch::KILL_SWITCH_RULE_CODE;
+    let ast_node_path = block.ast_node_path();
+    TcpDecision::Block {
+        rule_code: KILL_SWITCH_RULE_CODE.to_string(),
+        ast_node_path: ast_node_path.clone(),
+        suggested_safe_query: None,
+        severity: vericto_engine::Severity::Critical,
+        violations: vec![vericto_engine::ReportedViolation {
+            rule_id: KILL_SWITCH_RULE_CODE.to_string(),
+            rule_code: KILL_SWITCH_RULE_CODE.to_string(),
+            severity: vericto_engine::Severity::Critical,
+            action: EnforcementAction::Block,
+            ast_node_path,
+            estimated_rows_affected: None,
+            suggested_safe_query: None,
+        }],
+        sensitive_columns: Vec::new(),
+        access_denied: Vec::new(),
+    }
+}
+
+/// [`report_telemetry`] for a statement the kill switch refused: the event also
+/// names the block (`kill_switch_id`).
+pub(crate) fn report_kill_switch(
+    config: &PgProxyConfig,
+    sql: &str,
+    dialect: Dialect,
+    block: &crate::tcp::kill_switch::KillBlock,
+    identity: &EventIdentity,
+) {
+    let Some(sink) = &config.telemetry else {
+        return;
+    };
+    let mut event = build_event(
+        &sink.database_id,
+        sql,
+        dialect,
+        &kill_switch_decision(block),
+        0,
+        **config.telemetry_mode.load(),
+        identity,
+    );
+    event.kill_switch_id = Some(block.block_id.clone());
     sink.queue.push(event);
 }
 
@@ -2060,6 +2127,7 @@ mod tests {
             agent_access: Arc::new(ArcSwap::from_pointee(
                 vericto_engine::AccessPolicyMap::default(),
             )),
+            kill_switch: Default::default(),
             telemetry_mode: Arc::new(ArcSwap::from_pointee(
                 crate::tcp::rules_sync::TelemetryQueryMode::default(),
             )),

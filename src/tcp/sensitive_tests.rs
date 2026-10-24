@@ -94,6 +94,7 @@ pub(super) fn config_with(
         agent_access: Arc::new(ArcSwap::from_pointee(
             vericto_engine::AccessPolicyMap::default(),
         )),
+        kill_switch: Default::default(),
         telemetry_mode: Arc::new(ArcSwap::from_pointee(mode)),
         telemetry: Some(TelemetrySink {
             queue: queue.clone() as Arc<dyn EventQueue>,
@@ -916,6 +917,7 @@ fn a_vericto_086_block_on_postgres_is_42501() {
         rule_code: "VERICTO-086",
         ast_node_path: "LexicalDivergence > MySQL may read this text differently (…)",
         suggested_safe_query: None,
+        message: None,
         kind: crate::tcp::protocol::QueryKind::Simple,
         client_seq: 0,
         tx: None,

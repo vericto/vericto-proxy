@@ -138,6 +138,16 @@ async fn pg_denied_read_is_blocked_with_42501_on_simple_and_extended() {
     // A column not in the list, in a predicate only: predicates count.
     let msg = pg_expect_087(&mut w, "SELECT id FROM customers WHERE ssn = '123' LIMIT 1").await;
     assert!(msg.contains("customers.ssn (read)"), "{msg}");
+    // Engine 4.6.0: what to do about it, after the path.
+    assert!(
+        msg.ends_with(
+            ". Suggestion: Not in the agent-access allowlist of this identity: `customers.ssn` \
+             (needs read). An admin must grant it to this identity in Dashboard > Agent access; \
+             until then do not run it, and do not reach the same data through another table, \
+             identity or connection"
+        ),
+        "{msg}"
+    );
     // A table not in the allowlist at all.
     pg_expect_087(&mut w, "SELECT id FROM invoices LIMIT 1").await;
     // Catalogue reads are denied unless listed.
@@ -586,6 +596,14 @@ async fn mysql_sanitized_mode_never_reports_a_double_quoted_literal() {
     assert_eq!(ev[0]["rule_code"], "VERICTO-087");
     assert_eq!(ev[0]["access_denied"][0]["table"], "customers");
     assert_eq!(ev[0]["access_denied"][0]["column"], "?");
+    // Engine 4.6.0's suggestion names the reference too: redacted the same way.
+    let suggestion = ev[0]["violations"][0]["suggested_safe_query"]
+        .as_str()
+        .unwrap();
+    assert!(
+        suggestion.starts_with("Not in the agent-access allowlist of this identity: `customers.?`"),
+        "{suggestion}"
+    );
 
     // Raw mode reports it as the engine names it (proves the case is real).
     let (cfg, queue) = proxy(EnforcementPolicy::default(), TelemetryQueryMode::Raw);

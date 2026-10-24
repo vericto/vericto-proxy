@@ -63,7 +63,7 @@ docker network create vericto-demo
 docker run -d --name vericto-demo-db --network vericto-demo \
   -e POSTGRES_PASSWORD=demo postgres:17
 docker run -d --name vericto-demo-proxy --network vericto-demo \
-  -e UPSTREAM_HOST=vericto-demo-db vericto/vericto-proxy:4.17.3
+  -e UPSTREAM_HOST=vericto-demo-db vericto/vericto-proxy:4.18.0
 until docker exec vericto-demo-db pg_isready -q -h localhost -U postgres; do sleep 1; done
 
 docker run --rm --network vericto-demo postgres:17 \
@@ -75,7 +75,7 @@ docker run --rm --network vericto-demo postgres:17 \
   -c "SELECT id, email FROM users"
 ```
 
-The image comes from Docker Hub; `ghcr.io/vericto/vericto-proxy:4.17.3` serves the
+The image comes from Docker Hub; `ghcr.io/vericto/vericto-proxy:4.18.0` serves the
 same digest (see [Docker](#docker)).
 
 The `DELETE` without a `WHERE` never reaches the database; the one with a `WHERE`
@@ -213,6 +213,14 @@ session (`SET ROLE`, `USE`, `COM_CHANGE_USER` and the like are denied). A policy
 The full behaviour (name resolution, writes and locks, policy changes on open
 sessions, telemetry, known limits) is in [docs/AGENT_ACCESS.md](docs/AGENT_ACCESS.md).
 
+**Kill switch (4.18.0).** When an owner or admin blocks an agent (or every agent of
+the workspace) from the dashboard's Incident response panel, the proxy refuses every
+statement of that database user from its next rule sync with `VERICTO-105` and the
+kill-switch message the Runtime API returns, before anything is evaluated and in
+every mode: `SELECT 1`, `SET` and `BEGIN` included, and statements prepared before
+the block. Lifting the block restores the session at the following sync. See
+[docs/AGENT_ACCESS.md](docs/AGENT_ACCESS.md#kill-switch-vericto-105).
+
 ---
 
 ## Configuration
@@ -288,17 +296,17 @@ whichever your environment allows.
 ```bash
 # Postgres. On Linux, add --add-host=host.docker.internal:host-gateway
 docker run --rm -e UPSTREAM_HOST=host.docker.internal -p 5433:5433 \
-  vericto/vericto-proxy:4.17.3
+  vericto/vericto-proxy:4.18.0
 
 # MySQL
 docker run --rm \
   -e VERICTO_WIRE_PROTOCOL=mysql \
   -e UPSTREAM_HOST=host.docker.internal \
   -p 3307:3307 \
-  vericto/vericto-proxy:4.17.3
+  vericto/vericto-proxy:4.18.0
 
 # The same image from GHCR
-docker pull ghcr.io/vericto/vericto-proxy:4.17.3
+docker pull ghcr.io/vericto/vericto-proxy:4.18.0
 ```
 
 Images released from now on carry a build provenance attestation (Sigstore,
@@ -341,7 +349,7 @@ With Docker Compose:
 
 ```yaml
 proxy:
-  image: ${VERICTO_PROXY_IMAGE:-vericto/vericto-proxy:4.17.3}
+  image: ${VERICTO_PROXY_IMAGE:-vericto/vericto-proxy:4.18.0}
   ports:
     - "5433:5433"
   environment:

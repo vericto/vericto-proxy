@@ -124,6 +124,10 @@ async fn run() {
     let agent_access: SharedAccessPolicies =
         Arc::new(ArcSwap::from_pointee(AccessPolicyMap::default()));
 
+    // Shared, hot-swappable kill-switch blocks (VERICTO-105). None until a sync
+    // carries an active block; the rules cache restores them across a restart.
+    let kill_switch = tcp::kill_switch::SharedKillSwitch::default();
+
     // Shared, hot-swappable telemetry query mode. Defaults to Raw until the
     // first API sync resolves the workspace's reporting privacy preference.
     let telemetry_mode: SharedTelemetryMode =
@@ -313,6 +317,7 @@ async fn run() {
             let sync_ruleset = ruleset.clone();
             let sync_policy = policy.clone();
             let sync_agent_access = agent_access.clone();
+            let sync_kill_switch = kill_switch.clone();
             let sync_telemetry_mode = telemetry_mode.clone();
             let sync_readiness = readiness.clone();
             let sync_policy_rules = crate::tcp::rules_sync::PolicyRulesSync {
@@ -326,6 +331,7 @@ async fn run() {
                     sync_ruleset,
                     sync_policy,
                     sync_agent_access,
+                    sync_kill_switch,
                     sync_telemetry_mode,
                     sync_policy_rules,
                     sync_readiness,
@@ -420,6 +426,7 @@ async fn run() {
                     ruleset,
                     policy,
                     agent_access,
+                    kill_switch,
                     telemetry_mode,
                     policy_rules,
                     telemetry_sink,
@@ -432,6 +439,7 @@ async fn run() {
                     ruleset,
                     policy,
                     agent_access,
+                    kill_switch,
                     telemetry_mode,
                     policy_rules,
                     telemetry_sink,

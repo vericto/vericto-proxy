@@ -1462,6 +1462,7 @@ mod tests {
             policy_bundle_version: None,
             ticket_id: None,
             session_tenant: None,
+            kill_switch_id: None,
         }
     }
 
