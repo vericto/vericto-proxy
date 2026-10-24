@@ -7,6 +7,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [4.16.2] — 2026-10-24
+
+**Async workers sized from the CPU limit, not the CPU count.** Up to 4.16.1 the
+proxy started tokio's default of one worker per CPU it could run on. On ECS Fargate
+that is the host's vCPUs, not the task's: the CPU quota of a task is set on the
+task's cgroup, above the container's, and the container sees neither the quota nor
+its throttling (measured 2026-10-23, platform 1.4.0, ARM64, 0.5 vCPU tasks: 1 or 2
+CPUs visible depending on the host, `cpu.cfs_quota_us` = -1, while two busy threads
+got 0.50 vCPU). With 2 workers on a 0.5 vCPU quota the proxy needed about 25% more
+CPU per statement (103–106 against 81–83 µs for PostgreSQL pgbench select-only,
+extended protocol, TLS on both hops), reached the quota at a lower rate and was then
+throttled for the rest of each 100 ms CFS period, a stall for every connection at
+once: an added p99 of 39 ms at 4,826 statements/s and a collapse (p50 above 60 ms) at
+5,429/s, against 0.40 and 0.49 ms with 1 worker on the same budget (vericto-bench
+results/bench-2026-11-proxy-tail, 3 paired repetitions per cell). On one core with a
+visible quota (Docker `--cpus`) nothing changes: std already gave 1 worker there.
+
+### Changed
+
+- **Worker threads** (`src/runtime_sizing.rs`): `VERICTO_WORKER_THREADS` when set,
+  else `TOKIO_WORKER_THREADS` (as before), else the CPU limit rounded up, at most the
+  CPUs available and at least 1. The limit is the lower of the cgroup quota visible
+  to the process (v2 `cpu.max`, v1 `cpu.cfs_quota_us`, the process's cgroup and its
+  visible ancestors) and the ECS task's `Limits.CPU` (task metadata v4, read once at
+  startup with a 2-second timeout, only when `ECS_CONTAINER_METADATA_URI_V4` is set).
+  Rounding up, not down as std does: 1.5 vCPU gets 2 workers. A malformed
+  `VERICTO_WORKER_THREADS` (not 1–1024) stops the proxy at startup. One startup line,
+  `"Runtime sizing"`, logs the choice and where it came from.
+- `vericto-proxy healthcheck` no longer starts a runtime.
+- The evaluation pool keeps tokio's default bound: a cap of 4 threads made no
+  measurable difference at 0.5 vCPU up to 90% of the published saturation rate, and a
+  low cap would let a few large statements hold every evaluation thread.
+
+### Documentation
+
+- `docs/CONFIGURATION.md`, new section "CPU sizing": CPU per statement, where the
+  latency knee of a CPU quota is, scaling out at 50–60% of the task's CPU
+  reservation, why Fargate shows no throttling inside the container, 1 vCPU tasks
+  for bursty loads. README points to it.
+
+### Performance
+
+- The statement path is unchanged: callgrind, 2,000 pgbench select-only statements
+  (extended protocol) through one session, linux/arm64, release images, 2
+  repetitions: 196,510 / 196,771 user-space instructions per statement for 4.15.3,
+  197,358 / 196,888 for 4.16.2 (4.16.0 and 4.16.1 included; means within 0.25%).
+
 ## [4.16.1] — 2026-10-24
 
 **Two Postgres wire-protocol fixes.** Nothing changes in configuration, telemetry or

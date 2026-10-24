@@ -16,6 +16,7 @@ All variables are **dialect-agnostic** — the same names apply to every engine.
 - [Health check (optional)](#health-check-optional)
 - [Observability](#observability)
   - [Metrics](#metrics)
+- [CPU sizing](#cpu-sizing)
 - [Engine-specific notes](#engine-specific-notes)
   - [MySQL details](#mysql-details)
 
@@ -381,6 +382,53 @@ fixed whatever the traffic. The figures are not secret, but they say how busy th
 database is: bind the health-check listener to a private address
 (`VERICTO_HEALTHZ_ADDR`), keep its port reachable only from the load balancer and
 your monitoring, and never expose it to the internet.
+
+## CPU sizing
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `VERICTO_WORKER_THREADS` | from the CPU limit | 4.16.2+. Async worker threads (1–1024; anything else stops the proxy at startup). By default the CPU limit rounded up, at most the CPUs the process may run on: the cgroup CPU quota visible in the container, or the ECS task's `Limits.CPU` from the task metadata endpoint, whichever is lower; without a limit, one per CPU. `TOKIO_WORKER_THREADS` is still honoured when this is unset |
+
+The proxy logs its choice once at startup (`"Runtime sizing"`, with
+`worker_threads`, `source`, `cpu_limit` and `available_cpus`).
+
+**Why a limit, not the CPU count.** On ECS Fargate the CPU quota of a task sits on
+the task's cgroup, which the container cannot see: a 0.5 vCPU task runs on a host
+with 1 or 2 vCPUs, sees no quota, and up to 4.16.1 started one worker per vCPU. With
+2 workers on a 0.5 vCPU quota the proxy spent about 25% more CPU per statement
+(work moving between threads), reached the quota earlier and was then throttled
+for the rest of each 100 ms CFS period, which stalls every connection at once.
+Measured at 0.5 vCPU spread over two cores (PostgreSQL pgbench select-only,
+extended protocol, TLS on both hops): added p99 0.40 ms with 1 worker against
+39 ms with 2 at 4,826 statements/s, and 0.49 ms against a collapse (p50 above
+60 ms) at 5,429/s. Since 4.16.2 such a task starts 1 worker.
+
+**Capacity and the knee.** A proxy limited to a fraction of a CPU by a quota keeps
+its latency until its average CPU reaches the quota, then each 100 ms period runs
+out of CPU before it ends and statements wait for the next one: the p99 goes from
+about 1 ms to tens of ms within a few percent of load. Size from CPU per
+statement, not from a saturation test with many concurrent connections (that one
+batches work and overstates what an evenly spread load can sustain by up to 25%).
+Measured on Graviton3 with TLS on both hops, the proxy needs about 85 µs of CPU per
+statement for PostgreSQL pgbench select-only (extended protocol) and about 1.5 ms
+per sysbench `oltp_read_only` transaction on MySQL (14 statements). Workload
+statements that are larger or match more rules cost more; measure yours with the
+task's CPU metric against its statement rate.
+
+- **Scale out on CPU at 50–60% of the task's reservation** (ECS
+  `CPUUtilization`, a target-tracking policy). Bursts above the average reach the
+  quota first; a quota is a hard limit, not a soft one.
+- **Inside a Fargate container the throttling is invisible**: `cpu.stat` of the
+  container shows no throttled periods because the quota is on the task's cgroup.
+  A task at 100% of its reservation in `CPUUtilization` is being throttled.
+- **0.5 vCPU tasks** are fine for steady loads well below their capacity. For a
+  bursty load, or a tail-latency budget of a few ms at high utilization, use
+  **1 vCPU tasks** (twice the headroom per task) or more tasks. Two 0.5 vCPU tasks
+  carry about 1.9 times the load of one.
+- The CFS period (100 ms) cannot be changed on Fargate; on your own hosts a shorter
+  period (`--cpu-period`) shortens each stall but does not raise the capacity.
+- Set `VERICTO_WORKER_THREADS` only to override the detection, e.g. on a platform
+  that neither exposes the quota nor ECS task metadata.
 
 ---
 

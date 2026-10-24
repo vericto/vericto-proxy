@@ -584,8 +584,10 @@ impl Backoff {
     }
 }
 
-/// The request body, serialized (and compressed) on the blocking pool so a
-/// 500-event batch never occupies a runtime thread the query path also uses.
+/// The request body. The JSON is written on the calling worker (about 0.15 ms
+/// for 500 events, measured 2026-10-23; moving the batch to the blocking pool
+/// would mean copying it, which costs about as much); the gzip compression runs
+/// on the blocking pool.
 async fn encode_body(events: &[TelemetryEvent], gzip: bool) -> Result<Vec<u8>, DeliveryError> {
     // `{"events": [...]}`, serialized straight from the events: building a
     // `serde_json::Value` first copied every field of every event (one per

@@ -23,6 +23,7 @@
 #![forbid(unsafe_code)]
 
 mod config;
+mod runtime_sizing;
 mod tcp;
 mod telemetry;
 
@@ -38,10 +39,10 @@ use crate::tcp::rules_sync::{
 
 // vericto-engine re-exports through the tcp evaluator module's imports
 
-#[tokio::main]
-async fn main() {
+fn main() {
     // `vericto-proxy healthcheck` (4.15.2): the container health check, since the
-    // runtime image has no shell. Any other argument is ignored, as before.
+    // runtime image has no shell. Any other argument is ignored, as before. It
+    // needs no runtime (4.16.2: none is started for it).
     if std::env::args().nth(1).as_deref() == Some("healthcheck") {
         std::process::exit(crate::tcp::healthz::healthcheck_command(&|key| {
             std::env::var(key).ok()
@@ -50,6 +51,36 @@ async fn main() {
 
     init_tracing();
 
+    // 4.16.2: as many async workers as the CPU time the proxy may use, not one per
+    // CPU it may run on (runtime_sizing). A 0.5 vCPU Fargate task saw 2 CPUs and
+    // started 2 workers for half a CPU.
+    let sizing = match runtime_sizing::from_environment() {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!("{e}");
+            std::process::exit(1);
+        }
+    };
+    let mut builder = tokio::runtime::Builder::new_multi_thread();
+    builder.enable_all().worker_threads(sizing.worker_threads);
+    let runtime = match builder.build() {
+        Ok(rt) => rt,
+        Err(e) => {
+            tracing::error!(error = %e, "Could not start the async runtime");
+            std::process::exit(1);
+        }
+    };
+    tracing::info!(
+        worker_threads = sizing.worker_threads,
+        source = sizing.source.as_str(),
+        cpu_limit = sizing.cpu_limit,
+        available_cpus = sizing.available_cpus,
+        "Runtime sizing"
+    );
+    runtime.block_on(run());
+}
+
+async fn run() {
     // Install the process-default rustls crypto provider (ring) before any TLS
     // is used (upstream TLS client + telemetry/rule-sync HTTPS). Idempotent.
     let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
