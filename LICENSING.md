@@ -66,6 +66,21 @@ For example, selling a SQL firewall or SQL-guardrail product or service, hosted
 or self-managed, that is built on vericto-proxy is a Competing Use. Running
 vericto-proxy to protect your own databases is not.
 
+How Vericto reads these terms, for example:
+
+- Selling others a hosted or managed service that checks, blocks or rewrites
+  their SQL with vericto-proxy is a Competing Use, including when it runs
+  inside each customer's own account. Operating vericto-proxy for one customer
+  as part of consulting or integration work, where that customer holds the
+  license and the work is not sold as a product, is a permitted professional
+  service.
+- A product that costs nothing but is offered as part of a commercial business
+  (to win customers for a paid product, bundled with one, or as the free tier
+  of one) is still a commercial product.
+- Building vericto-proxy into a larger product that blocks, flags or rewrites
+  SQL for others offers substantially similar functionality, even when
+  guardrails are not that product's main purpose.
+
 Not sure whether your case is a Competing Use? Write to
 [legal@vericto.com](mailto:legal@vericto.com) before you rely on it.
 
@@ -88,10 +103,47 @@ the FSL, were released under the Elastic License 2.0 and stay under it. Nothing
 you received under it is taken away. The FSL applies only to 4.14.0 and later.
 If you move to a newer version, the FSL applies to that version.
 
+Those versions are no longer maintained and receive no security fixes (see
+[SECURITY.md](SECURITY.md)). The Elastic License 2.0 does not allow providing
+them to others as a hosted or managed service, or removing their license
+notices, and it grants no right to the Vericto marks: a modified build must not
+carry a Vericto name (see [TRADEMARKS.md](TRADEMARKS.md)).
+
 ### Can I get a commercial license?
 
-Yes. For a Competing Use, or for terms other than the FSL, write to
-[enterprise@vericto.com](mailto:enterprise@vericto.com).
+Yes. You probably don't need one: the FSL already lets you run vericto-proxy to
+protect your own databases, and build it into a product that is not a Competing
+Use. Integrating with Vericto through its API or MCP server needs no commercial
+license either; that use is governed by the [Terms of
+Service](https://vericto.com/terms).
+
+A commercial license is for cases the FSL does not cover:
+
+- **OEM / embedding.** You want SQL guardrails inside your own product or
+  hosted service (for example a database gateway, a connection pooler or a
+  managed database platform) in a way that would be a Competing Use. An OEM
+  license lets you embed and distribute vericto-proxy, modified or not, in the
+  product named in the agreement. OEM agreements normally include attribution,
+  such as "powered by Vericto"; the agreement grants the trademark permission
+  that [TRADEMARKS.md](TRADEMARKS.md) otherwise requires in writing, and sets
+  how modified builds may be described.
+- **Other terms.** Your organization cannot accept the FSL and needs
+  vericto-proxy under different terms.
+
+Scope, price, support and update commitments are agreed in each contract. OEM
+and Enterprise agreements can include a continuity clause: if Vericto stops
+offering and maintaining the licensed component and no successor takes it over,
+the licensee receives the version covered by its agreement under the Apache
+License 2.0. Vericto reviews every request and may decline it. Until an
+agreement is signed, the FSL applies. A commercial license does not change the
+FSL for anyone else, and every FSL version still becomes Apache-2.0 on its
+second anniversary.
+
+To ask, write to [enterprise@vericto.com](mailto:enterprise@vericto.com) with
+your company, the product vericto-proxy would go into, how it is distributed
+(hosted, self-managed or both), the SQL dialects you need and the expected
+scale. Not sure whether you need a license? Write to
+[legal@vericto.com](mailto:legal@vericto.com) first.
 
 ### How are contributions licensed?
 

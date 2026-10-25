@@ -342,6 +342,10 @@ mod fake_pg_tests;
 #[cfg(test)]
 mod mysql_auth_tests;
 #[cfg(test)]
+mod pg_coalesce_tests;
+#[cfg(test)]
+mod pg_relay_tests;
+#[cfg(test)]
 mod policy_rules_tests;
 #[cfg(test)]
 mod rewrite_limit_tests;

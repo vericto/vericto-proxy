@@ -34,7 +34,7 @@ impl WireProtocol for MysqlProtocol {
 
     async fn read_client_message(
         &self,
-        client_read: &mut crate::tcp::client_tls::ClientRead,
+        client_read: &mut crate::tcp::client_tls::ClientReader<'_>,
     ) -> std::io::Result<Option<RawClientMessage>> {
         Ok(read_packet(client_read).await?.map(RawClientMessage::Mysql))
     }

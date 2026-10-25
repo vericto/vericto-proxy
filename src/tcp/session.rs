@@ -87,24 +87,34 @@ impl SessionAccess {
     fn policy(&mut self, config: &PgProxyConfig) -> Arc<EnforcementPolicy> {
         let base = config.policy.load_full();
         let map = config.agent_access.load_full();
-        if let Some((b, m, effective)) = &self.cached
-            && Arc::ptr_eq(b, &base)
-            && Arc::ptr_eq(m, &map)
-        {
-            return Arc::clone(effective);
-        }
-        let effective = match select_policy(&map, self.user.as_deref()) {
-            None => Arc::clone(&base),
-            Some(mut access) => Arc::new(EnforcementPolicy {
-                access_policy: Some({
-                    self.database.apply(&mut access);
-                    access
+        Arc::clone(self.policy_from(&base, &map))
+    }
+
+    /// [`Self::policy`] from snapshots the caller already holds (the
+    /// prepared-statement check reads them from per-session caches).
+    fn policy_from(
+        &mut self,
+        base: &Arc<EnforcementPolicy>,
+        map: &Arc<AccessPolicyMap>,
+    ) -> &Arc<EnforcementPolicy> {
+        let hit = self
+            .cached
+            .as_ref()
+            .is_some_and(|(b, m, _)| Arc::ptr_eq(b, base) && Arc::ptr_eq(m, map));
+        if !hit {
+            let effective = match select_policy(map, self.user.as_deref()) {
+                None => Arc::clone(base),
+                Some(mut access) => Arc::new(EnforcementPolicy {
+                    access_policy: Some({
+                        self.database.apply(&mut access);
+                        access
+                    }),
+                    ..(**base).clone()
                 }),
-                ..(*base).clone()
-            }),
-        };
-        self.cached = Some((base, map, Arc::clone(&effective)));
-        effective
+            };
+            self.cached = Some((Arc::clone(base), Arc::clone(map), effective));
+        }
+        &self.cached.as_ref().expect("set above").2
     }
 
     /// The session user's policy in `map`, as [`select_policy`] picks it.
@@ -135,6 +145,17 @@ impl SessionAccess {
             policy: self.policy_telemetry.clone(),
         }
     }
+}
+
+/// Per-session caches of the synced snapshots ([`arc_swap::Cache`]): reading
+/// one costs a pointer compare until a sync swaps it.
+struct SnapshotInputs<'a> {
+    rules: arc_swap::Cache<
+        &'a arc_swap::ArcSwap<Vec<vericto_engine::Rule>>,
+        Arc<Vec<vericto_engine::Rule>>,
+    >,
+    policy: arc_swap::Cache<&'a arc_swap::ArcSwap<EnforcementPolicy>, Arc<EnforcementPolicy>>,
+    access: arc_swap::Cache<&'a arc_swap::ArcSwap<AccessPolicyMap>, Arc<AccessPolicyMap>>,
 }
 
 /// What the session's entrypoint learnt at the handshake, before the
@@ -319,11 +340,49 @@ pub async fn intercept_client_to_server(
     // first message (auth happens before this loop).
     let mut in_command_phase = proto.intercepts_from_start();
 
+    // The sync snapshots a Bind/Execute compares a prepared statement against.
+    let mut snapshot_inputs = SnapshotInputs {
+        rules: arc_swap::Cache::new(&*config.ruleset),
+        policy: arc_swap::Cache::new(&*config.policy),
+        access: arc_swap::Cache::new(&*config.agent_access),
+    };
+
+    // PostgreSQL with ordered responses (4.17.3): the client is read through a
+    // buffer, and the frontend messages framed from it go upstream together
+    // (see [`UpstreamSender`]). Their plans are registered in order as each
+    // one is handled, before its bytes leave, as before.
+    let coalesce = pg_responses.is_some() && proto.client_read_buffer() > 0;
+    // Capacity 1 buffers nothing: `BufReader` passes every read of at least
+    // its capacity straight to the socket (0 is not a valid capacity).
+    let mut client_read = tokio::io::BufReader::with_capacity(
+        if coalesce {
+            proto.client_read_buffer()
+        } else {
+            1
+        },
+        client_read,
+    );
+    let mut upstream = UpstreamSender::new(server_write, coalesce);
+    // Every frontend message is read into this one (PostgreSQL reuses its
+    // buffer from message to message).
+    let mut msg = RawClientMessage::Postgres(PgMessage {
+        tag: 0,
+        body: Vec::new(),
+    });
+
     loop {
-        let msg = match proto.read_client_message(client_read).await? {
-            Some(m) => m,
-            None => break, // client closed
-        };
+        // Nothing is held upstream while the loop waits for the client: what
+        // is pending goes out as soon as the client's buffered bytes hold no
+        // further whole message.
+        if !proto.has_buffered_message(client_read.buffer()) {
+            upstream.flush().await?;
+        }
+        if !proto
+            .read_client_message_into(&mut client_read, &mut msg)
+            .await?
+        {
+            break; // client closed
+        }
 
         // Pass auth/negotiation packets through untouched until the command
         // phase starts, so they are never misclassified as SQL.
@@ -332,7 +391,7 @@ pub async fn intercept_client_to_server(
                 in_command_phase = true;
                 // fall through: this first command-phase message IS classified.
             } else {
-                forward_client_message(server_write, &msg, pg_responses.as_ref(), None).await?;
+                forward_client_message(&mut upstream, &msg, pg_responses.as_ref(), None).await?;
                 continue;
             }
         }
@@ -372,21 +431,54 @@ pub async fn intercept_client_to_server(
         if let (Some(pg), RawClientMessage::Postgres(message)) = (pg_responses.as_ref(), &msg)
             && matches!(message.tag, b'B' | b'E')
         {
-            let rules = config.ruleset.load_full();
-            let policy = access.policy(config);
-            let identity = access.identity(&policy);
-            let current = crate::tcp::pg_response::EvalSnapshot {
-                rules: policy_ctx
-                    .as_ref()
-                    .and_then(|(bundle, _)| bundle.rules.clone())
-                    .unwrap_or(rules),
-                policy,
-                bundle: policy_ctx.as_ref().map(|(bundle, _)| Arc::clone(bundle)),
-                context: policy_ctx.as_ref().map(|(_, ctx)| Arc::clone(ctx)),
+            // Read through per-session caches: between syncs this is a pointer
+            // compare per snapshot, not an `ArcSwap` load.
+            let stale = {
+                let rules = snapshot_inputs.rules.load();
+                let policy = access
+                    .policy_from(snapshot_inputs.policy.load(), snapshot_inputs.access.load());
+                let current = crate::tcp::pg_response::SnapshotRef {
+                    rules: policy_ctx
+                        .as_ref()
+                        .and_then(|(bundle, _)| bundle.rules.as_ref())
+                        .unwrap_or(rules),
+                    policy,
+                    bundle: policy_ctx.as_ref().map(|(bundle, _)| bundle),
+                    context: policy_ctx.as_ref().map(|(_, ctx)| ctx),
+                };
+                // An Execute is evaluated again when a business policy in force
+                // may read the time of execution (4.17.3: only then; see
+                // `PolicyRules::reads_time`). Otherwise the verdict reached under
+                // the same snapshots stands: a changed snapshot (rules, effective
+                // access policy, bundle, session context) is what re-evaluates.
+                let time_dependent_execution =
+                    message.tag == b'E' && current.bundle.is_some_and(|bundle| bundle.reads_time);
+                // The usual case: every statement and portal held was evaluated
+                // under the current snapshot, known without a lookup.
+                let fresh = !time_dependent_execution
+                    && pg
+                        .prepared()
+                        .lock()
+                        .map_err(|_| std::io::Error::other("prepared state lock poisoned"))?
+                        .all_evaluated_under(current);
+                (!fresh).then(|| current.to_owned())
             };
-            if let Some(decision) =
-                refresh_prepared(pg, message, current, policy_mode, config, identity).await?
-            {
+            let refused = match stale {
+                None => None,
+                Some(current) => {
+                    // A request the server can already answer is not held back
+                    // while this one is evaluated.
+                    upstream.flush_answerable().await?;
+                    let policy = Arc::clone(&current.policy);
+                    // The telemetry identity (a copy of the user name) only when
+                    // a statement is evaluated again.
+                    refresh_prepared(pg, message, current, policy_mode, config, || {
+                        access.identity(&policy)
+                    })
+                    .await?
+                }
+            };
+            if let Some(decision) = refused {
                 let TcpDecision::Block {
                     rule_code,
                     ast_node_path,
@@ -413,7 +505,7 @@ pub async fn intercept_client_to_server(
                 local_block(
                     proto,
                     &msg,
-                    server_write,
+                    &mut upstream,
                     client_write,
                     pg_responses.as_ref(),
                     block,
@@ -425,7 +517,7 @@ pub async fn intercept_client_to_server(
 
         match proto.classify(&msg) {
             Classified::Terminate => {
-                forward_client_message(server_write, &msg, pg_responses.as_ref(), None).await?;
+                forward_client_message(&mut upstream, &msg, pg_responses.as_ref(), None).await?;
                 break;
             }
             Classified::PassThrough => {
@@ -527,7 +619,7 @@ pub async fn intercept_client_to_server(
                         if local_block(
                             proto,
                             &msg,
-                            server_write,
+                            &mut upstream,
                             client_write,
                             pg_responses.as_ref(),
                             block,
@@ -539,7 +631,7 @@ pub async fn intercept_client_to_server(
                         continue; // NOT forwarded upstream
                     }
                 }
-                forward_client_message(server_write, &msg, pg_responses.as_ref(), None).await?;
+                forward_client_message(&mut upstream, &msg, pg_responses.as_ref(), None).await?;
             }
             Classified::Query { sql, kind } => {
                 // `SET vericto.ticket` / `vericto.tenant`: consumed by the proxy,
@@ -567,7 +659,7 @@ pub async fn intercept_client_to_server(
                         ) {
                             if local_failed_transaction(
                                 &msg,
-                                server_write,
+                                &mut upstream,
                                 client_write,
                                 pg_responses.as_ref(),
                                 reply,
@@ -592,7 +684,7 @@ pub async fn intercept_client_to_server(
                             if local_set_ok(
                                 proto,
                                 &msg,
-                                server_write,
+                                &mut upstream,
                                 client_write,
                                 pg_responses.as_ref(),
                                 tx,
@@ -640,7 +732,7 @@ pub async fn intercept_client_to_server(
                             if local_block(
                                 proto,
                                 &msg,
-                                server_write,
+                                &mut upstream,
                                 client_write,
                                 pg_responses.as_ref(),
                                 block,
@@ -662,18 +754,20 @@ pub async fn intercept_client_to_server(
                 let rules = config.ruleset.load_full();
                 let policy = access.policy(config);
                 let identity = access.identity(&policy);
-                let snapshot =
-                    pg_responses
-                        .as_ref()
-                        .map(|_| crate::tcp::pg_response::EvalSnapshot {
-                            rules: policy_ctx
-                                .as_ref()
-                                .and_then(|(bundle, _)| bundle.rules.clone())
-                                .unwrap_or_else(|| Arc::clone(&rules)),
-                            policy: Arc::clone(&policy),
-                            bundle: policy_ctx.as_ref().map(|(bundle, _)| Arc::clone(bundle)),
-                            context: policy_ctx.as_ref().map(|(_, ctx)| Arc::clone(ctx)),
-                        });
+                // The snapshots a Parse is tracked under, for its Bind and
+                // Execute (built for a Parse only).
+                let snapshot = pg_responses
+                    .as_ref()
+                    .filter(|_| kind == QueryKind::Prepared)
+                    .map(|_| crate::tcp::pg_response::EvalSnapshot {
+                        rules: policy_ctx
+                            .as_ref()
+                            .and_then(|(bundle, _)| bundle.rules.clone())
+                            .unwrap_or_else(|| Arc::clone(&rules)),
+                        policy: Arc::clone(&policy),
+                        bundle: policy_ctx.as_ref().map(|(bundle, _)| Arc::clone(bundle)),
+                        context: policy_ctx.as_ref().map(|(_, ctx)| Arc::clone(ctx)),
+                    });
 
                 // Admission guard, before any parse. Evaluation cost is linear in
                 // input size, so an oversized statement is refused rather than
@@ -716,7 +810,7 @@ pub async fn intercept_client_to_server(
                         if local_block(
                             proto,
                             &msg,
-                            server_write,
+                            &mut upstream,
                             client_write,
                             pg_responses.as_ref(),
                             block,
@@ -744,7 +838,7 @@ pub async fn intercept_client_to_server(
                         &sql,
                         snapshot.clone(),
                     )?;
-                    forward_client_message(server_write, &msg, pg_responses.as_ref(), action)
+                    forward_client_message(&mut upstream, &msg, pg_responses.as_ref(), action)
                         .await?;
                     continue;
                 }
@@ -755,6 +849,7 @@ pub async fn intercept_client_to_server(
                 // other connection scheduled on it — a per-connection cost turning
                 // into a multi-tenant one. Measured hop cost is ~7 µs, negligible
                 // next to a database round trip.
+                upstream.flush_answerable().await?;
                 let eval_start = Instant::now();
                 let (decision, eval_us) = {
                     let sql = sql.clone();
@@ -819,7 +914,7 @@ pub async fn intercept_client_to_server(
                     if local_block(
                         proto,
                         &msg,
-                        server_write,
+                        &mut upstream,
                         client_write,
                         pg_responses.as_ref(),
                         block,
@@ -876,7 +971,7 @@ pub async fn intercept_client_to_server(
                             snapshot.clone(),
                         )?;
                         forward_client_message(
-                            server_write,
+                            &mut upstream,
                             &rewritten_msg,
                             pg_responses.as_ref(),
                             action,
@@ -922,7 +1017,7 @@ pub async fn intercept_client_to_server(
                     if local_block(
                         proto,
                         &msg,
-                        server_write,
+                        &mut upstream,
                         client_write,
                         pg_responses.as_ref(),
                         block,
@@ -936,11 +1031,12 @@ pub async fn intercept_client_to_server(
 
                 // Allowed / flagged / monitored → forward unchanged.
                 let action = stage_parse_action(pg_responses.as_ref(), &msg, &sql, &sql, snapshot)?;
-                forward_client_message(server_write, &msg, pg_responses.as_ref(), action).await?;
+                forward_client_message(&mut upstream, &msg, pg_responses.as_ref(), action).await?;
             }
         }
     }
-    Ok(())
+    // A Terminate (or what preceded the client's close) is not held back.
+    upstream.flush().await
 }
 
 /// Handles one MySQL client connection end to end.
@@ -1328,7 +1424,7 @@ fn is_postgres_sync(msg: &RawClientMessage) -> bool {
 async fn local_block(
     _proto: &dyn WireProtocol,
     original: &RawClientMessage,
-    server_write: &mut crate::tcp::upstream::UpstreamWrite,
+    upstream: &mut UpstreamSender<'_>,
     client_write: &Arc<Mutex<ClientWrite>>,
     pg: Option<&crate::tcp::pg_response::PgResponseCoordinator>,
     block: crate::tcp::protocol::BlockResponse,
@@ -1346,24 +1442,25 @@ async fn local_block(
             postgres_before_ready(block.bytes)?
         };
         if block.skip_until_sync {
-            pg.register(
+            let full = pg.register_now(
                 crate::tcp::pg_response::PlanKind::Parse,
                 Some(replacement),
                 false,
                 None,
-            )
-            .await?;
-            let invalid = RawClientMessage::Postgres(crate::tcp::pg_response::invalid_parse());
-            forward(server_write, &invalid.encode()).await?;
+            )?;
+            queue_plan(upstream, pg, full).await?;
+            upstream
+                .send_pg(&crate::tcp::pg_response::invalid_parse())
+                .await?;
         } else {
-            pg.register(
+            let full = pg.register_now(
                 crate::tcp::pg_response::PlanKind::Simple,
                 Some(replacement),
                 false,
                 Some(crate::tcp::pg_response::PreparedAction::SimpleQuery),
-            )
-            .await?;
-            forward(server_write, &postgres_marker_query().encode()).await?;
+            )?;
+            queue_plan(upstream, pg, full).await?;
+            upstream.send_pg(&postgres_marker_query()).await?;
         }
         return Ok(false);
     }
@@ -1379,21 +1476,22 @@ async fn local_block(
 async fn local_set_ok(
     proto: &dyn WireProtocol,
     msg: &RawClientMessage,
-    server_write: &mut crate::tcp::upstream::UpstreamWrite,
+    upstream: &mut UpstreamSender<'_>,
     client_write: &Arc<Mutex<ClientWrite>>,
     pg: Option<&crate::tcp::pg_response::PgResponseCoordinator>,
     tx: &crate::tcp::tx_state::ServerTxState,
 ) -> std::io::Result<bool> {
     let bytes = proto.build_set_ok(message_seq(msg), tx);
     if let Some(pg) = pg {
-        let completion = pg
-            .register_simple_with_completion(
-                postgres_before_ready(bytes)?,
-                true,
-                Some(crate::tcp::pg_response::PreparedAction::SimpleQuery),
-            )
-            .await?;
-        forward(server_write, &postgres_marker_query().encode()).await?;
+        let (full, completion) = pg.register_simple_with_completion_now(
+            postgres_before_ready(bytes)?,
+            true,
+            Some(crate::tcp::pg_response::PreparedAction::SimpleQuery),
+        )?;
+        queue_plan(upstream, pg, full).await?;
+        upstream.send_pg(&postgres_marker_query()).await?;
+        // The marker's response is awaited: it must reach the server first.
+        upstream.flush().await?;
         completion.await.map_err(|_| {
             std::io::Error::new(
                 std::io::ErrorKind::BrokenPipe,
@@ -1408,7 +1506,7 @@ async fn local_set_ok(
 
 async fn local_failed_transaction(
     msg: &RawClientMessage,
-    server_write: &mut crate::tcp::upstream::UpstreamWrite,
+    upstream: &mut UpstreamSender<'_>,
     client_write: &Arc<Mutex<ClientWrite>>,
     pg: Option<&crate::tcp::pg_response::PgResponseCoordinator>,
     reply: crate::tcp::protocol::BlockResponse,
@@ -1417,22 +1515,21 @@ async fn local_failed_transaction(
         if reply.skip_until_sync {
             // PostgreSQL itself supplies 25P02 and enters native extended
             // skip-until-Sync state; no local replacement is needed.
-            pg.register(crate::tcp::pg_response::PlanKind::Parse, None, false, None)
+            let full =
+                pg.register_now(crate::tcp::pg_response::PlanKind::Parse, None, false, None)?;
+            queue_plan(upstream, pg, full).await?;
+            upstream
+                .send_pg(&crate::tcp::pg_response::invalid_parse())
                 .await?;
-            forward(
-                server_write,
-                &crate::tcp::pg_response::invalid_parse().encode(),
-            )
-            .await?;
         } else {
-            pg.register(
+            let full = pg.register_now(
                 crate::tcp::pg_response::PlanKind::Simple,
                 Some(Vec::new()),
                 true,
                 Some(crate::tcp::pg_response::PreparedAction::SimpleQuery),
-            )
-            .await?;
-            forward(server_write, &postgres_marker_query().encode()).await?;
+            )?;
+            queue_plan(upstream, pg, full).await?;
+            upstream.send_pg(&postgres_marker_query()).await?;
         }
         Ok(false)
     } else {
@@ -1440,6 +1537,21 @@ async fn local_failed_transaction(
         let _ = msg;
         Ok(reply.skip_until_sync)
     }
+}
+
+/// Queues a plan the response queue had no room for. The frontend messages
+/// held for the database go out first: the relay frees room only as their
+/// responses arrive.
+async fn queue_plan(
+    upstream: &mut UpstreamSender<'_>,
+    pg: &crate::tcp::pg_response::PgResponseCoordinator,
+    full: Option<crate::tcp::pg_response::PendingPlan>,
+) -> std::io::Result<()> {
+    if let Some(plan) = full {
+        upstream.flush().await?;
+        pg.register_when_room(plan).await?;
+    }
+    Ok(())
 }
 
 fn postgres_marker_query() -> PgMessage {
@@ -1478,27 +1590,40 @@ async fn refresh_prepared(
     current: crate::tcp::pg_response::EvalSnapshot,
     mode: crate::tcp::policy_rules::PolicyRulesMode,
     config: &Arc<PgProxyConfig>,
-    identity: EventIdentity,
+    identity: impl FnOnce() -> EventIdentity,
 ) -> std::io::Result<Option<TcpDecision>> {
     enum Target {
         Statement(Vec<u8>, crate::tcp::pg_response::PreparedStatement),
         Portal(Vec<u8>, crate::tcp::pg_response::PreparedStatement),
     }
+    // An Execute is evaluated again when a business policy in force may read
+    // the time of execution; otherwise only a changed snapshot (rules,
+    // effective access policy, bundle, session context) is.
+    let time_dependent_execution = message.tag == b'E'
+        && current
+            .bundle
+            .as_ref()
+            .is_some_and(|bundle| bundle.reads_time);
     let target = {
         let state = pg
             .prepared()
             .lock()
             .map_err(|_| std::io::Error::other("prepared state lock poisoned"))?;
+        let stale = |prepared: &crate::tcp::pg_response::PreparedStatement| {
+            time_dependent_execution || !prepared.snapshot.same_as(&current)
+        };
         match message.tag {
             b'B' => crate::tcp::pg_response::bind_names(message).and_then(|(_, statement)| {
                 state
-                    .statement(statement)
-                    .map(|prepared| Target::Statement(statement.to_vec(), prepared))
+                    .statement_ref(statement)
+                    .filter(|prepared| stale(prepared))
+                    .map(|prepared| Target::Statement(statement.to_vec(), prepared.clone()))
             }),
             b'E' => crate::tcp::pg_response::execute_portal(message).and_then(|portal| {
                 state
-                    .statement_for_portal(portal)
-                    .map(|prepared| Target::Portal(portal.to_vec(), prepared))
+                    .statement_for_portal_ref(portal)
+                    .filter(|prepared| stale(prepared))
+                    .map(|prepared| Target::Portal(portal.to_vec(), prepared.clone()))
             }),
             _ => None,
         }
@@ -1509,14 +1634,7 @@ async fn refresh_prepared(
     let prepared = match &target {
         Target::Statement(_, prepared) | Target::Portal(_, prepared) => prepared.clone(),
     };
-    let time_dependent_execution = message.tag == b'E'
-        && current
-            .bundle
-            .as_ref()
-            .is_some_and(|bundle| !bundle.policies.is_empty());
-    if prepared.snapshot.same_as(&current) && !time_dependent_execution {
-        return Ok(None);
-    }
+    let identity = identity();
 
     let original = prepared.original_sql.clone();
     let evaluated_sql = original.clone();
@@ -1620,25 +1738,43 @@ fn stage_parse_action(
             "malformed PostgreSQL Parse message",
         )
     })?;
-    let id = pg
+    let mut state = pg
         .prepared()
         .lock()
-        .map_err(|_| std::io::Error::other("prepared state lock poisoned"))?
-        .stage_parse(
-            name,
-            crate::tcp::pg_response::PreparedStatement {
-                original_sql: Arc::from(original_sql),
-                upstream_sql: Arc::from(upstream_sql),
-                snapshot,
-            },
-        )?;
+        .map_err(|_| std::io::Error::other("prepared state lock poisoned"))?;
+    // The SQL is shared with the statement it replaces when it is the same
+    // text (a driver preparing the unnamed statement again for every
+    // execution), and between the original and the upstream text when it
+    // goes upstream as written: no copy then, and the retained-SQL bound
+    // counts it once.
+    let previous = state.statement_ref(name);
+    let original_sql: Arc<str> = match previous {
+        Some(previous) if *previous.original_sql == *original_sql => {
+            Arc::clone(&previous.original_sql)
+        }
+        _ => Arc::from(original_sql),
+    };
+    let upstream_sql = if upstream_sql == &*original_sql {
+        Arc::clone(&original_sql)
+    } else {
+        match previous {
+            Some(previous) if *previous.upstream_sql == *upstream_sql => {
+                Arc::clone(&previous.upstream_sql)
+            }
+            _ => Arc::from(upstream_sql),
+        }
+    };
+    let id = state.stage_parse(
+        name,
+        crate::tcp::pg_response::PreparedStatement::new(original_sql, upstream_sql, snapshot),
+    )?;
     Ok(Some(crate::tcp::pg_response::PreparedAction::CommitParse(
         id,
     )))
 }
 
 async fn forward_client_message(
-    server_write: &mut crate::tcp::upstream::UpstreamWrite,
+    upstream: &mut UpstreamSender<'_>,
     msg: &RawClientMessage,
     pg: Option<&crate::tcp::pg_response::PgResponseCoordinator>,
     action: Option<crate::tcp::pg_response::PreparedAction>,
@@ -1668,15 +1804,112 @@ async fn forward_client_message(
                 _ => None,
             }
         };
-        pg.register_message(message, action).await?;
+        let full = pg.register_message(message, action)?;
+        queue_plan(upstream, pg, full).await?;
     }
-    forward(server_write, &msg.encode()).await
+    upstream.send(msg).await
 }
 
-async fn forward(
-    server_write: &mut crate::tcp::upstream::UpstreamWrite,
-    bytes: &[u8],
-) -> std::io::Result<()> {
-    server_write.write_all(bytes).await?;
-    server_write.flush().await
+/// Bytes the frontend holds for the database before it writes them (4.17.3):
+/// past this, what is pending goes out, and a message this large goes out on
+/// its own.
+const COALESCE_LIMIT: usize = 16 * 1024;
+
+/// The frontend's writes to the database.
+///
+/// On PostgreSQL (4.17.3) the frontend messages framed from one client read
+/// are coalesced: each is appended to `pending`, in order, once its response
+/// plan is registered, and `pending` is written with one write and one flush
+/// when the loop is about to wait: for the client (its buffered bytes hold no
+/// further whole message), for room in the response queue, for a response it
+/// awaits, or for an evaluation while it holds a message the server answers on
+/// its own; and when it reaches [`COALESCE_LIMIT`]. A larger message goes out
+/// on its own, after what was pending. Up to 4.17.2 every message was one
+/// write and one flush (about 5 sends per extended-protocol transaction).
+///
+/// Elsewhere (MySQL, or PostgreSQL without the ordered response coordinator)
+/// every message is written and flushed as it comes, as before.
+pub(crate) struct UpstreamSender<'a> {
+    inner: &'a mut crate::tcp::upstream::UpstreamWrite,
+    pending: Vec<u8>,
+    coalesce: bool,
+    /// `pending` holds a message the server answers without waiting for more:
+    /// Sync, Flush, a simple Query, a FunctionCall, CopyDone or CopyFail.
+    answerable: bool,
+}
+
+impl<'a> UpstreamSender<'a> {
+    pub(crate) fn new(inner: &'a mut crate::tcp::upstream::UpstreamWrite, coalesce: bool) -> Self {
+        Self {
+            inner,
+            pending: Vec::new(),
+            coalesce,
+            answerable: false,
+        }
+    }
+
+    /// Sends (or, coalescing, queues) one frontend message.
+    pub(crate) async fn send(&mut self, msg: &RawClientMessage) -> std::io::Result<()> {
+        match msg {
+            RawClientMessage::Postgres(message) if self.coalesce => self.send_pg(message).await,
+            _ => {
+                self.inner.write_all(&msg.encode()).await?;
+                self.inner.flush().await
+            }
+        }
+    }
+
+    /// [`Self::send`] for a PostgreSQL message.
+    pub(crate) async fn send_pg(&mut self, message: &PgMessage) -> std::io::Result<()> {
+        if !self.coalesce {
+            self.inner.write_all(&message.encode()).await?;
+            return self.inner.flush().await;
+        }
+        let size = message.encoded_len();
+        if self.pending.len() + size > COALESCE_LIMIT {
+            self.flush().await?;
+        }
+        if size > COALESCE_LIMIT {
+            // Large (COPY data, a big Bind): straight from its buffer.
+            let len = (message.body.len() + 4) as i32;
+            let mut header = [0u8; 5];
+            header[0] = message.tag;
+            header[1..].copy_from_slice(&len.to_be_bytes());
+            self.inner.write_all(&header).await?;
+            self.inner.write_all(&message.body).await?;
+            return self.inner.flush().await;
+        }
+        message.encode_into(&mut self.pending);
+        self.answerable |= matches!(message.tag, b'S' | b'H' | b'Q' | b'F' | b'c' | b'f');
+        Ok(())
+    }
+
+    /// Writes what is pending, with one write and one flush.
+    pub(crate) async fn flush(&mut self) -> std::io::Result<()> {
+        if self.pending.is_empty() {
+            return Ok(());
+        }
+        let written = self.inner.write_all(&self.pending).await;
+        self.pending.clear();
+        self.answerable = false;
+        if self.pending.capacity() > 2 * COALESCE_LIMIT {
+            self.pending = Vec::new();
+        }
+        written?;
+        self.inner.flush().await
+    }
+
+    /// [`Self::flush`] when what is pending could already be answered.
+    pub(crate) async fn flush_answerable(&mut self) -> std::io::Result<()> {
+        if self.answerable {
+            self.flush().await
+        } else {
+            Ok(())
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pending(&self) -> &[u8] {
+        &self.pending
+    }
 }

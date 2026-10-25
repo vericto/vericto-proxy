@@ -134,8 +134,41 @@ pub trait WireProtocol: Send + Sync {
     /// This is the only protocol-specific *read* in the interception loop.
     async fn read_client_message(
         &self,
-        client_read: &mut crate::tcp::client_tls::ClientRead,
+        client_read: &mut crate::tcp::client_tls::ClientReader<'_>,
     ) -> std::io::Result<Option<RawClientMessage>>;
+
+    /// [`Self::read_client_message`] into `slot`, which a protocol may reuse
+    /// (PostgreSQL keeps the message buffer from one message to the next).
+    /// `false` on clean EOF.
+    async fn read_client_message_into(
+        &self,
+        client_read: &mut crate::tcp::client_tls::ClientReader<'_>,
+        slot: &mut RawClientMessage,
+    ) -> std::io::Result<bool> {
+        match self.read_client_message(client_read).await? {
+            Some(message) => {
+                *slot = message;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
+    /// The bytes the interception loop reads the client through before they
+    /// are framed (4.17.3): PostgreSQL buffers, so the messages of one client
+    /// read go upstream in one write; 0 reads the socket directly (MySQL).
+    /// Only used with PostgreSQL's ordered response coordinator.
+    fn client_read_buffer(&self) -> usize {
+        0
+    }
+
+    /// Whether `buffered` (the client bytes read but not yet framed) holds a
+    /// whole message, so the next read needs no I/O. While it does, frontend
+    /// messages are coalesced upstream; when it does not, the loop sends what
+    /// it holds before it waits for the client.
+    fn has_buffered_message(&self, _buffered: &[u8]) -> bool {
+        false
+    }
 
     /// Classifies a framed message: query (with SQL), pass-through, or terminate.
     fn classify(&self, msg: &RawClientMessage) -> Classified;

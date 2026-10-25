@@ -316,12 +316,13 @@ With `observe` or `enforce`:
   report the would-be text as the finding's `suggested_safe_query`. Without a
   `rewrite_limit` policy, or with policy rules `off`, nothing is rewritten: the
   built-in VERICTO-050 (`SELECT` without `LIMIT`) only flags.
-- **PostgreSQL prepared refresh (4.17.1).** The proxy retains the original SQL,
+- **PostgreSQL prepared refresh (4.17.3).** The proxy retains the original SQL,
   the SQL actually prepared upstream, and the rules/policy/context snapshot for
   each named or unnamed statement. Bind re-evaluates after that snapshot changes;
-  Execute does the same and is always re-evaluated while business policies are
-  active, so a policy using `time.now` cannot keep a Parse-time allow
-  after its window closes. A new block is returned in order as SQLSTATE 42501. If
+  Execute does the same, and is also re-evaluated every time while a business
+  policy in force may read the time (see the next item), so a policy using
+  `time.now` cannot keep a Parse-time allow after its window closes. A new block
+  is returned in order as SQLSTATE 42501. If
   the refreshed decision adds, changes or removes a mask or `rewrite_limit`, the
   old server-side statement cannot be changed in place: the proxy blocks with
   `VERICTO-PREPARED-STALE` and asks the client to close and prepare it again.
@@ -332,10 +333,45 @@ With `observe` or `enforce`:
   statement/portal counts are bounded; queue saturation applies backpressure
   instead of evicting an association. This is a PostgreSQL fix. MySQL prepared
   statements remain evaluated at prepare time.
-- **PostgreSQL pipelining and COPY (4.17.1).** One response plan is registered
-  before each frontend message is forwarded. The backend relay frames each
-  response and is the sole in-session client writer, streaming large bodies
-  without buffering them as a whole. Local simple replies use a harmless upstream
+- **Execute re-evaluation and time (4.17.3).** When a sync delivers a bundle,
+  the proxy records whether any of its business policies may read the time of
+  the statement (`time.now`, `time.hour`, `time.minute`, `time.weekday`,
+  `time.date`, `time.tz`), from the engine's analysis of each compiled policy
+  (the fields its compiled CEL reads), not from the policy's text. It is
+  conservative: a policy counts as time-free only when it compiles and every
+  field it reads is a `stmt.*`, `principal.*`, `session.*`, `ticket.*` or
+  `db.*` field; any other field and a policy that does not compile count as
+  reading the time. While such a policy is in the bundle, every Execute is
+  evaluated again (4.17.1 and 4.17.2 did this whenever any business policy was
+  active). Otherwise an Execute keeps the verdict its statement or portal was
+  evaluated to, as long as the four snapshots it was evaluated under are still
+  the ones in force: the rules, the session's effective access policy, the
+  business-policy bundle and the session context. **Security note:** this does
+  not weaken any refusal that depends on configuration. A sync that changes the
+  rules, the bundle or the access policy (an agent-access allowlist, the
+  dashboard's kill switch, which reaches this release as a deny-all allowlist,
+  or a sensitive-column mask), and a session-context change (`SET vericto.*`, a
+  different principal), replace a snapshot, so the next Bind or Execute of every held
+  statement and portal is evaluated again under it, and a mask or
+  `rewrite_limit` that would now require different SQL still returns
+  `VERICTO-PREPARED-STALE`. Bind parameters never take part in a verdict: the
+  engine evaluates the statement's SQL text, never its parameter values (a
+  `LIMIT $1` is unknown to a policy and its `on_unknown` decides at Parse), so
+  a verdict kept across Executes with different parameters is the one each of
+  them would get. A policy that must be checked at every execution has to read
+  the time (for example a `deny_if` on `in_window(time.now, ...)`).
+- **PostgreSQL pipelining and COPY (4.17.3).** One response plan is registered
+  before each frontend message is forwarded, and the frontend messages of one
+  client read go to the database in one write and one flush, sent before the
+  proxy waits for the client, for room in the response queue or for a
+  response, and before it evaluates a later statement while it holds a request
+  the server can already answer (a larger message than 16 KiB goes out on its
+  own). The backend relay frames each
+  response by its length prefix and is the sole in-session client writer: the
+  messages one upstream read holds whole reach the client in one write and one
+  flush (one TLS record), unchanged when no local reply is planned for them,
+  and a message larger than its 64 KiB buffer is streamed through it without
+  being buffered as a whole. Local simple replies use a harmless upstream
   Query cycle and keep its real ReadyForQuery; local extended errors replace an
   intentionally invalid Parse error and let PostgreSQL perform native
   skip-until-Sync and transaction rollback. Messages pipelined after the

@@ -30,6 +30,11 @@ use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
 pub type ClientRead = Box<dyn AsyncRead + Send + Unpin>;
 /// Boxed client write half (plaintext TCP or TLS).
 pub type ClientWrite = Box<dyn AsyncWrite + Send + Unpin>;
+/// The client read half as the interception loop reads it (4.17.3): through
+/// a buffer on PostgreSQL, so the frontend messages of one client read are
+/// framed without further reads and forwarded upstream together; with no
+/// buffer (capacity 0, every read goes straight to the socket) on MySQL.
+pub type ClientReader<'a> = tokio::io::BufReader<&'a mut ClientRead>;
 
 /// TLS mode for the client → proxy hop.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
