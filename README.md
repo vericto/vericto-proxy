@@ -63,7 +63,7 @@ docker network create vericto-demo
 docker run -d --name vericto-demo-db --network vericto-demo \
   -e POSTGRES_PASSWORD=demo postgres:17
 docker run -d --name vericto-demo-proxy --network vericto-demo \
-  -e UPSTREAM_HOST=vericto-demo-db vericto/vericto-proxy:4.17.1
+  -e UPSTREAM_HOST=vericto-demo-db vericto/vericto-proxy:4.17.3
 until docker exec vericto-demo-db pg_isready -q -h localhost -U postgres; do sleep 1; done
 
 docker run --rm --network vericto-demo postgres:17 \
@@ -75,7 +75,7 @@ docker run --rm --network vericto-demo postgres:17 \
   -c "SELECT id, email FROM users"
 ```
 
-The image comes from Docker Hub; `ghcr.io/vericto/vericto-proxy:4.17.1` serves the
+The image comes from Docker Hub; `ghcr.io/vericto/vericto-proxy:4.17.3` serves the
 same digest (see [Docker](#docker)).
 
 The `DELETE` without a `WHERE` never reaches the database; the one with a `WHERE`
@@ -150,13 +150,15 @@ needs `VERICTO_POLICY_RULES=enforce`; see
 A blocked query is returned as a **native error** for the active protocol (see
 the table above), so no special handling is needed in your application.
 
-**PostgreSQL pipelines and prepared statements (4.17.1).** Local block and
+**PostgreSQL pipelines and prepared statements (4.17.3).** Local block and
 session-context replies are ordered at the exact position of their upstream
 response cycle, after every earlier pipelined result. Backend messages are framed,
 so even a large row or COPY message is never split by a synthetic reply. Named and
 unnamed prepared SQL is checked again at Bind and Execute after a rules, policy,
-principal or session-context refresh; active time-dependent business policies are checked on
-every Execute. If a mask or `rewrite_limit` would now require different SQL, the
+principal or session-context refresh; business policies that may read the time
+(`time.*`) are checked on every Execute, the others keep the verdict reached under the
+same rules, policy, bundle and session context (see
+[docs/CONFIGURATION.md](docs/CONFIGURATION.md)). If a mask or `rewrite_limit` would now require different SQL, the
 proxy returns `VERICTO-PREPARED-STALE` and the client must close and prepare the
 statement again. Portals retain the plan they bound even after their source
 statement is closed or replaced. PostgreSQL COPY BOTH/replication is rejected by
@@ -286,17 +288,17 @@ whichever your environment allows.
 ```bash
 # Postgres. On Linux, add --add-host=host.docker.internal:host-gateway
 docker run --rm -e UPSTREAM_HOST=host.docker.internal -p 5433:5433 \
-  vericto/vericto-proxy:4.17.1
+  vericto/vericto-proxy:4.17.3
 
 # MySQL
 docker run --rm \
   -e VERICTO_WIRE_PROTOCOL=mysql \
   -e UPSTREAM_HOST=host.docker.internal \
   -p 3307:3307 \
-  vericto/vericto-proxy:4.17.1
+  vericto/vericto-proxy:4.17.3
 
 # The same image from GHCR
-docker pull ghcr.io/vericto/vericto-proxy:4.17.1
+docker pull ghcr.io/vericto/vericto-proxy:4.17.3
 ```
 
 Images released from now on carry a build provenance attestation (Sigstore,
@@ -339,7 +341,7 @@ With Docker Compose:
 
 ```yaml
 proxy:
-  image: ${VERICTO_PROXY_IMAGE:-vericto/vericto-proxy:4.17.1}
+  image: ${VERICTO_PROXY_IMAGE:-vericto/vericto-proxy:4.17.3}
   ports:
     - "5433:5433"
   environment:

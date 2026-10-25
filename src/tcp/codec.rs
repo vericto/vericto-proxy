@@ -78,6 +78,19 @@ pub struct PgMessage {
 }
 
 impl PgMessage {
+    /// The size of the encoded message (tag + len + body).
+    pub fn encoded_len(&self) -> usize {
+        self.body.len() + 5
+    }
+
+    /// Appends the complete message bytes (tag + len + body) to `out`.
+    pub fn encode_into(&self, out: &mut Vec<u8>) {
+        let len = (self.body.len() + 4) as i32;
+        out.push(self.tag);
+        out.extend_from_slice(&len.to_be_bytes());
+        out.extend_from_slice(&self.body);
+    }
+
     /// Rebuilds the complete message bytes (tag + len + body) for forwarding.
     pub fn encode(&self) -> Vec<u8> {
         let len = (self.body.len() + 4) as i32;
@@ -243,6 +256,79 @@ where
     reader.read_exact(&mut body).await?;
 
     Ok(Some(PgMessage { tag: tag[0], body }))
+}
+
+/// The size (tag + length + body) of the frontend message at the start of
+/// `buffered`, once its header is there. `Err` for a length PostgreSQL never
+/// sends (as [`read_message`] refuses it).
+pub fn frontend_message_size(buffered: &[u8]) -> Option<std::io::Result<usize>> {
+    let header = buffered.get(..5)?;
+    let len = i32::from_be_bytes([header[1], header[2], header[3], header[4]]);
+    if len < 4 || (len as usize) > MAX_MESSAGE_LEN {
+        return Some(Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("invalid message length: {len}"),
+        )));
+    }
+    Some(Ok(1 + len as usize))
+}
+
+/// The capacity a reused message buffer keeps between messages: a larger one
+/// (a rare big message) is released before the next read.
+const REUSED_BODY_CAPACITY: usize = 64 * 1024;
+
+/// [`read_message`] into `msg`, reusing its body buffer (4.17.3: the
+/// interception loop reads every frontend message into the same one, so the
+/// usual message costs no allocation). A message the reader's buffer holds
+/// whole is framed from it without a read. `false` on clean EOF.
+pub async fn read_message_into<R>(
+    reader: &mut tokio::io::BufReader<R>,
+    msg: &mut PgMessage,
+) -> std::io::Result<bool>
+where
+    R: AsyncRead + Unpin,
+{
+    use tokio::io::AsyncBufReadExt;
+    if msg.body.capacity() > REUSED_BODY_CAPACITY {
+        msg.body = Vec::new();
+    }
+    // Nothing buffered: one read fills the buffer (a whole client read,
+    // usually), then the message is framed from it.
+    if reader.buffer().is_empty() && reader.fill_buf().await?.is_empty() {
+        return Ok(false); // clean EOF before a new message
+    }
+    let buffered = reader.buffer();
+    if let Some(size) = frontend_message_size(buffered) {
+        let total = size?;
+        if buffered.len() >= total {
+            msg.tag = buffered[0];
+            msg.body.clear();
+            msg.body.extend_from_slice(&buffered[5..total]);
+            reader.consume(total);
+            return Ok(true);
+        }
+    }
+
+    let mut tag = [0u8; 1];
+    match reader.read_exact(&mut tag).await {
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(false),
+        Err(e) => return Err(e),
+    }
+    let mut len_buf = [0u8; 4];
+    reader.read_exact(&mut len_buf).await?;
+    let len = i32::from_be_bytes(len_buf);
+    if len < 4 || (len as usize) > MAX_MESSAGE_LEN {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("invalid message length: {len}"),
+        ));
+    }
+    msg.tag = tag[0];
+    msg.body.clear();
+    msg.body.resize((len - 4) as usize, 0);
+    reader.read_exact(&mut msg.body).await?;
+    Ok(true)
 }
 
 /// Extracts the SQL from a Simple Query message ('Q'): payload = cstring.

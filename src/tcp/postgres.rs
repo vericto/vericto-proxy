@@ -458,7 +458,13 @@ async fn read_startup_message<R: AsyncRead + Unpin>(reader: &mut R) -> std::io::
     }
 }
 
-/// Relays bytes from the server to the client without intercepting.
+/// Bytes of upstream data the relay buffers. A backend message that fits is
+/// handled whole from this buffer; a larger one (a big DataRow or CopyData) is
+/// streamed through it in bounded chunks.
+const RELAY_BUFFER: usize = 64 * 1024;
+
+/// Relays the server's messages to the client, in order, applying the local
+/// replies the response coordinator planned at their positions.
 ///
 /// `wrote_any` is flipped to `true` the first time a byte is successfully
 /// written to the client. `run_session` reads it when the relay ends to decide
@@ -469,8 +475,18 @@ async fn read_startup_message<R: AsyncRead + Unpin>(reader: &mut R) -> std::io::
 /// `tx_state` receives the status of every ReadyForQuery. With `cancel_keys`,
 /// the session's BackendKeyData is registered there before it reaches the
 /// client, and stays registered until the relay ends (the session closes).
+///
+/// How (4.17.2): each upstream read is framed by the messages' length
+/// prefixes. The messages the buffer holds whole are passed to the coordinator
+/// in one batch (one lock), then written to the client with one write and one
+/// flush, so one database read is one TLS record and one send again, as up to
+/// 4.17.0 (4.17.1 wrote and flushed every message on its own). When no local
+/// reply is planned for them, which is the usual case, the bytes go out as
+/// read, straight from the buffer. The complete messages are always written
+/// before the relay waits for more upstream bytes, so a message the server
+/// has not finished sending never holds back the ones before it.
 pub(crate) async fn relay_server_to_client(
-    server_read: crate::tcp::upstream::UpstreamRead,
+    mut server_read: crate::tcp::upstream::UpstreamRead,
     client_write: Arc<Mutex<ClientWrite>>,
     wrote_any: Arc<std::sync::atomic::AtomicBool>,
     tx_state: Arc<crate::tcp::tx_state::ServerTxState>,
@@ -479,168 +495,293 @@ pub(crate) async fn relay_server_to_client(
 ) -> std::io::Result<()> {
     use crate::tcp::pg_response::BackendDisposition;
 
-    // Backend messages are framed here rather than relayed as read() chunks.
-    // Large DataRow/CopyData bodies are streamed, but one client-write lock is
-    // held for the complete message. Thus neither a local replacement nor any
-    // other producer can appear between its header and body fragments.
-    let mut tracker = crate::tcp::tx_state::PgTxTracker::new();
-    // Buffer the upstream reads so framing several tiny extended-protocol
-    // responses does not turn one database read into a syscall per message.
-    let mut server_read = tokio::io::BufReader::with_capacity(64 * 1024, server_read);
     let mut _registration = None;
     let mut startup = !responses.startup_complete()?;
     // This relay is the sole in-session producer of PostgreSQL client bytes.
-    // Hold the writer for the session instead of locking and flushing once per
-    // backend message; startup/connection-loss writers run only before it starts
-    // or after it returns.
+    // Hold the writer for the session; startup/connection-loss writers run
+    // only before it starts or after it returns.
     let mut client_writer = client_write.lock().await;
+    // Upstream bytes not yet relayed are `buf[start..end]`.
+    let mut buf = vec![0u8; RELAY_BUFFER];
+    let (mut start, mut end) = (0usize, 0usize);
+    // The client bytes of a batch in which a local reply replaces, precedes or
+    // suppresses a server message. Empty and unused on the usual path.
+    let mut altered: Vec<u8> = Vec::new();
     loop {
-        let mut header = [0u8; 5];
-        match server_read.read(&mut header[..1]).await {
-            Ok(0) => return Ok(()),
-            Ok(_) => {
-                server_read.read_exact(&mut header[1..]).await?;
+        // ── 1. The messages buffered whole, in one coordinator pass.
+        let mut pos = start;
+        let mut is_altered = false;
+        let mut failure = None;
+        // The header of the next message when it cannot be buffered whole.
+        let mut oversized = None;
+        // The walk stopped with whole messages still buffered (startup ended).
+        let mut more_buffered = false;
+        {
+            let mut batch = None;
+            while end - pos >= 5 {
+                let header = [
+                    buf[pos],
+                    buf[pos + 1],
+                    buf[pos + 2],
+                    buf[pos + 3],
+                    buf[pos + 4],
+                ];
+                let tag = header[0];
+                let len = match backend_length(&header, startup) {
+                    Ok(len) => len,
+                    Err(e) => {
+                        failure = Some(e);
+                        break;
+                    }
+                };
+                let total = 1 + len;
+                if total > end - pos {
+                    if total > RELAY_BUFFER {
+                        oversized = Some(header);
+                    }
+                    break;
+                }
+                let message = pos..pos + total;
+                let body = &buf[pos + 5..pos + total];
+                let ready = (tag == b'Z').then(|| body[0]);
+                // Tracking precedes exposure to the client: the client's next
+                // message sees the status, and a cancel finds its key.
+                if let Some(status) = ready {
+                    tx_state.set_pg_status(status);
+                }
+                if startup
+                    && tag == b'K'
+                    && let Some(key) = crate::tcp::cancel::BackendKey::parse(body)
+                    && let Some(registry) = cancel_keys.take()
+                {
+                    _registration = Some(registry.register(key));
+                }
+                let disposition = if startup {
+                    BackendDisposition::Forward
+                } else {
+                    let batch = match batch.as_mut() {
+                        Some(batch) => batch,
+                        None => match responses.backend_batch() {
+                            Ok(opened) => batch.insert(opened),
+                            Err(e) => {
+                                failure = Some(e);
+                                break;
+                            }
+                        },
+                    };
+                    match batch.message(tag, ready) {
+                        Ok(disposition) => disposition,
+                        Err(e) => {
+                            failure = Some(e);
+                            break;
+                        }
+                    }
+                };
+                if !matches!(disposition, BackendDisposition::Forward) && !is_altered {
+                    // From here on the batch is assembled: what was forwarded
+                    // so far, then each message's client bytes.
+                    altered.clear();
+                    altered.extend_from_slice(&buf[start..pos]);
+                    is_altered = true;
+                }
+                match disposition {
+                    BackendDisposition::Forward => {
+                        if is_altered {
+                            altered.extend_from_slice(&buf[message.clone()]);
+                        }
+                    }
+                    BackendDisposition::Suppress => {}
+                    // Replacements are emitted where the backend message was,
+                    // after it has been read whole.
+                    BackendDisposition::Replace(bytes) => altered.extend_from_slice(&bytes),
+                    // Simple cycles: the replacement, then the server's actual
+                    // ReadyForQuery, preserving I/T/E. `ready` is always set
+                    // here (only a ReadyForQuery gets this disposition); the
+                    // check keeps malformed traffic from manufacturing a frame.
+                    BackendDisposition::BeforeForward(bytes) => {
+                        if ready.is_none() {
+                            failure = Some(std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                "simple replacement did not end at ReadyForQuery",
+                            ));
+                            break;
+                        }
+                        altered.extend_from_slice(&bytes);
+                        altered.extend_from_slice(&buf[message.clone()]);
+                    }
+                }
+                pos = message.end;
+                if startup && tag == b'Z' {
+                    // The session's frontend registers plans from here on.
+                    startup = false;
+                    if let Err(e) = responses.complete_startup() {
+                        failure = Some(e);
+                    }
+                    more_buffered = true;
+                    break;
+                }
             }
-            Err(e) => return Err(e),
+            // `batch` drops here: the coordinator is unlocked before any await.
         }
-        let len = i32::from_be_bytes([header[1], header[2], header[3], header[4]]);
-        if len < 4 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("invalid PostgreSQL backend message length: {len}"),
-            ));
-        }
-        if header[0] == b'Z' && len != 5 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("invalid PostgreSQL ReadyForQuery length: {len}"),
-            ));
-        }
-        let tag = header[0];
-        let mut remaining = len as usize - 4;
-        // BackendKeyData is small and exceptional: retain it until the cancel
-        // key has been registered, then expose it. Every other large body is
-        // streamed below.
-        if startup && tag == b'K' {
-            if !(8..=4 + crate::tcp::cancel::MAX_SECRET_LEN).contains(&remaining) {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!("invalid PostgreSQL BackendKeyData length: {len}"),
-                ));
-            }
-            let mut body = vec![0; remaining];
-            server_read.read_exact(&mut body).await?;
-            tracker.feed(&header, &tx_state);
-            tracker.feed(&body, &tx_state);
-            if let Some(key) = tracker.take_backend_key()
-                && let Some(registry) = cancel_keys.take()
-            {
-                _registration = Some(registry.register(key));
-            }
-            client_writer.write_all(&header).await?;
-            client_writer.write_all(&body).await?;
+
+        // ── 2. One write and one flush for the batch.
+        let out: &[u8] = if is_altered {
+            &altered
+        } else {
+            &buf[start..pos]
+        };
+        if !out.is_empty() {
+            client_writer.write_all(out).await?;
             client_writer.flush().await?;
             wrote_any.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        if is_altered && altered.capacity() > RELAY_BUFFER {
+            // A rare, large local reply: do not keep its allocation.
+            altered = Vec::new();
+        }
+        start = pos;
+        if let Some(e) = failure {
+            return Err(e);
+        }
+
+        // ── 3. A message larger than the buffer is streamed through it.
+        if let Some(header) = oversized {
+            let wrote = relay_oversized(
+                &mut server_read,
+                &mut **client_writer,
+                &responses,
+                startup,
+                header,
+                &mut buf,
+                start,
+                end,
+            )
+            .await?;
+            if wrote {
+                wrote_any.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+            (start, end) = (0, 0);
             continue;
         }
-        let disposition = if startup {
-            BackendDisposition::Forward
-        } else {
-            responses.disposition(tag)?
-        };
-        let stream_to_client = matches!(disposition, BackendDisposition::Forward);
+        if more_buffered {
+            continue;
+        }
 
-        // Tracking precedes exposure to the client. Small messages are written
-        // in one call (header + body); the extended protocol emits several of
-        // them per statement, so separate header/body writes are measurable at
-        // high QPS. Large rows and COPY frames stay streaming and bounded.
-        tracker.feed(&header, &tx_state);
-        let mut body_prefix = [0u8; 1];
-        let mut first = true;
-        let mut buf = vec![0u8; 16 * 1024];
-        if remaining <= buf.len() {
-            server_read.read_exact(&mut buf[..remaining]).await?;
-            if remaining > 0 {
-                body_prefix[0] = buf[0];
-                first = false;
-                tracker.feed(&buf[..remaining], &tx_state);
+        // ── 4. Read more: keep the partial message at the front.
+        if start == end {
+            (start, end) = (0, 0);
+        } else if start > 0 {
+            buf.copy_within(start..end, 0);
+            end -= start;
+            start = 0;
+        }
+        let n = server_read.read(&mut buf[end..]).await?;
+        if n == 0 {
+            if start == end {
+                return Ok(());
             }
-            if stream_to_client {
-                let mut frame = Vec::with_capacity(header.len() + remaining);
-                frame.extend_from_slice(&header);
-                frame.extend_from_slice(&buf[..remaining]);
-                client_writer.write_all(&frame).await?;
-            }
-        } else {
-            if stream_to_client {
-                client_writer.write_all(&header).await?;
-            }
-            while remaining > 0 {
-                let n = remaining.min(buf.len());
-                server_read.read_exact(&mut buf[..n]).await?;
-                if first {
-                    body_prefix[0] = buf[0];
-                    first = false;
-                }
-                tracker.feed(&buf[..n], &tx_state);
-                if stream_to_client {
-                    client_writer.write_all(&buf[..n]).await?;
-                }
-                remaining -= n;
-            }
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "PostgreSQL server closed the connection inside a message",
+            ));
+        }
+        end += n;
+    }
+}
+
+/// The body length (after the 4 length bytes, plus them) of a backend message
+/// header, i.e. the bytes after its tag; validated as PostgreSQL defines it.
+fn backend_length(header: &[u8; 5], startup: bool) -> std::io::Result<usize> {
+    let len = i32::from_be_bytes([header[1], header[2], header[3], header[4]]);
+    if len < 4 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("invalid PostgreSQL backend message length: {len}"),
+        ));
+    }
+    if header[0] == b'Z' && len != 5 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("invalid PostgreSQL ReadyForQuery length: {len}"),
+        ));
+    }
+    // BackendKeyData is retained until its cancel key is registered, so its
+    // size is bounded.
+    if startup
+        && header[0] == b'K'
+        && !(8..=4 + crate::tcp::cancel::MAX_SECRET_LEN).contains(&(len as usize - 4))
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("invalid PostgreSQL BackendKeyData length: {len}"),
+        ));
+    }
+    Ok(len as usize)
+}
+
+/// Streams one backend message larger than [`RELAY_BUFFER`] (a big DataRow or
+/// CopyData): its disposition is taken from the header, then its body goes to
+/// the client chunk by chunk as it arrives (or is read and dropped when a
+/// local reply replaces it). `buf[start..end]` holds its header and the first
+/// body bytes. The client writer is held throughout, so nothing can appear
+/// between the fragments of the message. Returns whether bytes reached the
+/// client.
+#[allow(clippy::too_many_arguments)]
+async fn relay_oversized(
+    server_read: &mut crate::tcp::upstream::UpstreamRead,
+    client_writer: &mut (dyn tokio::io::AsyncWrite + Send + Unpin),
+    responses: &crate::tcp::pg_response::PgResponseCoordinator,
+    startup: bool,
+    header: [u8; 5],
+    buf: &mut [u8],
+    start: usize,
+    end: usize,
+) -> std::io::Result<bool> {
+    use crate::tcp::pg_response::BackendDisposition;
+    let tag = header[0];
+    let len = i32::from_be_bytes([header[1], header[2], header[3], header[4]]) as usize;
+    // Neither a ReadyForQuery nor a BackendKeyData can be this large (their
+    // lengths were validated), so no status or key is tracked here, and the
+    // plan of a streamed message never completes at ReadyForQuery.
+    let disposition = if startup {
+        BackendDisposition::Forward
+    } else {
+        responses.disposition(tag)?
+    };
+    let stream_to_client = matches!(disposition, BackendDisposition::Forward);
+    let buffered = &buf[start + 5..end];
+    let mut remaining = len - 4 - buffered.len();
+    if stream_to_client {
+        client_writer.write_all(&header).await?;
+        client_writer.write_all(buffered).await?;
+    }
+    while remaining > 0 {
+        let want = remaining.min(buf.len());
+        let n = server_read.read(&mut buf[..want]).await?;
+        if n == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "PostgreSQL server closed the connection inside a message",
+            ));
         }
         if stream_to_client {
-            client_writer.flush().await?;
-            wrote_any.store(true, std::sync::atomic::Ordering::Relaxed);
+            client_writer.write_all(&buf[..n]).await?;
         }
-
-        if cancel_keys.is_some()
-            && let Some(key) = tracker.take_backend_key()
-            && let Some(registry) = cancel_keys.take()
-        {
-            _registration = Some(registry.register(key));
-        }
-
-        let ready = (tag == b'Z' && !first).then_some(body_prefix[0]);
-        if startup {
-            if tag == b'Z' {
-                startup = false;
-                responses.complete_startup()?;
-            }
-            continue;
-        }
-
-        // Replacements are emitted only after the backend message has been read
-        // whole. BeforeForward is used for simple cycles: replacement bytes then
-        // the server's actual ReadyForQuery, preserving I/T/E.
-        match disposition {
-            BackendDisposition::Replace(bytes) => {
-                client_writer.write_all(&bytes).await?;
-                client_writer.flush().await?;
-                wrote_any.store(true, std::sync::atomic::Ordering::Relaxed);
-            }
-            BackendDisposition::BeforeForward(bytes) => {
-                // ReadyForQuery has one body byte. This branch is only selected
-                // for it, but retain the check so malformed server traffic closes
-                // safely instead of manufacturing a frame.
-                if ready.is_none() {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        "simple replacement did not end at ReadyForQuery",
-                    ));
-                }
-                let mut reply = Vec::with_capacity(bytes.len() + header.len() + 1);
-                reply.extend_from_slice(&bytes);
-                reply.extend_from_slice(&header);
-                reply.extend_from_slice(&body_prefix);
-                client_writer.write_all(&reply).await?;
-                client_writer.flush().await?;
-                wrote_any.store(true, std::sync::atomic::Ordering::Relaxed);
-            }
-            BackendDisposition::Forward | BackendDisposition::Suppress => {}
-        }
-        responses.finish(tag, ready)?;
+        remaining -= n;
     }
+    match disposition {
+        BackendDisposition::Forward => {}
+        BackendDisposition::Suppress => return Ok(false),
+        BackendDisposition::Replace(bytes) => client_writer.write_all(&bytes).await?,
+        BackendDisposition::BeforeForward(_) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "simple replacement did not end at ReadyForQuery",
+            ));
+        }
+    }
+    client_writer.flush().await?;
+    Ok(true)
 }
 
 /// Main loop: delegates to the protocol-agnostic interception loop with the

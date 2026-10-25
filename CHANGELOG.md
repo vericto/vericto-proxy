@@ -7,7 +7,257 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [4.17.3] - 2026-10-25
+
+**PostgreSQL: 4.17.1's ordering and prepared-statement guarantees at 4.17.0's
+cost or less, and business policies re-evaluate an Execute only when they read
+the time.** This is the first release of the work of 4.17.1 (PR #89) and
+4.17.2; neither was tagged or released. 4.17.1 (merge 77ff155) failed its EC2
+release gate on 2026-10-24: +14 to +38% CPU per transaction against 4.17.0 and
+a quota tail at the 0.5 vCPU Fargate shape, because its relay wrote and flushed
+the client stream once per backend message. 4.17.2 (patch 0066, not merged)
+removed most of that, but its gate on 2026-10-25 still measured +1.5 to +7.3%
+CPU per transaction against 4.17.0 in the PostgreSQL cells (criterion: at most
++3%), a tail on one core at 90% of S, and, with business policies on, +54%
+(extended) and about 3.5x (prepared) CPU per transaction from evaluating every
+Execute again. 4.17.3 is 4.17.2 plus the three changes below. Everything the
+4.17.1 and 4.17.2 notes describe ships first in this release.
+
+### Changed
+
+- **Frontend messages go to the database in one write per client read.** Up to
+  4.17.2 every frontend message was its own write and flush upstream (about 5
+  per extended-protocol transaction: Parse, Bind, Describe, Execute, Sync; with
+  TLS each one a record and a `sendmsg`). The client is now read through a
+  16 KiB buffer, and the messages framed from one client read are appended in
+  order to one upstream buffer, each after its response plan is registered,
+  as before. That buffer is written with one write and one flush when the
+  session is about to wait: for the client (no further whole message is
+  buffered), for room in the response queue, for the response a consumed
+  `SET vericto.*` awaits, or for an evaluation while it holds a message the
+  server answers on its own (Sync, Flush, a simple Query, a FunctionCall,
+  CopyDone, CopyFail), so the coalescing never delays an earlier response
+  behind a later statement's evaluation. It is also written at 16 KiB; a
+  larger message (COPY data, a big Bind) goes out on its own after what was
+  pending, straight from its buffer. A locally refused message keeps its exact
+  position (its marker query or invalid Parse takes its place in the same
+  buffer), a Flush is never held back waiting for more client bytes, and COPY
+  IN data is forwarded in order. MySQL, and PostgreSQL without the ordered
+  response coordinator, still write and flush every message as it comes.
+- **Business policies: an Execute is evaluated again only when a policy in
+  force may read the time.** 4.17.1 and 4.17.2 evaluated every Execute again
+  while any business policy was active. From 4.17.3 the bundle records, when it
+  is compiled, whether any of its business policies may read the time of the
+  statement (`time.now`, `time.hour`, `time.minute`, `time.weekday`,
+  `time.date`, `time.tz`). This comes from the engine's analysis of each
+  compiled policy (`vericto_engine::policy::check_policy`: the fields its
+  compiled CEL reads), not from the policy's text, and it is conservative: a
+  policy is time-free only when it compiles and every field it reads is a
+  statement, principal, session, ticket or database field; any other field,
+  including one a later engine adds, and a policy that does not compile count
+  as reading the time. With such a policy in the bundle every Execute is
+  evaluated again, as before. Otherwise an Execute keeps the verdict its
+  statement or portal was evaluated to under the same snapshots: the rules,
+  the session's effective access policy (allowlist and sensitive-column masks
+  included), the business-policy bundle and the session context, compared as
+  the same `Arc`s. Any change to one of them (a sync with a new bundle, an
+  allowlist or mask change, a `SET vericto.*`, a different principal) still
+  forces the evaluation at the next Bind or Execute, with the same
+  `VERICTO-PREPARED-STALE` handling when a mask or `rewrite_limit` would now
+  require different SQL. No verdict depends on Bind parameters: the engine
+  evaluates a statement's SQL text, never its parameter values (a `LIMIT $1`
+  is unknown to a policy, which its `on_unknown` decides at Parse), so a
+  verdict reused across Executes with different parameters is the one each of
+  them would get.
+
+### Performance
+
+- **Compact Parse/Bind bookkeeping.** A prepared statement is shared by its
+  pending Parse, the statement table and every portal bound from it (one
+  reference count; a Bind used to copy six handles). Statement and portal
+  names up to 30 bytes, which covers the names drivers generate, are kept
+  inline, so tracking one allocates nothing. The retained-SQL bound is kept as
+  entries come and go (a Parse used to sum it over every entry), and a Parse
+  of the same text as the statement it replaces (a driver preparing the
+  unnamed statement for every execution) shares that SQL instead of copying
+  it. Each frontend message is read into one reused buffer and framed from the
+  client read buffer without further reads; the snapshot a Parse is tracked
+  under is built for a Parse only.
+- **Callgrind** (user-space instructions per transaction, `pgbench -n -S -c
+  1`, `VERICTO_WORKER_THREADS=1`, TLS on both legs, PostgreSQL 17, release
+  builds in rust:1.88-slim-bookworm linux/arm64, marginal = (Ir@6000 -
+  Ir@2000)/4000, 3 runs, spread under 0.7%): extended 4.16.2 214.1k, 4.17.0
+  213.6k, 4.17.2 217.8k, 4.17.3 206.2k (-3.5% against 4.17.0); prepared 26.36k,
+  26.35k, 29.15k, 20.35k (-22.8%); simple 200.0k, 200.3k, 201.1k, 200.6k
+  (+0.1%). `strace -c` per transaction: `writev` 6 -> 2 (extended, 16
+  connections) and 5 -> 2 (prepared); simple unchanged (2).
+- **EC2 release gate** (2026-10-25: the 4.17.2 gate's suites with 4.17.2 added
+  as a target, c7g hosts, latest AL2023; 0.5 vCPU, TLS on both legs, policies
+  off, 4-5 paired repetitions per cell). CPU per transaction against 4.17.0:
+  extended -14 to -18% (every rate, one core and the 0.5 vCPU Fargate shape),
+  prepared -32 to -33%, simple +0.0 to +2.2% (intervals include 0), MySQL +0.4
+  to +2.0%. p99 below the knee: extended 0.06 to 0.20 ms lower, prepared 0.02 to
+  0.03 ms lower, simple within +0.05 ms. At the Fargate shape the added p99 over
+  a direct connection is +0.36 ms at 80% of S and +0.41 ms at 90% (4.17.0: +0.46
+  and +1.75 ms; 4.16.2: +0.45 and +0.59 ms). On one core at 90% of S the p99 is
+  1.4 ms (4.17.0 26.4 ms, 4.16.2 25.5 ms, 4.17.2 48.7 ms): the knee moved past
+  90%. Closed-loop TPS against 4.17.0: extended +5 to +23%, prepared +57 to
+  +61%, simple and MySQL within noise. MySQL at 90% of S on one core, a cell at
+  its quota knee: p99 9.2 ms against 6.1 ms for 4.17.0 (interval includes 0;
+  4.17.2: 7.8 ms), no collapse.
+- **Business policies on** (same gate, one business policy on `select` of
+  `public.pgbench_accounts`): with a time-free policy (`deny_if:
+  stmt.has_where == false`), CPU per transaction is 13% (extended) and 30 to
+  32% (prepared) below 4.17.0 with policies on, and 44% and 80% below 4.17.2
+  (closed loop at 16 connections: 6,160 and 29,487 TPS against 5,052 and
+  18,685 for 4.17.0 and 3,160 and 4,651 for 4.17.2). With the time-dependent
+  policy (`in_window(time.now, ...)`), every Execute is still evaluated again:
+  +28% (extended) and about 2.8x (prepared) against 4.17.0, 15 to 17% below
+  4.17.2.
+
+### Tests
+
+- `src/tcp/pg_coalesce_tests.rs` drives the interception loop with an upstream
+  that records every write and flush: an extended transaction is one write and
+  one flush (five on 4.17.2); three pipelined groups with a refused Parse in
+  the middle reach the database in order with the invalid Parse at its
+  position; a refused simple Query keeps its position; a Flush goes up without
+  more client bytes; a message cut by the client read does not hold back the
+  ones before it; COPY IN data is coalesced, and a 100 KB CopyData goes out on
+  its own, bytes in order; the sender's 16 KiB bound and the per-message path
+  without coalescing.
+- Through the real entrypoint against a scripted PostgreSQL: a time-free policy
+  is evaluated at Parse and not at the three Executes after it (it was at each
+  on 4.17.2); a time-dependent one is evaluated at every Execute; a bundle swap
+  makes the next Bind evaluate the statement again, once, and a new bundle
+  whose time-free policy refuses it refuses the next Bind; a `SET
+  vericto.tenant` that a time-free policy reads makes the next Bind refuse the
+  statement; a `LIMIT $1` statement executed with three different parameters
+  keeps its Parse verdict; more Syncs in one client write than the response
+  queue holds; pipelined groups with a refusal in the middle and a group ended
+  by Flush, every response in order. A unit test checks which policies count
+  as reading the time.
+- The randomized prepared-state test also checks the incremental retained-SQL
+  bound against a recount.
+
+## [4.17.2] - 2026-10-25
+
+_Not released: superseded by 4.17.3 (see above)._
+
+**PostgreSQL relay performance: 4.17.1's guarantees, most of its cost removed.** 4.17.1
+(merge 77ff155, PR #89) was never tagged or released: its EC2 release gate
+(2026-10-24, policies off, 0.5 vCPU, TLS on both legs) found that it regressed
+every PostgreSQL cell against 4.16.2 and 4.17.0: +10 to +21 µs of CPU per
+transaction (+14% simple, +20% extended, +38% prepared), p99 +0.07 to +0.23 ms
+below the knee, 12 to 32% less closed-loop throughput, and a quota tail at 80% of
+S (extended at the 0.5 vCPU Fargate shape: added p99 +16.3 ms against +0.46 ms,
+collapse at 90%). Its new backend relay wrote and flushed the client stream once
+per backend message, where 4.17.0 did it once per upstream read: with TLS on the
+client leg every message became its own TLS record, `sendmsg` and TCP segment
+(proxy-to-client bytes per transaction went from about 180 to 380-476), and the
+response coordinator added a lock round trip per message. 4.17.2 is 4.17.1 with
+that cost removed; its fixes (pipeline ordering, prepared-statement refresh at
+Bind/Execute, the COPY and FunctionCall fail-safes) are unchanged and ship first
+in 4.17.3. The 4.17.1 notes below describe them. What remained over 4.17.0
+(see Performance) was the bookkeeping those fixes need, which 4.17.3 reduces.
+
+### Fixed
+
+- **One client write per upstream read.** The relay frames each upstream read by
+  the backend messages' length prefixes. The messages the read holds whole are
+  written to the client with one write and one flush, so one database read is
+  one TLS record and one send again, as up to 4.17.0. When no local reply is
+  planned for them (the usual case) the bytes go out exactly as read, straight
+  from the relay's buffer; a batch with a local reply is assembled in order in a
+  side buffer. Complete messages are always written before the relay waits for
+  more upstream bytes, so a backend message the server has not finished sending
+  never holds back the ones before it. A message larger than the 64 KiB buffer
+  (a big DataRow or CopyData) is still streamed through it, its disposition taken
+  from the header and the client writer held until its last byte.
+- **The coordinator is consulted once per upstream read.** The messages of a
+  read are matched to their response plans under one lock (and the
+  prepared-statement state under one more, only when a completed plan changes
+  it), instead of one or two locks per message. A plan with no local reply that
+  does not end in an extended-protocol error completes on an inline path. Plans
+  are smaller (a local reply is boxed), and the frontend registers a plan without
+  an `.await` unless the bounded queue is full: the slot count is now the queue
+  length checked under the lock the push takes anyway (no semaphore permit per
+  message), with the same backpressure.
+- **Bind/Execute need no lookup while nothing is stale.** The prepared state
+  counts, against the session's current snapshot (rules, effective access policy,
+  business-policy bundle, session context), how many statements, portals and
+  candidates were evaluated under another one. While that count is 0 a Bind or
+  Execute is known fresh with a pointer compare; the snapshot is read through
+  per-session `arc_swap` caches, and the telemetry identity is built only when a
+  statement is evaluated again. While business policies are active every Execute
+  is still evaluated again, as in 4.17.1 (4.17.3 narrows this to policies that
+  may read the time).
+- **Fewer allocations per statement.** A Parse whose SQL goes upstream unchanged
+  keeps one copy of it (4.17.1 kept two); the retained-SQL bound uses an
+  allocation-free upper bound and builds the exact (shared-aware) count only near
+  the limit (4.17.1 built a hash set on every Parse). The unnamed statement and
+  portal, which most drivers use, are kept outside the hash maps, and pending
+  Parse/Bind candidates are a FIFO acknowledged from its front.
+
+### Performance
+
+- **EC2 release gate** (2026-10-25: the 4.17.1 gate's suites, c7g hosts, latest
+  AL2023; 0.5 vCPU, TLS on both legs, policies off, 4-5 paired repetitions per
+  cell). Against 4.17.0, CPU per transaction: extended +1.5 to +3.9%, simple +3.6
+  to +7.3%, prepared +5.1% (4.17.1: +14 to +38%); p99 within ±0.02 ms of 4.17.0 up
+  to 70% of S and at most +0.07 ms at 80%; closed-loop TPS -3 to -7% (4.17.1: -12
+  to -32%); proxy-to-client bytes per transaction as 4.17.0 (172-185 B; 4.17.1:
+  381-476 B). At the 0.5 vCPU Fargate shape (a 0.5 quota over two cores) the added
+  p99 over a direct connection is +0.44 ms at 80% of S and +0.56 ms at 90%
+  (4.16.2: +0.42 and +0.49 ms; 4.17.1: +16.3 ms and a collapse). On one core, at
+  90% of S the extra CPU brings the knee closer: p99 23.8 ms (4.16.2 2.4 ms,
+  4.17.0 6.0 ms). Against 4.16.2 the CPU per transaction is +2 to +8% (in the
+  extended protocol 4.17.0 itself measures +2 to +4% over 4.16.2 in the same
+  session). MySQL, whose path 4.17.2 does not change, is within noise on latency
+  and TPS.
+- **Callgrind** (user-space instructions per transaction, `pgbench -n -S -c 1`,
+  `VERICTO_WORKER_THREADS=1`, TLS on both legs, PostgreSQL 17, release builds in
+  rust:1.88-slim-bookworm linux/arm64, marginal = (Ir@6000 - Ir@2000)/4000, 3
+  runs, spread under 0.7%): extended 4.16.2 214.0k, 4.17.0 213.9k, 4.17.1
+  249.7k, 4.17.2 217.9k (+1.9% vs 4.17.0); prepared 26.35k, 26.35k, 54.4k,
+  29.15k (+10.6%: the prepared-statement bookkeeping of 4.17.1); simple 200.4k,
+  200.1k, 218.3k, 201.4k (+0.6%).
+- **Business policies on** (`VERICTO_POLICY_RULES=enforce`, one business policy
+  that reads `time.now`): as in 4.17.1, every Execute is evaluated again while
+  business policies are active, which 4.17.0 did not do. On the same hosts, CPU
+  per transaction against 4.17.0 with policies on: extended +63 µs (+54%; the
+  Parse and the Execute of each statement are both evaluated), prepared +84 µs
+  (about 3.5x; 4.17.0 evaluated a prepared statement only at Parse). Policies off,
+  no Execute is evaluated again unless a rules, policy or context swap made a
+  statement stale.
+
+### Tests
+
+- `src/tcp/pg_relay_tests.rs` drives the relay directly: one upstream read is
+  one client write and one flush; the startup and later replies reach the client
+  unchanged at every upstream chunking (1 byte to all at once), with the
+  ReadyForQuery status and BackendKeyData tracked before exposure; DataRow
+  streams with rows just under, at and over the 64 KiB buffer and several times
+  larger, fragmented around the buffer size; COPY OUT followed by a local reply;
+  three pipelined extended groups with a local refusal in the middle at every
+  chunking; complete messages not held back by a partial one; truncated and
+  malformed framing failing closed after the good messages; a message without a
+  plan; a full response queue waiting for the relay.
+- Scripted PostgreSQL sessions through the real entrypoint, plaintext and with
+  TLS on both legs (`PROXY_TLS_MODE=require`, `UPSTREAM_SSLMODE=require`): a
+  2,004-row result with rows around and over the buffer, COPY OUT, and pipelined
+  groups with a refusal in the middle, the upstream writing in pieces around the
+  buffer size. A real-PostgreSQL test (`VERICTO_TEST_PG_URL`) checks rows of 64
+  KiB and 300 KB by the simple and extended protocol and 64 prepared statements
+  pipelined by the driver.
+- A randomized test checks the incremental stale count against a recount after
+  20,000 stages, commits, aborts, closes, refreshes and transaction ends.
+- The byte-wise backend tracker (`PgTxTracker`) is gone with the relay that used
+  it; its chunking tests are replaced by the relay's.
+
 ## [4.17.1] - 2026-10-24
+
+_Not released: superseded by 4.17.2, itself superseded by 4.17.3 (see above)._
 
 **PostgreSQL pipelined replies are ordered, and prepared statements follow live
 policy refreshes.** In 4.17.0 the client-reading task wrote a local block directly

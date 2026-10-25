@@ -60,16 +60,44 @@ struct FakePg {
 /// status as the server does: `BEGIN` → `T`; `SELECT 1/0` → error, and `E`
 /// inside a block; `COMMIT` / `ROLLBACK` → `I`; anything else in `E` → 25P02.
 async fn fake_pg() -> FakePg {
+    fake_pg_with(None).await
+}
+
+/// [`fake_pg`] that answers an SSLRequest with `S` and serves the session
+/// over TLS with `tls` (what `UPSTREAM_SSLMODE=require` negotiates).
+async fn fake_pg_with(tls: Option<Arc<tokio_rustls::rustls::ServerConfig>>) -> FakePg {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let (cancel_tx, cancels) = mpsc::unbounded_channel();
     let (stmt_tx, statements) = mpsc::unbounded_channel();
     tokio::spawn(async move {
-        while let Ok((sock, _)) = listener.accept().await {
+        while let Ok((mut sock, _)) = listener.accept().await {
             let cancel_tx = cancel_tx.clone();
             let stmt_tx = stmt_tx.clone();
+            let tls = tls.clone();
             tokio::spawn(async move {
-                let _ = fake_pg_connection(sock, cancel_tx, stmt_tx).await;
+                match tls {
+                    None => {
+                        let _ = fake_pg_connection(sock, cancel_tx, stmt_tx).await;
+                    }
+                    Some(config) => {
+                        let mut request = [0u8; 8];
+                        if sock.read_exact(&mut request).await.is_err()
+                            || i32::from_be_bytes([request[4], request[5], request[6], request[7]])
+                                != SSL_REQUEST_CODE
+                        {
+                            return;
+                        }
+                        if sock.write_all(b"S").await.is_err() {
+                            return;
+                        }
+                        let Ok(tls) = tokio_rustls::TlsAcceptor::from(config).accept(sock).await
+                        else {
+                            return;
+                        };
+                        let _ = fake_pg_connection(tls, cancel_tx, stmt_tx).await;
+                    }
+                }
             });
         }
     });
@@ -80,8 +108,37 @@ async fn fake_pg() -> FakePg {
     }
 }
 
-async fn fake_pg_connection(
-    mut sock: TcpStream,
+/// The DataRows of `SELECT many_rows`: 2,000 small rows, then rows whose frame
+/// is just under, at and over the relay's 64 KiB buffer, and one of 200 KB.
+fn many_rows() -> Vec<u8> {
+    let mut rows = Vec::new();
+    for i in 0..2000usize {
+        rows.extend(msg(b'D', &vec![b'a' + (i % 26) as u8; 6 + i % 400]));
+    }
+    for (i, total) in [64 * 1024 - 1, 64 * 1024, 64 * 1024 + 1, 200_000]
+        .into_iter()
+        .enumerate()
+    {
+        rows.extend(msg(b'D', &vec![b'0' + i as u8; total - 5]));
+    }
+    rows
+}
+
+/// The COPY OUT stream of `COPY big TO STDOUT`: CopyOutResponse, 1,000 rows,
+/// one row larger than the relay buffer, CopyDone, CommandComplete.
+fn copy_out() -> Vec<u8> {
+    let mut out = msg(b'H', &[0, 0, 1, 0, 0]);
+    for i in 0..1000usize {
+        out.extend(msg(b'd', format!("{i}\tcopied row {i}\n").as_bytes()));
+    }
+    out.extend(msg(b'd', &vec![b'c'; 100_000]));
+    out.extend(msg(b'c', b""));
+    out.extend(msg(b'C', b"COPY 1001\0"));
+    out
+}
+
+async fn fake_pg_connection<S: AsyncRead + AsyncWrite + Unpin>(
+    mut sock: S,
     cancel_tx: mpsc::UnboundedSender<Vec<u8>>,
     stmt_tx: mpsc::UnboundedSender<String>,
 ) -> std::io::Result<()> {
@@ -107,10 +164,14 @@ async fn fake_pg_connection(
     let mut status = b'I';
     // Extended protocol: after an error the server skips to Sync.
     let mut skipping = false;
+    // The statement an Execute runs (the last one parsed).
+    let mut parsed = String::new();
     loop {
         let m = read_message(&mut sock).await?;
         let mut out = Vec::new();
         let mut split_reply = false;
+        // Large replies go out in pieces around the relay's buffer size.
+        let mut large_reply = false;
         match m.tag {
             b'X' => return Ok(()),
             b'Q' | b'P' => {
@@ -125,7 +186,18 @@ async fn fake_pg_connection(
                     continue;
                 }
                 let upper = sql.to_ascii_uppercase();
-                let (reply, next) = if upper == "SELECT SLOW_LARGE" {
+                if m.tag == b'P' {
+                    parsed = upper.clone();
+                }
+                let (reply, next) = if upper == "SELECT MANY_ROWS" && m.tag == b'Q' {
+                    large_reply = true;
+                    let mut reply = many_rows();
+                    reply.extend(msg(b'C', b"SELECT 2004\0"));
+                    (reply, status)
+                } else if upper == "COPY BIG TO STDOUT" && m.tag == b'Q' {
+                    large_reply = true;
+                    (copy_out(), status)
+                } else if upper == "SELECT SLOW_LARGE" {
                     split_reply = true;
                     let mut reply = msg(b'D', &vec![b'x'; 32 * 1024 + 37]);
                     reply.extend(msg(b'C', b"SELECT 1\0"));
@@ -166,7 +238,15 @@ async fn fake_pg_connection(
             }
             b'B' if !skipping => out.extend(msg(b'2', b"")),
             b'C' if !skipping => out.extend(msg(b'3', b"")),
-            b'E' if !skipping => out.extend(msg(b'C', b"SELECT 1\0")),
+            b'E' if !skipping => {
+                if parsed == "SELECT MANY_ROWS" {
+                    large_reply = true;
+                    out.extend(many_rows());
+                    out.extend(msg(b'C', b"SELECT 2004\0"));
+                } else {
+                    out.extend(msg(b'C', b"SELECT 1\0"));
+                }
+            }
             b'S' => {
                 skipping = false;
                 out.extend(msg(b'Z', &[status]));
@@ -174,7 +254,22 @@ async fn fake_pg_connection(
             _ => {}
         }
         if !out.is_empty() {
-            if split_reply {
+            if large_reply {
+                let mut offset = 0;
+                for width in [65_535usize, 1, 4, 65_537, 5, 6, 4_093, 70_000]
+                    .into_iter()
+                    .cycle()
+                {
+                    if offset == out.len() {
+                        break;
+                    }
+                    let end = out.len().min(offset + width);
+                    sock.write_all(&out[offset..end]).await?;
+                    sock.flush().await?;
+                    offset = end;
+                    tokio::task::yield_now().await;
+                }
+            } else if split_reply {
                 let mut offset = 0;
                 for width in [1usize, 2, 3, 7, 16_383, 5, 8_191, usize::MAX] {
                     if offset == out.len() {
@@ -189,6 +284,7 @@ async fn fake_pg_connection(
             } else {
                 sock.write_all(&out).await?;
             }
+            sock.flush().await?;
         }
     }
 }
@@ -446,8 +542,9 @@ async fn flag_off_session() -> (TcpStream, FakePg) {
 
 /// Sends `sql` as a simple query; returns the reply's first message tag and the
 /// ReadyForQuery status.
-async fn simple(s: &mut TcpStream, sql: &str) -> (u8, String, u8) {
+async fn simple<S: AsyncRead + AsyncWrite + Unpin>(s: &mut S, sql: &str) -> (u8, String, u8) {
     s.write_all(&pg_query(sql)).await.unwrap();
+    s.flush().await.unwrap();
     let first = read_pg(s).await;
     let detail = if first.tag == b'E' {
         pg_error(&first.body).0
@@ -1008,4 +1105,503 @@ async fn real_pg_client_cancel_through_the_proxy() {
         assert_eq!(value.as_deref(), Some("42"), "the session runs on");
     })
     .await;
+}
+
+// ── 4.17.2: the relay's batched framing, end to end ─────────────────────────
+
+/// Reads the client's next messages until `bytes` worth, as raw bytes.
+async fn read_raw<S: AsyncRead + Unpin>(s: &mut S, n: usize) -> Vec<u8> {
+    let mut got = vec![0u8; n];
+    tokio::time::timeout(std::time::Duration::from_secs(20), s.read_exact(&mut got))
+        .await
+        .expect("the reply arrives")
+        .unwrap();
+    got
+}
+
+/// Long results, COPY OUT and three pipelined extended groups with a local
+/// refusal in the middle, through the real session entrypoint, the upstream
+/// sending its replies in pieces around the relay's 64 KiB buffer: every
+/// byte arrives unchanged and in order, the refusal takes exactly the middle
+/// group's place, and the session goes on.
+async fn large_results_copy_and_pipelined_groups<S: AsyncRead + AsyncWrite + Unpin>(
+    s: &mut S,
+    pg: &mut FakePg,
+) {
+    let z = msg(b'Z', b"I");
+    // Simple protocol: a long result.
+    s.write_all(&pg_query("SELECT many_rows")).await.unwrap();
+    s.flush().await.unwrap();
+    let mut expected = many_rows();
+    expected.extend(msg(b'C', b"SELECT 2004\0"));
+    expected.extend(&z);
+    assert!(read_raw(s, expected.len()).await == expected, "many_rows");
+
+    // COPY OUT.
+    s.write_all(&pg_query("COPY big TO STDOUT")).await.unwrap();
+    s.flush().await.unwrap();
+    let mut expected = copy_out();
+    expected.extend(&z);
+    assert!(read_raw(s, expected.len()).await == expected, "COPY OUT");
+
+    // Pipelined groups: rows, a refusal, a plain statement.
+    let group = |sql: &str| {
+        let mut g = pg_parse("", sql, &[]);
+        g.extend(msg(b'B', b"\0\0\0\0\0\0\0\0"));
+        g.extend(msg(b'E', b"\0\0\0\0\0"));
+        g.extend(pg_sync());
+        g
+    };
+    let mut pipeline = group("SELECT many_rows");
+    pipeline.extend(group(DANGEROUS));
+    pipeline.extend(group("SELECT 1"));
+    s.write_all(&pipeline).await.unwrap();
+    s.flush().await.unwrap();
+    let mut first = msg(b'1', b"");
+    first.extend(msg(b'2', b""));
+    first.extend(many_rows());
+    first.extend(msg(b'C', b"SELECT 2004\0"));
+    first.extend(&z);
+    assert!(read_raw(s, first.len()).await == first, "first group");
+    let refusal = read_pg(s).await;
+    assert_eq!(
+        (refusal.tag, pg_error(&refusal.body).0.as_str()),
+        (b'E', "42501"),
+        "the refusal takes the middle group's place"
+    );
+    assert_eq!(read_pg(s).await.body, b"I");
+    let mut third = msg(b'1', b"");
+    third.extend(msg(b'2', b""));
+    third.extend(msg(b'C', b"SELECT 1\0"));
+    third.extend(&z);
+    assert!(read_raw(s, third.len()).await == third, "third group");
+
+    let mut seen = Vec::new();
+    while let Ok(sql) = pg.statements.try_recv() {
+        seen.push(sql);
+    }
+    assert!(
+        !seen.iter().any(|sql| sql == DANGEROUS),
+        "never reaches the database"
+    );
+    // The session goes on.
+    let (tag, _, status) = simple(s, "SELECT 1").await;
+    assert_eq!((tag, status), (b'C', b'I'));
+}
+
+#[tokio::test]
+async fn plaintext_relays_large_results_copy_and_pipelined_groups_in_order() {
+    let (mut s, mut pg) = flag_off_session().await;
+    large_results_copy_and_pipelined_groups(&mut s, &mut pg).await;
+}
+
+/// The same with TLS on both legs: `PROXY_TLS_MODE=require` toward the client
+/// and `UPSTREAM_SSLMODE=require` toward the database.
+#[tokio::test]
+async fn tls_on_both_legs_relays_large_results_copy_and_pipelined_groups_in_order() {
+    let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
+    let db_ca = crate::tcp::upstream::test_pki::TestCa::new("fake postgres CA");
+    let db_leaf = db_ca.issue(&["127.0.0.1"]);
+    let mut pg = fake_pg_with(Some(crate::tcp::upstream::test_pki::server_config(
+        &db_leaf, None,
+    )))
+    .await;
+    let proxy_ca = crate::tcp::upstream::test_pki::TestCa::new("proxy test CA");
+    let proxy_leaf = proxy_ca.issue(&["localhost"]);
+    let mut cfg = proxy_config(pg.addr);
+    cfg.upstream_tls = crate::tcp::upstream::UpstreamTlsMode::Require;
+    cfg.client_tls_acceptor = Some(
+        crate::tcp::client_tls::build_acceptor(&proxy_leaf.cert_pem, &proxy_leaf.key_pem).unwrap(),
+    );
+    let proxy = spawn_proxy(Arc::new(cfg)).await;
+    let mut s = tls_client(proxy, proxy_ca.roots()).await;
+    start_session(&mut s).await;
+    large_results_copy_and_pipelined_groups(&mut s, &mut pg).await;
+}
+
+/// A real PostgreSQL through the 4.17.2 relay: rows under, at and well over
+/// its 64 KiB buffer and a long result, by the simple and the extended
+/// protocol, and prepared statements pipelined by the driver (joined
+/// futures), each reply matched to its own statement.
+#[tokio::test]
+async fn real_pg_large_rows_and_pipelined_prepared_statements_through_the_relay() {
+    super::sensitive_tests::with_real_pg(|via| async move {
+        let c = super::sensitive_tests::connect(&via).await;
+        // Simple protocol: 3,000 rows of growing size, then three large ones.
+        let sql = "SELECT repeat(chr(97 + n % 26), n) FROM generate_series(1, 3000) n \
+                   UNION ALL SELECT repeat('z', 65531) \
+                   UNION ALL SELECT repeat('y', 65536) \
+                   UNION ALL SELECT repeat('w', 300000)";
+        let rows: Vec<String> = c
+            .simple_query(sql)
+            .await
+            .unwrap()
+            .iter()
+            .filter_map(|m| match m {
+                tokio_postgres::SimpleQueryMessage::Row(r) => r.get(0).map(str::to_string),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(rows.len(), 3003);
+        for (i, row) in rows.iter().take(3000).enumerate() {
+            let n = i + 1;
+            assert_eq!(row.len(), n);
+            assert!(row.bytes().all(|b| b == b'a' + (n % 26) as u8), "row {n}");
+        }
+        assert_eq!(rows[3000].len(), 65531);
+        assert_eq!(rows[3001].len(), 65536);
+        assert_eq!(rows[3002].len(), 300000);
+
+        // Extended protocol, the same result.
+        let rows = c.query(sql, &[]).await.unwrap();
+        assert_eq!(rows.len(), 3003);
+        assert_eq!(rows[3002].get::<_, String>(0).len(), 300000);
+
+        // Prepared statements, pipelined: every reply is its own.
+        let echo = c
+            .prepare("SELECT $1::int AS n, repeat('p', $1::int)")
+            .await
+            .unwrap();
+        let sizes: Vec<i32> = (0..64).map(|i| (i * 2_053) % 90_000).collect();
+        let mut replies = Vec::new();
+        for n in sizes.chunks(8) {
+            let p: Vec<[&(dyn tokio_postgres::types::ToSql + Sync); 1]> =
+                n.iter().map(|v| [v as _]).collect();
+            // Polled together, so the driver pipelines the eight.
+            let r = tokio::join!(
+                c.query_one(&echo, &p[0]),
+                c.query_one(&echo, &p[1]),
+                c.query_one(&echo, &p[2]),
+                c.query_one(&echo, &p[3]),
+                c.query_one(&echo, &p[4]),
+                c.query_one(&echo, &p[5]),
+                c.query_one(&echo, &p[6]),
+                c.query_one(&echo, &p[7]),
+            );
+            for row in [r.0, r.1, r.2, r.3, r.4, r.5, r.6, r.7] {
+                replies.push(row.unwrap());
+            }
+        }
+        for (n, row) in sizes.iter().zip(&replies) {
+            assert_eq!(row.get::<_, i32>(0), *n);
+            assert_eq!(row.get::<_, String>(1).len(), *n as usize);
+        }
+    })
+    .await;
+}
+
+// ── 4.17.3: Execute re-evaluation only for time-dependent policies ──────────
+
+/// A business policy on every `select`, as a sync would deliver it.
+fn policy_rule(code: &str, body: &str) -> vericto_engine::Rule {
+    vericto_engine::Rule {
+        rule_id: format!("rule-{code}"),
+        code: code.into(),
+        severity: vericto_engine::Severity::High,
+        default_action: vericto_engine::EnforcementAction::Block,
+        rule_type: vericto_engine::RuleType::Custom,
+        ast_condition_yaml: Some(format!(
+            "rule: {code}\napplies_to: {{ ops: [select] }}\n{body}\naction: block\n"
+        )),
+    }
+}
+
+/// The bundle a sync of the built-in ruleset plus `policies` compiles.
+fn policy_bundle(
+    policies: &[vericto_engine::Rule],
+    version: &str,
+) -> crate::tcp::policy_rules::PolicyRules {
+    let mut rules = crate::tcp::evaluator::default_ruleset();
+    rules.extend(policies.iter().cloned());
+    crate::tcp::policy_rules::bundle_from_sync(
+        crate::tcp::policy_rules::PolicyRulesMode::Enforce,
+        Arc::new(rules),
+        None,
+        version,
+    )
+}
+
+/// A session through the real entrypoint with policy rules enforced and
+/// `policies` in force; the telemetry queue counts the evaluations.
+async fn policy_proxy(
+    policies: &[vericto_engine::Rule],
+) -> (
+    TcpStream,
+    FakePg,
+    Arc<PgProxyConfig>,
+    Arc<crate::telemetry::queue::MemoryQueue>,
+) {
+    let pg = fake_pg().await;
+    let (cfg, queue) = super::sensitive_tests::config_with(
+        (&pg.addr.ip().to_string(), pg.addr.port()),
+        vericto_engine::EnforcementPolicy::default(),
+        crate::tcp::rules_sync::TelemetryQueryMode::Raw,
+        crate::tcp::evaluator::default_ruleset(),
+        crate::tcp::upstream::UpstreamTlsMode::Disable,
+    );
+    let mut cfg = Arc::into_inner(cfg).expect("unshared config");
+    let bundle = policy_bundle(policies, "bundle-v1");
+    cfg.ruleset
+        .store(Arc::clone(bundle.rules.as_ref().unwrap()));
+    cfg.policy_rules = crate::tcp::policy_rules::PolicyRulesRuntime {
+        mode: crate::tcp::policy_rules::PolicyRulesMode::Enforce,
+        bundle: Arc::new(arc_swap::ArcSwap::from_pointee(bundle)),
+        listener: "127.0.0.1:5433".into(),
+        database_id: Some("00000000-0000-0000-0000-000000000001".into()),
+    };
+    let cfg = Arc::new(cfg);
+    let proxy = spawn_proxy(Arc::clone(&cfg)).await;
+    let mut s = TcpStream::connect(proxy).await.unwrap();
+    start_session(&mut s).await;
+    (s, pg, cfg, queue)
+}
+
+/// The evaluations reported for `sql` since the last call.
+fn evaluations_of(queue: &crate::telemetry::queue::MemoryQueue, sql: &str) -> usize {
+    super::sensitive_tests::events(queue)
+        .iter()
+        .filter(|e| e["query_text"].as_str() == Some(sql))
+        .count()
+}
+
+/// Bind (one text parameter when `param` is set), Execute, Sync; asserts
+/// BindComplete, CommandComplete and ReadyForQuery.
+async fn execute_ok(s: &mut TcpStream, statement: &str, param: Option<&str>) {
+    let mut bind = b"portal\0".to_vec();
+    bind.extend_from_slice(statement.as_bytes());
+    bind.extend_from_slice(b"\0\0\0");
+    match param {
+        None => bind.extend_from_slice(b"\0\0"),
+        Some(value) => {
+            bind.extend_from_slice(&1i16.to_be_bytes());
+            bind.extend_from_slice(&(value.len() as i32).to_be_bytes());
+            bind.extend_from_slice(value.as_bytes());
+        }
+    }
+    bind.extend_from_slice(b"\0\0");
+    let mut bytes = msg(b'B', &bind);
+    bytes.extend(msg(b'E', b"portal\0\0\0\0\0"));
+    bytes.extend(pg_sync());
+    s.write_all(&bytes).await.unwrap();
+    assert_eq!(read_pg(s).await.tag, b'2');
+    let c = read_pg(s).await;
+    assert_eq!(c.tag, b'C', "{:?}", pg_error(&c.body));
+    assert_eq!(read_pg(s).await.tag, b'Z');
+}
+
+/// Bind, Execute, Sync of `statement`: the Bind is refused by `code` (the
+/// statement is evaluated again under the new snapshots at its Bind).
+async fn bind_refused(s: &mut TcpStream, statement: &str, code: &str) {
+    s.write_all(&bind_execute_sync("portal", statement))
+        .await
+        .unwrap();
+    let e = read_pg(s).await;
+    let (state, message) = pg_error(&e.body);
+    assert_eq!(state, "42501");
+    assert!(message.contains(code), "{message}");
+    assert_eq!(read_pg(s).await.tag, b'Z');
+}
+
+#[test]
+fn the_bundle_knows_whether_a_policy_reads_the_time() {
+    let reads = |policies: &[vericto_engine::Rule]| policy_bundle(policies, "v").reads_time;
+    // Nothing to read: no business policy.
+    assert!(!reads(&[]));
+    // Time-free: principal, statement, session, ticket and database fields.
+    assert!(!reads(&[policy_rule(
+        "POL-FREE",
+        "deny_if: principal.type == \"agent\" && !stmt.has_where"
+    )]));
+    assert!(!reads(&[policy_rule(
+        "POL-FREE2",
+        "deny_if: session.tenant == \"x\" || db.env == \"prod\" || stmt.limit > 10"
+    )]));
+    // Any time field, with or without in_window; in `when` as in `deny_if`.
+    for body in [
+        "deny_if: in_window(time.now, \"Wed 03:00-03:01\", \"UTC\")",
+        "deny_if: time.hour < 6",
+        "deny_if: time.weekday == 0",
+        "deny_if: time.tz != \"UTC\"",
+        "when: time.minute > 30\ndeny_if: stmt.has_where",
+    ] {
+        assert!(reads(&[policy_rule("POL-TIME", body)]), "{body}");
+    }
+    // One time-dependent policy among time-free ones.
+    assert!(reads(&[
+        policy_rule("POL-A", "deny_if: principal.type == \"agent\""),
+        policy_rule("POL-B", "require: time.hour >= 0"),
+    ]));
+    // A policy whose fields the engine cannot read counts as reading the time.
+    assert!(reads(&[policy_rule(
+        "POL-BROKEN",
+        "deny_if: no.such.field =="
+    )]));
+}
+
+#[tokio::test]
+async fn execute_keeps_the_verdict_of_a_time_free_policy() {
+    let (mut s, mut pg, _cfg, queue) = policy_proxy(&[policy_rule(
+        "POL-FREE",
+        "deny_if: principal.type == \"agent\"",
+    )])
+    .await;
+    parse_complete(&mut s, &mut pg, "named", "SELECT 1").await;
+    assert_eq!(evaluations_of(&queue, "SELECT 1"), 1, "evaluated at Parse");
+    for _ in 0..3 {
+        execute_ok(&mut s, "named", None).await;
+    }
+    assert_eq!(
+        evaluations_of(&queue, "SELECT 1"),
+        0,
+        "no Execute is evaluated again under the same snapshots"
+    );
+}
+
+#[tokio::test]
+async fn execute_rechecks_a_time_dependent_policy_every_time() {
+    let (mut s, mut pg, _cfg, queue) = policy_proxy(&[policy_rule(
+        "POL-TIME",
+        "deny_if: time.now < timestamp('2000-01-01T00:00:00Z')",
+    )])
+    .await;
+    parse_complete(&mut s, &mut pg, "named", "SELECT 1").await;
+    assert_eq!(evaluations_of(&queue, "SELECT 1"), 1);
+    for _ in 0..3 {
+        execute_ok(&mut s, "named", None).await;
+    }
+    assert_eq!(evaluations_of(&queue, "SELECT 1"), 3, "one per Execute");
+}
+
+#[tokio::test]
+async fn a_bundle_swap_invalidates_a_time_free_verdict() {
+    let free = policy_rule("POL-FREE", "deny_if: principal.type == \"agent\"");
+    let (mut s, mut pg, cfg, queue) = policy_proxy(std::slice::from_ref(&free)).await;
+    parse_complete(&mut s, &mut pg, "named", "SELECT 1").await;
+    execute_ok(&mut s, "named", None).await;
+    assert_eq!(evaluations_of(&queue, "SELECT 1"), 1);
+
+    // The same policies in a new bundle: evaluated again once, then reused.
+    cfg.policy_rules.bundle.store(Arc::new(policy_bundle(
+        std::slice::from_ref(&free),
+        "bundle-v2",
+    )));
+    execute_ok(&mut s, "named", None).await;
+    execute_ok(&mut s, "named", None).await;
+    // The Bind finds the statement stale under the new bundle and evaluates
+    // it again once; the portal it binds and every later Execute are fresh.
+    assert_eq!(evaluations_of(&queue, "SELECT 1"), 1);
+
+    // A bundle whose (time-free) policy now refuses the statement: the next
+    // Execute is refused, although its Parse was allowed.
+    cfg.policy_rules.bundle.store(Arc::new(policy_bundle(
+        &[policy_rule(
+            "POL-DENY",
+            "deny_if: principal.type != \"agent\"",
+        )],
+        "bundle-v3",
+    )));
+    bind_refused(&mut s, "named", "POL-DENY").await;
+}
+
+#[tokio::test]
+async fn a_session_context_change_invalidates_a_time_free_verdict() {
+    let (mut s, mut pg, _cfg, _queue) = policy_proxy(&[policy_rule(
+        "POL-TENANT",
+        "deny_if: has(session.tenant) && session.tenant == \"acme\"",
+    )])
+    .await;
+    parse_complete(&mut s, &mut pg, "named", "SELECT 1").await;
+    execute_ok(&mut s, "named", None).await;
+    // Consumed by the proxy: the session context changes.
+    s.write_all(&pg_query("SET vericto.tenant = 'acme'"))
+        .await
+        .unwrap();
+    assert_eq!(read_pg(&mut s).await.tag, b'C');
+    assert_eq!(read_pg(&mut s).await.tag, b'Z');
+    bind_refused(&mut s, "named", "POL-TENANT").await;
+}
+
+/// The engine evaluates a statement's SQL, never its Bind parameters, so no
+/// verdict depends on a parameter value: a verdict reused across Executes
+/// with different parameters is the one any of them would get. Here a
+/// `LIMIT $1` is not known at Parse (`stmt.limit` is unknown, and
+/// `on_unknown: flag` forwards it, flagged); binding 10 or 1,000,000 changes nothing.
+#[tokio::test]
+async fn a_reused_verdict_never_depends_on_bind_parameters() {
+    let sql = "SELECT 1 LIMIT $1";
+    let (mut s, mut pg, _cfg, queue) = policy_proxy(&[policy_rule(
+        "POL-LIMIT",
+        "deny_if: stmt.limit > 100\non_unknown: flag",
+    )])
+    .await;
+    s.write_all(&pg_parse("named", sql, &[])).await.unwrap();
+    let r = read_pg(&mut s).await;
+    assert_eq!(r.tag, b'1', "{:?}", pg_error(&r.body));
+    assert_eq!(timeout(pg.statements.recv()).await.as_deref(), Some(sql));
+    assert_eq!(evaluations_of(&queue, sql), 1);
+    for value in ["10", "1000000", "7"] {
+        execute_ok(&mut s, "named", Some(value)).await;
+    }
+    assert_eq!(evaluations_of(&queue, sql), 0);
+    // Written out, the bound that matters is refused at Parse whatever runs it.
+    s.write_all(&pg_parse("big", "SELECT 1 LIMIT 1000000", &[]))
+        .await
+        .unwrap();
+    let e = read_pg(&mut s).await;
+    assert!(pg_error(&e.body).1.contains("POL-LIMIT"));
+}
+
+// ── 4.17.3: coalesced frontend writes, end to end ───────────────────────────
+
+/// More Syncs in one client write than the response queue holds (4,096
+/// plans): the session goes on as the database's answers free the queue.
+/// What the frontend holds unsent never fills the queue on its own (the
+/// coalescing bound is below 4,096 of the smallest messages), and it is sent
+/// before the frontend waits for room anyway.
+#[tokio::test]
+async fn a_full_response_queue_sends_what_is_held_before_it_waits() {
+    let (mut s, _pg, _cfg) = prepared_proxy().await;
+    const SYNCS: usize = 6000;
+    let bytes: Vec<u8> = (0..SYNCS).flat_map(|_| pg_sync()).collect();
+    let (mut r, mut w) = s.split();
+    let write = async { w.write_all(&bytes).await.unwrap() };
+    let read = async {
+        for _ in 0..SYNCS {
+            assert_eq!(read_pg(&mut r).await.tag, b'Z');
+        }
+    };
+    tokio::join!(write, read);
+}
+
+/// Extended groups pipelined in one client write, a refused Parse in the
+/// middle, a Flush-terminated group: every response in order.
+#[tokio::test]
+async fn pipelined_groups_and_a_flush_through_coalesced_writes() {
+    let (mut s, _pg, _cfg) = prepared_proxy().await;
+    let group = |sql: &str| {
+        let mut b = pg_parse("", sql, &[]);
+        b.extend(msg(b'B', b"\0\0\0\0\0\0\0"));
+        b.extend(msg(b'E', b"\0\0\0\0\0"));
+        b.extend(pg_sync());
+        b
+    };
+    let mut bytes = group("SELECT 1");
+    bytes.extend(group(DANGEROUS));
+    bytes.extend(group("SELECT 2"));
+    // Then a group ended by Flush: answered without a Sync.
+    bytes.extend(pg_parse("", "SELECT 3", &[]));
+    bytes.extend(msg(b'B', b"\0\0\0\0\0\0\0"));
+    bytes.extend(msg(b'E', b"\0\0\0\0\0"));
+    bytes.extend(msg(b'H', b""));
+    s.write_all(&bytes).await.unwrap();
+    let mut tags = Vec::new();
+    for _ in 0..13 {
+        tags.push(read_pg(&mut s).await.tag);
+    }
+    assert_eq!(
+        &tags[..],
+        b"12CZEZ12CZ12C",
+        "{:?}",
+        String::from_utf8_lossy(&tags)
+    );
 }

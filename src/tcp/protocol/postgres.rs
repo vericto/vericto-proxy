@@ -22,6 +22,10 @@ use crate::tcp::protocol::{
 
 pub struct PostgresProtocol;
 
+/// The client bytes buffered before framing (4.17.3): one TLS record's
+/// plaintext at most, so a client read is usually framed whole from it.
+pub const CLIENT_READ_BUFFER: usize = 16 * 1024;
+
 #[async_trait::async_trait]
 impl WireProtocol for PostgresProtocol {
     fn dialect(&self) -> Dialect {
@@ -34,11 +38,41 @@ impl WireProtocol for PostgresProtocol {
 
     async fn read_client_message(
         &self,
-        client_read: &mut crate::tcp::client_tls::ClientRead,
+        client_read: &mut crate::tcp::client_tls::ClientReader<'_>,
     ) -> std::io::Result<Option<RawClientMessage>> {
         Ok(read_message(client_read)
             .await?
             .map(RawClientMessage::Postgres))
+    }
+
+    async fn read_client_message_into(
+        &self,
+        client_read: &mut crate::tcp::client_tls::ClientReader<'_>,
+        slot: &mut RawClientMessage,
+    ) -> std::io::Result<bool> {
+        if !matches!(slot, RawClientMessage::Postgres(_)) {
+            *slot = RawClientMessage::Postgres(crate::tcp::codec::PgMessage {
+                tag: 0,
+                body: Vec::new(),
+            });
+        }
+        let RawClientMessage::Postgres(message) = slot else {
+            unreachable!("set above")
+        };
+        crate::tcp::codec::read_message_into(client_read, message).await
+    }
+
+    fn client_read_buffer(&self) -> usize {
+        CLIENT_READ_BUFFER
+    }
+
+    fn has_buffered_message(&self, buffered: &[u8]) -> bool {
+        match crate::tcp::codec::frontend_message_size(buffered) {
+            Some(Ok(total)) => buffered.len() >= total,
+            // A length PostgreSQL never sends: the next read refuses it at once.
+            Some(Err(_)) => true,
+            None => false,
+        }
     }
 
     fn classify(&self, msg: &RawClientMessage) -> Classified {

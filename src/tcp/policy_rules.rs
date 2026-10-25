@@ -127,6 +127,86 @@ pub struct PolicyRules {
     pub principals: PrincipalMap,
     /// The `version` of the response, reported as `policy_bundle_version`.
     pub version: Option<String>,
+    /// Whether a business policy of the bundle may read the time of the
+    /// statement (`time.*`), so that its verdict can change between a prepared
+    /// statement's Parse (or Bind) and an Execute with every snapshot the
+    /// proxy compares unchanged. While it is, every Execute is evaluated again;
+    /// otherwise an Execute keeps the verdict reached under the same
+    /// snapshots (4.17.3; 4.17.1 and 4.17.2 evaluated every Execute again
+    /// while any business policy was active). See [`policies_read_time`].
+    pub reads_time: bool,
+}
+
+/// The fields a business policy may read whose value cannot change between a
+/// statement's Parse and its Execute while the snapshots the proxy compares
+/// stay the same `Arc`s: the statement's facts (from its SQL text, never from
+/// Bind parameters, which the engine does not see), the principal, session and
+/// ticket (the session context), and the database (the proxy's configuration).
+/// The paths are the engine's own names of its typed fields, as
+/// [`vericto_engine::policy::check_policy`] reports the fields a compiled
+/// policy reads (engine 4.5.0). Any other field (`time.*`, or one a later
+/// engine adds) counts as time-dependent.
+const SNAPSHOT_FIELDS: &[&str] = &[
+    "principal.type",
+    "principal.id",
+    "principal.owner",
+    "principal.trust",
+    "principal.via",
+    "principal.attrs",
+    "principal.groups",
+    "principal.end_user",
+    "stmt.op",
+    "stmt.kind",
+    "stmt.tables",
+    "stmt.tables_written",
+    "stmt.columns_read",
+    "stmt.columns_written",
+    "stmt.functions",
+    "stmt.has_where",
+    "stmt.where_always_true",
+    "stmt.limit",
+    "stmt.has_returning",
+    "stmt.insert_rows",
+    "stmt.truncated",
+    "db.id",
+    "db.name",
+    "db.env",
+    "db.tags",
+    "db.dialect",
+    "session.tenant",
+    "session.application_name",
+    "session.client_ip",
+    "session.listener",
+    "ticket.id",
+    "ticket.source",
+    "ticket.verified",
+];
+
+/// Whether any business policy among `rules` may read the time of the
+/// statement. Conservative: a policy is time-free only when the engine
+/// compiles it and every field its compiled CEL reads (`when`, `deny_if` /
+/// `require`) is in [`SNAPSHOT_FIELDS`]. A policy that does not compile (its
+/// fields cannot be read) counts as reading the time. This reads the
+/// engine's analysis of the compiled policy, not the policy's text.
+pub fn policies_read_time(rules: &[Rule]) -> bool {
+    rules
+        .iter()
+        .filter(|r| r.rule_type == vericto_engine::RuleType::Custom)
+        .filter_map(|r| r.ast_condition_yaml.as_deref())
+        .filter(|yaml| vericto_engine::policy::is_policy_document(yaml))
+        .any(|yaml| !policy_is_time_free(yaml))
+}
+
+fn policy_is_time_free(yaml: &str) -> bool {
+    let report = vericto_engine::policy::check_policy(yaml);
+    // The engine lists the fields (and a decidability per mode) only for a
+    // document it parsed and compiled.
+    report.is_policy
+        && !report.decidability.is_empty()
+        && report
+            .fields
+            .iter()
+            .all(|field| SNAPSHOT_FIELDS.contains(&field.as_str()))
 }
 
 /// Shared, hot-swappable policy bundle.
@@ -170,10 +250,12 @@ pub fn bundle_from_sync(
         );
     }
     let principals = PrincipalMap::from_sync(principals);
+    let reads_time = !policies.is_empty() && policies_read_time(&rules);
     tracing::debug!(
         mode = mode.as_str(),
         policies = policies.len(),
         principals = principals.entries.len(),
+        reads_time,
         "Policy bundle compiled"
     );
     PolicyRules {
@@ -181,6 +263,7 @@ pub fn bundle_from_sync(
         policies,
         principals,
         version: Some(version.to_string()),
+        reads_time,
     }
 }
 
