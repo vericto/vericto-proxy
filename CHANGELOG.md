@@ -7,6 +7,66 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [4.18.0] - 2026-10-25
+
+**The kill switch is VERICTO-105 on the wire, for every statement.** Up to 4.17.x a
+dashboard "Block all statements" reached the proxy only as a deny-all agent-access
+allowlist for the blocked database user: refusals were reported as VERICTO-087, and
+statements that read no table (`SELECT 1`, `SET`, `BEGIN`) still passed. 4.18.0 reads
+the new `kill_switch` field of `/sync/rules` and refuses every statement of a blocked
+user (or of every user, under the workspace switch) with the control plane's
+kill-switch message. Requires 4.17.3 to be tagged first (this release is built on it;
+4.17.1 and 4.17.2 were not released).
+
+### Added
+
+- **`kill_switch` in the sync bundle** (`{"workspace": {block_id, target_type,
+  message}, "db_users": {"<user>": {…}}}`, present only while a block is active;
+  part of the signed body). Applied with the rest of each sync, restored from the
+  rules cache after a restart, cleared by the first sync without it. A malformed
+  entry is skipped and logged (`alert=kill_switch_malformed`) and never turns the
+  bundle away: its deny-all allowlist still blocks that user as VERICTO-087.
+- **Every statement of a blocked session is refused before anything else**, in
+  every mode (`monitor_mode`, observe windows and `VERICTO_POLICY_RULES` included):
+  Postgres `Query`, `Parse`, and `Bind`/`Execute` of a statement prepared before the
+  block, through the ordered response coordinator; MySQL `COM_QUERY`,
+  `COM_STMT_PREPARE`, `COM_STMT_EXECUTE`/`COM_STMT_FETCH`, `COM_INIT_DB`,
+  `COM_FIELD_LIST` and `COM_CHANGE_USER` (no way out to another user). The error is
+  a normal one (Postgres 42501, MySQL 1142) whose text is the block's message.
+  Protocol plumbing (Sync, Describe, Close, ping, statement close/reset, quit)
+  passes. A user's own block wins over the workspace switch. The check comes before
+  every verdict: an Execute that keeps its statement's time-free business-policy
+  verdict (4.17.3) is refused by a block like any other.
+- **Telemetry `kill_switch_id`**: each refusal is a BLOCKED event with VERICTO-105,
+  severity critical, path `KillSwitch > <target>`, the one violation, and the block
+  id, which the control plane links to the block; one event per statement.
+- `docs/AGENT_ACCESS.md` "Kill switch (VERICTO-105)"; README.
+
+### Changed
+
+- **vericto-engine v4.5.0 -> v4.6.0** (git tag): every VERICTO-087 finding carries a
+  deterministic suggestion (what is not in the identity's allowlist, and that an
+  admin must grant it in Dashboard > Agent access), so the proxy's 087 error now
+  ends with `. Suggestion: …`. Nothing else changes in the engine's decisions or
+  paths. In sanitized telemetry, when a MySQL name is redacted from `access_denied`,
+  the suggestion is rebuilt from the redacted names
+  (`vericto_engine::access_suggested_fix`), so a double-quoted literal never leaves
+  in it. Cargo.lock: only the engine entry and this crate's version change.
+
+### Performance
+
+- Plumbing messages (Sync, Describe, ping…) pay one match; any other message one
+  atomic load and an `is_none` while no block is active, and one hash lookup by the
+  session user while blocks are. Callgrind, pgbench select-only `-M extended`, one
+  session, one worker, linux/arm64 release builds, marginal user-space instructions
+  per statement over 4,000 statements, 2 runs each: 4.17.1 227,669 / 227,760, 4.18.0
+  227,706 / 228,955 (no block; no control plane); with a control plane, 211,365 /
+  211,336 without a block and 212,237 / 212,340 with another user blocked (+0.4%).
+  On 4.17.3 (pgbench `-n -S -c 1`, TLS on both legs, no control plane, 2 runs):
+  extended 206,486 / 205,909 -> 207,020 / 206,393 (+0.3%), prepared 20,371 /
+  20,356 -> 20,799 / 20,796 (+2.1%: the kill-switch check on the Parse, Bind and
+  Execute messages).
+
 ## [4.17.3] - 2026-10-25
 
 **PostgreSQL: 4.17.1's ordering and prepared-statement guarantees at 4.17.0's

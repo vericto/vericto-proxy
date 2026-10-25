@@ -334,6 +334,11 @@ pub async fn intercept_client_to_server(
     // the end-of-sequence marker (Postgres: Sync 'S'). Only the Postgres path
     // sets this; MySQL never requests it.
     let mut skip_until_sync = false;
+    // PostgreSQL with the response coordinator: after the kill switch refused a
+    // message of an extended sequence, the server skips the rest of it until
+    // Sync (the refusal reached it as an invalid Parse), so the rest is dropped
+    // here: one refusal, one event, per sequence.
+    let mut kill_switch_until_sync = false;
 
     // For protocols that negotiate auth on this same stream (MySQL), stay in
     // pass-through until the command phase begins. Postgres intercepts from the
@@ -424,6 +429,74 @@ pub async fn intercept_client_to_server(
             (bundle, ctx)
         });
 
+        // The kill switch (VERICTO-105, 4.18.0): the session's agent is blocked,
+        // so every statement is refused before anything is parsed or evaluated,
+        // in every mode. Plumbing (Sync, Describe, ping…) costs one match; any
+        // other message one atomic load and an `is_none` while no block is
+        // active, and with blocks one hash lookup by the session user.
+        if kill_switch_until_sync {
+            if is_postgres_sync(&msg) {
+                kill_switch_until_sync = false;
+            } else if proto.kill_switch_scope(&msg).is_some() {
+                continue;
+            }
+        }
+        let refused = proto.kill_switch_scope(&msg).and_then(|kind| {
+            config
+                .kill_switch
+                .load()
+                .as_ref()
+                .and_then(|ks| ks.for_user(access.user.as_deref()).cloned())
+                .map(|block| (kind, block))
+        });
+        if let Some((kind, block)) = refused {
+            let text = match proto.classify(&msg) {
+                Classified::Query { sql, .. } => sql,
+                _ => kill_switch_label(&msg),
+            };
+            let policy = access.policy(config);
+            crate::tcp::postgres::report_kill_switch(
+                config,
+                &text,
+                proto.dialect(),
+                &block,
+                &access.identity(&policy),
+            );
+            let ast_node_path = block.ast_node_path();
+            tracing::info!(
+                rule_code = crate::tcp::kill_switch::KILL_SWITCH_RULE_CODE,
+                block_id = %block.block_id,
+                target_type = %block.target_type,
+                query_preview = %crate::tcp::postgres::log_preview(&text, proto.dialect()),
+                "Statement refused by the kill switch"
+            );
+            let reply = proto.build_block_response(&BlockContext {
+                rule_code: crate::tcp::kill_switch::KILL_SWITCH_RULE_CODE,
+                ast_node_path: &ast_node_path,
+                suggested_safe_query: None,
+                message: Some(&block.message),
+                kind,
+                client_seq: message_seq(&msg),
+                tx: tx_state.as_deref(),
+            });
+            let extended = reply.skip_until_sync;
+            if local_block(
+                proto,
+                &msg,
+                &mut upstream,
+                client_write,
+                pg_responses.as_ref(),
+                reply,
+            )
+            .await?
+            {
+                skip_until_sync = true;
+            } else if extended && pg_responses.is_some() {
+                kill_switch_until_sync = true;
+            }
+            continue; // NOT forwarded upstream
+        }
+
         // A prepared statement can outlive the rules, effective access policy,
         // business-policy bundle or session context under which Parse was
         // accepted. Bind and Execute re-evaluate only when one of those Arc
@@ -498,6 +571,7 @@ pub async fn intercept_client_to_server(
                     rule_code,
                     ast_node_path,
                     suggested_safe_query: suggested_safe_query.as_deref(),
+                    message: None,
                     kind: QueryKind::Prepared,
                     client_seq: message_seq(&msg),
                     tx: tx_state.as_deref(),
@@ -612,6 +686,7 @@ pub async fn intercept_client_to_server(
                             rule_code,
                             ast_node_path,
                             suggested_safe_query: None,
+                            message: None,
                             kind,
                             client_seq: message_seq(&msg),
                             tx: tx_state.as_deref(),
@@ -725,6 +800,7 @@ pub async fn intercept_client_to_server(
                                 rule_code: SESSION_CONTEXT_RULE_CODE,
                                 ast_node_path: &ast_node_path,
                                 suggested_safe_query: None,
+                                message: None,
                                 kind,
                                 client_seq: message_seq(&msg),
                                 tx: tx_state.as_deref(),
@@ -803,6 +879,7 @@ pub async fn intercept_client_to_server(
                             rule_code,
                             ast_node_path,
                             suggested_safe_query: suggested_safe_query.as_deref(),
+                            message: None,
                             kind,
                             client_seq: message_seq(&msg),
                             tx: tx_state.as_deref(),
@@ -907,6 +984,7 @@ pub async fn intercept_client_to_server(
                         rule_code,
                         ast_node_path,
                         suggested_safe_query: suggested_safe_query.as_deref(),
+                        message: None,
                         kind,
                         client_seq: message_seq(&msg),
                         tx: tx_state.as_deref(),
@@ -1010,6 +1088,7 @@ pub async fn intercept_client_to_server(
                         rule_code: &rule_code,
                         ast_node_path: &ast_node_path,
                         suggested_safe_query: None,
+                        message: None,
                         kind,
                         client_seq: message_seq(&msg),
                         tx: tx_state.as_deref(),
@@ -1404,6 +1483,29 @@ pub(crate) async fn relay_upstream_to_client(
             }
             Err(_) => break,
         }
+    }
+}
+
+/// What a kill-switch refusal of a message without readable SQL is reported as.
+fn kill_switch_label(msg: &RawClientMessage) -> String {
+    match msg {
+        RawClientMessage::Postgres(m) => match m.tag {
+            b'B' => "Bind (prepared statement)".to_string(),
+            b'E' => "Execute (prepared statement)".to_string(),
+            b'F' => "FunctionCall".to_string(),
+            b'Q' => "Query (unreadable SQL)".to_string(),
+            b'P' => "Parse (unreadable SQL)".to_string(),
+            t => format!("protocol message {:?}", t as char),
+        },
+        RawClientMessage::Mysql(p) => match p.command_tag() {
+            Some(0x17) => "COM_STMT_EXECUTE (prepared statement)".to_string(),
+            Some(0x1c) => "COM_STMT_FETCH (prepared statement)".to_string(),
+            Some(0x02) => "COM_INIT_DB".to_string(),
+            Some(0x04) => "COM_FIELD_LIST".to_string(),
+            Some(0x11) => "COM_CHANGE_USER".to_string(),
+            Some(t) => format!("command 0x{t:02x}"),
+            None => "empty command".to_string(),
+        },
     }
 }
 

@@ -16,6 +16,7 @@ pub mod codec;
 pub mod codec_mysql;
 pub mod evaluator;
 pub mod healthz;
+pub mod kill_switch;
 pub mod pg_response;
 pub mod policy_rules;
 pub mod postgres;
@@ -30,6 +31,7 @@ use std::sync::Arc;
 use tokio::net::TcpListener;
 
 use crate::tcp::client_tls::ClientTlsMode;
+use crate::tcp::kill_switch::SharedKillSwitch;
 use crate::tcp::policy_rules::{PolicyRulesRuntime, SharedPolicyRules};
 use crate::tcp::postgres::{PgProxyConfig, TelemetrySink, handle_connection};
 use crate::tcp::rules_sync::{
@@ -151,11 +153,13 @@ impl TcpProxyOptions {
 ///
 /// `ruleset` is shared and reloadable by the syncer; `telemetry` is optional
 /// (None disables reporting, e.g. in dev/air-gapped mode).
+#[allow(clippy::too_many_arguments)]
 pub async fn run_pg_proxy(
     opts: TcpProxyOptions,
     ruleset: SharedRuleset,
     policy: SharedPolicy,
     agent_access: SharedAccessPolicies,
+    kill_switch: SharedKillSwitch,
     telemetry_mode: SharedTelemetryMode,
     policy_rules: SharedPolicyRules,
     telemetry: Option<TelemetrySink>,
@@ -203,6 +207,7 @@ pub async fn run_pg_proxy(
         ruleset,
         policy,
         agent_access,
+        kill_switch,
         telemetry_mode,
         telemetry,
         // Resolved here rather than per query: the wire protocol is fixed at
@@ -247,11 +252,13 @@ pub async fn run_pg_proxy(
 /// TLS on each hop. The shared `PgProxyConfig` carries the
 /// ruleset/policy/telemetry regardless of protocol (the name is historical; it
 /// is the generic proxy config).
+#[allow(clippy::too_many_arguments)]
 pub async fn run_mysql_proxy(
     opts: TcpProxyOptions,
     ruleset: SharedRuleset,
     policy: SharedPolicy,
     agent_access: SharedAccessPolicies,
+    kill_switch: SharedKillSwitch,
     telemetry_mode: SharedTelemetryMode,
     policy_rules: SharedPolicyRules,
     telemetry: Option<TelemetrySink>,
@@ -297,6 +304,7 @@ pub async fn run_mysql_proxy(
         ruleset,
         policy,
         agent_access,
+        kill_switch,
         telemetry_mode,
         telemetry,
         max_query_bytes: query_limit::effective_max_query_bytes(
@@ -339,6 +347,8 @@ pub mod rules_sync;
 mod access_tests;
 #[cfg(test)]
 mod fake_pg_tests;
+#[cfg(test)]
+mod kill_switch_tests;
 #[cfg(test)]
 mod mysql_auth_tests;
 #[cfg(test)]
@@ -518,11 +528,30 @@ mod tests {
         let run = async {
             match protocol {
                 "mysql" => {
-                    run_mysql_proxy(opts, rules, policy, access, mode, Default::default(), None)
-                        .await
+                    run_mysql_proxy(
+                        opts,
+                        rules,
+                        policy,
+                        access,
+                        Default::default(),
+                        mode,
+                        Default::default(),
+                        None,
+                    )
+                    .await
                 }
                 _ => {
-                    run_pg_proxy(opts, rules, policy, access, mode, Default::default(), None).await
+                    run_pg_proxy(
+                        opts,
+                        rules,
+                        policy,
+                        access,
+                        Default::default(),
+                        mode,
+                        Default::default(),
+                        None,
+                    )
+                    .await
                 }
             }
         };

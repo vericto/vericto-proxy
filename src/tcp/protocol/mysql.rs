@@ -96,6 +96,28 @@ impl WireProtocol for MysqlProtocol {
         p.with_sql(sql).map(RawClientMessage::Mysql)
     }
 
+    /// Under a kill switch only commands that run nothing and answer with no
+    /// data pass: ping, statistics, COM_STMT_SEND_LONG_DATA / COM_STMT_CLOSE
+    /// (no reply exists to refuse them with), COM_STMT_RESET, COM_SET_OPTION,
+    /// COM_RESET_CONNECTION and COM_QUIT. Everything else is refused, including
+    /// COM_STMT_EXECUTE / COM_STMT_FETCH of a statement prepared before the
+    /// block, COM_INIT_DB, COM_FIELD_LIST and COM_CHANGE_USER (the session
+    /// cannot become another user to leave the block). Only command packets
+    /// (sequence id 0) are commands.
+    fn kill_switch_scope(&self, msg: &RawClientMessage) -> Option<QueryKind> {
+        let RawClientMessage::Mysql(p) = msg else {
+            return None;
+        };
+        if p.seq != 0 {
+            return None;
+        }
+        match p.command_tag() {
+            Some(0x0e | 0x09 | 0x18 | 0x19 | 0x1a | 0x1b | 0x1f | 0x01) => None,
+            Some(crate::tcp::codec_mysql::COM_STMT_PREPARE) => Some(QueryKind::Prepared),
+            _ => Some(QueryKind::Simple),
+        }
+    }
+
     /// Under an allowlist, only commands known to be plumbing pass: ping,
     /// statistics, the COM_STMT_* follow-ups of a statement evaluated at its
     /// COM_STMT_PREPARE, COM_SET_OPTION and COM_RESET_CONNECTION (the user
@@ -164,7 +186,10 @@ impl WireProtocol for MysqlProtocol {
     }
 
     fn build_block_response(&self, ctx: &BlockContext) -> BlockResponse {
-        let message = block_message(ctx.rule_code, ctx.ast_node_path, ctx.suggested_safe_query);
+        let message = match ctx.message {
+            Some(m) => m.to_string(),
+            None => block_message(ctx.rule_code, ctx.ast_node_path, ctx.suggested_safe_query),
+        };
         // The reply to a command packet uses sequence id command_seq + 1.
         let reply_seq = ctx.client_seq.wrapping_add(1);
         BlockResponse {
@@ -316,6 +341,7 @@ mod tests {
             rule_code: "VERICTO-001",
             ast_node_path: "DeleteStmt",
             suggested_safe_query: None,
+            message: None,
             kind: QueryKind::Simple,
             client_seq: 0,
             tx: None,

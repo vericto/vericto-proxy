@@ -78,3 +78,41 @@ function over a table is not resolved to it (grant the view itself), and an
 unqualified column in a multi-table query must be allowed in every table it could
 belong to (qualify it). See the
 [engine documentation](https://github.com/vericto/vericto-engine#agent-access-allowlists-vericto-087).
+
+## Kill switch (VERICTO-105)
+
+Since 4.18.0. "Block all statements" in the dashboard's Incident response panel stops
+one agent (an API key, a database user or a principal) or every agent of the
+workspace until an owner or admin lifts it. `/sync/rules` carries the active blocks
+that cover the proxy's database in a `kill_switch` field, and the proxy applies them
+from that sync on, to open sessions too:
+
+| | Postgres | MySQL |
+|---|---|---|
+| Refused | `Query`, `Parse`, and `Bind` / `Execute` of a statement prepared before the block (the sequence is discarded up to `Sync`); `FunctionCall` closes the session, as under an allowlist; any message not known to be plumbing | `COM_QUERY`, `COM_STMT_PREPARE`, `COM_STMT_EXECUTE` / `COM_STMT_FETCH` of an earlier statement, `COM_INIT_DB`, `COM_FIELD_LIST`, `COM_CHANGE_USER`, any command not known to be plumbing |
+| Error | `ErrorResponse`, SQLSTATE 42501 | `ERR_Packet`, ERROR 1142 |
+| Passes | `Describe`, `Close`, `Sync`, `Flush`, COPY data, `Terminate` | `COM_PING`, `COM_STATISTICS`, `COM_STMT_SEND_LONG_DATA`, `COM_STMT_CLOSE`, `COM_STMT_RESET`, `COM_SET_OPTION`, `COM_RESET_CONNECTION`, `COM_QUIT` |
+
+- **Every statement**, including those that read no table (`SELECT 1`, `SET`,
+  `BEGIN`, `SET vericto.*`): the whole agent is blocked. The check comes before the
+  size guard, the parser, the rules, the allowlist and the business policies, and it
+  does not depend on `monitor_mode`, an observe window or `VERICTO_POLICY_RULES`.
+- **The error text is the block's message**, the same text the Runtime API, MCP and
+  the CLI return (who set it, when, the block id, and to stop and ask a person).
+- **Who is blocked.** The session's database user's own block, else the workspace
+  switch. A session whose user could not be read is refused by any block (it might
+  be the blocked user), as the allowlists treat it. Principal blocks reach the proxy
+  only for principals identified by an exact database user.
+- **Telemetry.** Each refusal is a BLOCKED event with `rule_code` `VERICTO-105`,
+  severity `critical`, path `KillSwitch > <target>` and `kill_switch_id` (the block
+  id), which the control plane links to the block. One event per statement: the
+  `Bind` and `Execute` of one execution are one refusal.
+- **Older proxies and control planes.** The control plane keeps sending the deny-all
+  allowlist of each blocked user, which 4.17.x and older proxies (they ignore the new
+  field) enforce as `VERICTO-087`; there, statements that read no table pass. A
+  4.18.0 proxy talking to a control plane without the field behaves the same way.
+  A malformed `kill_switch` entry is skipped and logged as an error
+  (`alert=kill_switch_malformed`); the rest of the bundle, the deny-all allowlist of
+  that user included, still applies.
+- **Cost.** With no active block a statement pays one atomic load; with blocks, one
+  hash lookup by the session user.

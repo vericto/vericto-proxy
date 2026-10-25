@@ -17,6 +17,7 @@ use serde::Deserialize;
 
 use crate::config::ControlPlaneConfig;
 use crate::tcp::bundle_signature::{BundleSource, BundleVerifier, Keyring, SIGNATURE_HEADER};
+use crate::tcp::kill_switch::{KillSwitch, SharedKillSwitch};
 use crate::tcp::rules_cache::RulesCache;
 use vericto_engine::{
     AccessPolicyMap, EnforcementAction, EnforcementPolicy, ParseErrorAction, Rule, RuleType,
@@ -102,6 +103,13 @@ struct SyncResponse {
     /// with `VERICTO_POLICY_RULES` on.
     #[serde(default)]
     principals: Option<serde_json::Value>,
+    /// The active kill-switch blocks of this database (VERICTO-105, since
+    /// 4.18.0), present only while one is active. Kept as raw JSON and read
+    /// entry by entry by [`KillSwitch::from_sync`]: a malformed entry is skipped
+    /// and logged, never the response refused, because the same bundle carries
+    /// the deny-all allowlist (VERICTO-087) that blocks that user too.
+    #[serde(default)]
+    kill_switch: Option<serde_json::Value>,
 }
 
 /// What the rule sync does for business policy rules: with the mode on it
@@ -310,6 +318,8 @@ struct Applied {
     sensitive_columns: usize,
     /// Number of database users (incl. `"*"`) with an agent-access policy.
     agent_access: usize,
+    /// Number of kill-switch blocks in force (blocked users, plus the workspace switch).
+    kill_switch: usize,
     mode: TelemetryQueryMode,
     proxy_config: Option<ProxyConfig>,
     quota: Option<QuotaWord>,
@@ -322,6 +332,7 @@ fn apply(
     ruleset: &SharedRuleset,
     policy: &SharedPolicy,
     agent_access: &SharedAccessPolicies,
+    kill_switch: &SharedKillSwitch,
     telemetry_mode: &SharedTelemetryMode,
     policy_rules: &PolicyRulesSync,
 ) -> Applied {
@@ -336,6 +347,8 @@ fn apply(
     let sensitive_columns = new_policy.sensitive_columns.len();
     let access = body.agent_access.unwrap_or_default();
     let access_users = access.0.len();
+    let blocks = KillSwitch::from_sync(body.kill_switch);
+    let blocked = blocks.as_ref().map_or(0, KillSwitch::len);
     let rules: Vec<Rule> = body.rules.into_iter().map(ApiRule::into_rule).collect();
     let count = rules.len();
     let rules = Arc::new(rules);
@@ -354,12 +367,14 @@ fn apply(
     ruleset.store(rules);
     policy.store(Arc::new(new_policy));
     agent_access.store(Arc::new(access));
+    kill_switch.store(blocks.map(Arc::new));
     telemetry_mode.store(Arc::new(mode));
     Applied {
         count,
         monitor_mode,
         sensitive_columns,
         agent_access: access_users,
+        kill_switch: blocked,
         mode,
         proxy_config: body.proxy_config,
         quota,
@@ -444,6 +459,7 @@ async fn run(
         ruleset,
         policy,
         agent_access,
+        SharedKillSwitch::default(),
         telemetry_mode,
         PolicyRulesSync::default(),
         readiness,
@@ -460,6 +476,7 @@ pub async fn run_with_policy_rules(
     ruleset: SharedRuleset,
     policy: SharedPolicy,
     agent_access: SharedAccessPolicies,
+    kill_switch: SharedKillSwitch,
     telemetry_mode: SharedTelemetryMode,
     policy_rules: PolicyRulesSync,
     readiness: Arc<crate::tcp::healthz::Readiness>,
@@ -511,6 +528,7 @@ pub async fn run_with_policy_rules(
                     &ruleset,
                     &policy,
                     &agent_access,
+                    &kill_switch,
                     &telemetry_mode,
                     &policy_rules,
                 );
@@ -526,6 +544,7 @@ pub async fn run_with_policy_rules(
                     monitor_mode = applied.monitor_mode,
                     sensitive_columns = applied.sensitive_columns,
                     agent_access_users = applied.agent_access,
+                    kill_switch_blocks = applied.kill_switch,
                     saved_at = %cached.saved_at,
                     "Ruleset and policy loaded from the rules cache"
                 );
@@ -617,6 +636,7 @@ pub async fn run_with_policy_rules(
                             &ruleset,
                             &policy,
                             &agent_access,
+                            &kill_switch,
                             &telemetry_mode,
                             &policy_rules,
                         );
@@ -637,6 +657,7 @@ pub async fn run_with_policy_rules(
                             monitor_mode = applied.monitor_mode,
                             sensitive_columns = applied.sensitive_columns,
                             agent_access_users = applied.agent_access,
+                            kill_switch_blocks = applied.kill_switch,
                             telemetry_query_mode = ?applied.mode,
                             "Ruleset and policy updated from API"
                         );
@@ -1169,6 +1190,7 @@ mod tests {
             &ruleset,
             &policy,
             &access,
+            &SharedKillSwitch::default(),
             &mode,
             &PolicyRulesSync::default(),
         );
@@ -1463,6 +1485,71 @@ mod tests {
     }
 
     /// A malformed policy fails the whole response: the last-good one stays.
+    /// The kill switch (4.18.0) one `/sync/rules` body puts in effect, with its
+    /// agent-access map.
+    fn applied_kill_switch(body: &str) -> (Option<Arc<KillSwitch>>, AccessPolicyMap) {
+        let body: SyncResponse = serde_json::from_str(body).expect("sync body parses");
+        let access: SharedAccessPolicies =
+            Arc::new(ArcSwap::from_pointee(AccessPolicyMap::default()));
+        // A block from an earlier sync: every body replaces it.
+        let kill = SharedKillSwitch::default();
+        kill.store(
+            KillSwitch::from_sync(Some(serde_json::json!({
+                "workspace": {"block_id": "old", "message": "m"}
+            })))
+            .map(Arc::new),
+        );
+        apply(
+            body,
+            &Arc::new(ArcSwap::from_pointee(Vec::new())),
+            &Arc::new(ArcSwap::from_pointee(EnforcementPolicy::default())),
+            &access,
+            &kill,
+            &Arc::new(ArcSwap::from_pointee(TelemetryQueryMode::Raw)),
+            &PolicyRulesSync::default(),
+        );
+        (kill.load_full(), (**access.load()).clone())
+    }
+
+    /// `kill_switch` is applied with the rest of the body, and a body without it
+    /// (the block lifted, or a control plane that predates it) clears it. The
+    /// deny-all allowlist of the same body applies either way.
+    #[test]
+    fn sync_payload_with_kill_switch_applies_and_without_it_clears() {
+        let (ks, access) = applied_kill_switch(
+            r#"{"version": "v1", "rules": [],
+                "agent_access": {"agent": {"mode": "enforce", "ddl": "deny", "entries": []}},
+                "kill_switch": {"db_users": {"agent": {"block_id": "b-1", "target_type": "db_user",
+                    "message": "Vericto blocked this query [VERICTO-105]: stop"}}}}"#,
+        );
+        let ks = ks.expect("a block is in force");
+        let b = ks.for_user(Some("agent")).unwrap();
+        assert_eq!(b.block_id, "b-1");
+        assert_eq!(b.message, "Vericto blocked this query [VERICTO-105]: stop");
+        assert!(ks.for_user(Some("app")).is_none());
+        assert!(access.for_user("agent").is_some());
+
+        for extra in ["", r#", "kill_switch": null"#, r#", "kill_switch": {}"#] {
+            let (ks, _) =
+                applied_kill_switch(&format!(r#"{{"version": "v1", "rules": []{extra}}}"#));
+            assert!(ks.is_none(), "{extra:?} must clear the block");
+        }
+    }
+
+    /// A malformed `kill_switch` never refuses the bundle: its allowlists (the
+    /// deny-all of the blocked users among them) still apply, so the agents stay
+    /// blocked as VERICTO-087, as on a 4.17.x proxy.
+    #[test]
+    fn a_malformed_kill_switch_keeps_the_rest_of_the_bundle() {
+        let (ks, access) = applied_kill_switch(
+            r#"{"version": "v1", "rules": [],
+                "agent_access": {"agent": {"mode": "enforce", "ddl": "deny", "entries": []}},
+                "kill_switch": {"db_users": {"agent": {"block_id": 7}}}}"#,
+        );
+        assert!(ks.is_none());
+        assert!(access.for_user("agent").is_some());
+    }
+
     #[test]
     fn a_malformed_agent_access_policy_rejects_the_response() {
         let bad = r#"{"version": "v1", "rules": [], "agent_access": {"u": {"entries": [{"columns": "*"}]}}}"#;
@@ -1617,6 +1704,7 @@ mod tests {
                 ruleset.clone(),
                 Arc::new(ArcSwap::from_pointee(EnforcementPolicy::default())),
                 Arc::new(ArcSwap::from_pointee(AccessPolicyMap::default())),
+                SharedKillSwitch::default(),
                 Arc::new(ArcSwap::from_pointee(TelemetryQueryMode::default())),
                 policy_rules.clone(),
                 ready.clone(),
@@ -1833,6 +1921,7 @@ mod tests {
                     ruleset.clone(),
                     Arc::new(ArcSwap::from_pointee(EnforcementPolicy::default())),
                     Arc::new(ArcSwap::from_pointee(AccessPolicyMap::default())),
+                    SharedKillSwitch::default(),
                     Arc::new(ArcSwap::from_pointee(TelemetryQueryMode::default())),
                     sync.clone(),
                     ready.clone(),

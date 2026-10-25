@@ -106,6 +106,22 @@ impl WireProtocol for PostgresProtocol {
         with_replaced_query(m, sql).map(RawClientMessage::Postgres)
     }
 
+    /// Under a kill switch: Query and Parse, and Bind and Execute too (a statement
+    /// or portal prepared before the block must not run after it), FunctionCall
+    /// and any message not known to be plumbing. Describe, Close, Sync, Flush,
+    /// COPY data and authentication pass: they run nothing by themselves.
+    fn kill_switch_scope(&self, msg: &RawClientMessage) -> Option<QueryKind> {
+        let RawClientMessage::Postgres(m) = msg else {
+            return None;
+        };
+        match m.tag {
+            b'P' | b'B' | b'E' => Some(QueryKind::Prepared),
+            b'D' | b'C' | b'S' | b'H' | b'd' | b'c' | b'f' | b'p' | b'X' => None,
+            // Query, FunctionCall, anything unknown.
+            _ => Some(QueryKind::Simple),
+        }
+    }
+
     /// Under an allowlist, only the extended-protocol plumbing of a statement
     /// already evaluated at its Parse, COPY data, authentication messages and
     /// Terminate pass. A FunctionCall (`'F'`) calls a function by OID with no
@@ -174,10 +190,11 @@ impl WireProtocol for PostgresProtocol {
     }
 
     fn build_block_response(&self, ctx: &BlockContext) -> BlockResponse {
-        let err = build_error_response(
-            SQLSTATE_INSUFFICIENT_PRIVILEGE,
-            &block_message(ctx.rule_code, ctx.ast_node_path, ctx.suggested_safe_query),
-        );
+        let message = match ctx.message {
+            Some(m) => m.to_string(),
+            None => block_message(ctx.rule_code, ctx.ast_node_path, ctx.suggested_safe_query),
+        };
+        let err = build_error_response(SQLSTATE_INSUFFICIENT_PRIVILEGE, &message);
         match ctx.kind {
             QueryKind::Simple => {
                 // Simple protocol: ErrorResponse + ReadyForQuery, no skip.

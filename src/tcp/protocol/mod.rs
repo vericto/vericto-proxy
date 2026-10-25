@@ -98,6 +98,10 @@ pub struct BlockContext<'a> {
     pub rule_code: &'a str,
     pub ast_node_path: &'a str,
     pub suggested_safe_query: Option<&'a str>,
+    /// The client's error text in full, in place of the wording built from the
+    /// rule, path and suggestion: the kill switch's message (VERICTO-105), which
+    /// the control plane writes and every path returns verbatim.
+    pub message: Option<&'a str>,
     pub kind: QueryKind,
     /// Sequence id of the blocked message (MySQL needs command_seq + 1 for the
     /// reply; Postgres ignores this).
@@ -224,6 +228,15 @@ pub trait WireProtocol: Send + Sync {
     /// carry a rewrite: the session then blocks, because the only other thing it
     /// could forward is the unmasked original. Default: `None`.
     fn with_query(&self, _msg: &RawClientMessage, _sql: &str) -> Option<RawClientMessage> {
+        None
+    }
+
+    /// Whether an active kill switch (VERICTO-105) refuses this client message,
+    /// and with which reply shape: every message that runs a statement or reaches
+    /// the server beyond protocol plumbing, read or not, SQL or not. `None`:
+    /// forwarded (plumbing that runs nothing by itself, authentication,
+    /// Terminate). Default: refuse nothing.
+    fn kill_switch_scope(&self, _msg: &RawClientMessage) -> Option<QueryKind> {
         None
     }
 

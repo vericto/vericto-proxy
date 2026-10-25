@@ -147,6 +147,12 @@ pub struct TelemetryEvent {
     /// The session's `vericto.tenant`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_tenant: Option<String>,
+    /// The kill-switch block that refused the statement (VERICTO-105, since
+    /// 4.18.0): the `block_id` of the sync bundle's `kill_switch` entry, so the
+    /// control plane links the refusal to the block without inferring it from
+    /// the time. Omitted on every other event.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kill_switch_id: Option<String>,
 }
 
 /// One reference an agent-access allowlist denied, shaped for the ingest schema:
@@ -490,6 +496,7 @@ mod tests {
             policy_bundle_version: None,
             ticket_id: None,
             session_tenant: None,
+            kill_switch_id: None,
         }
     }
 

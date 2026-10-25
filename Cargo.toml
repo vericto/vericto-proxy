@@ -1,6 +1,6 @@
 [package]
 name = "vericto-proxy"
-version = "4.17.3"
+version = "4.18.0"
 edition = "2024"
 rust-version = "1.88"
 description = "Vericto — Deterministic SQL firewall — TCP wire-protocol proxy for customer infrastructure"
@@ -16,7 +16,7 @@ path = "src/main.rs"
 # AST engine, Vericto's own source-available library, under FSL-1.1-ALv2 like
 # the proxy from v4.3.0 on (earlier engine releases stay under the Elastic
 # License 2.0).
-vericto-engine = { git = "https://github.com/vericto/vericto-engine", tag = "v4.5.0" }
+vericto-engine = { git = "https://github.com/vericto/vericto-engine", tag = "v4.6.0" }
 
 # PostgreSQL query normalization for sanitized telemetry (literals → $1, $2…).
 # Same major version the engine uses, so libpg_query resolves to a single build.

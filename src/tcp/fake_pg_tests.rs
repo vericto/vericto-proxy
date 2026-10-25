@@ -1605,3 +1605,36 @@ async fn pipelined_groups_and_a_flush_through_coalesced_writes() {
         String::from_utf8_lossy(&tags)
     );
 }
+
+/// 4.18.0 on 4.17.3: an Execute that keeps a time-free verdict is still
+/// refused by the kill switch, which every Bind and Execute checks before any
+/// verdict (it is not part of the verdict the Execute reuses); the lift lets
+/// the statement run again.
+#[tokio::test]
+async fn the_kill_switch_refuses_a_statement_whose_time_free_verdict_is_reused() {
+    let (mut s, mut pg, cfg, queue) = policy_proxy(&[policy_rule(
+        "POL-FREE",
+        "deny_if: principal.type == \"agent\"",
+    )])
+    .await;
+    parse_complete(&mut s, &mut pg, "named", "SELECT 1").await;
+    execute_ok(&mut s, "named", None).await;
+    assert_eq!(evaluations_of(&queue, "SELECT 1"), 1);
+
+    let text = "Vericto blocked this query [VERICTO-105]: the kill switch blocks every statement of this agent (block ks-1).";
+    cfg.kill_switch.store(Some(Arc::new(
+        crate::tcp::kill_switch::KillSwitch::from_sync(Some(serde_json::json!({
+            "db_users": { "app": { "block_id": "ks-1", "target_type": "db_user", "message": text } }
+        })))
+        .unwrap(),
+    )));
+    s.write_all(&bind_execute_sync("portal", "named"))
+        .await
+        .unwrap();
+    let e = read_pg(&mut s).await;
+    assert_eq!(pg_error(&e.body), ("42501".to_string(), text.to_string()));
+    assert_eq!(read_pg(&mut s).await.tag, b'Z');
+
+    cfg.kill_switch.store(None);
+    execute_ok(&mut s, "named", None).await;
+}
