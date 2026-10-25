@@ -1486,8 +1486,6 @@ pub(crate) async fn relay_upstream_to_client(
     }
 }
 
-/// Sequence id needed to build a correctly-numbered reply (MySQL). Postgres has
-/// no per-message sequence, so it returns 0 (ignored by the pg block builder).
 /// What a kill-switch refusal of a message without readable SQL is reported as.
 fn kill_switch_label(msg: &RawClientMessage) -> String {
     match msg {
@@ -1511,6 +1509,8 @@ fn kill_switch_label(msg: &RawClientMessage) -> String {
     }
 }
 
+/// Sequence id needed to build a correctly-numbered reply (MySQL). Postgres has
+/// no per-message sequence, so it returns 0 (ignored by the pg block builder).
 fn message_seq(msg: &RawClientMessage) -> u8 {
     match msg {
         RawClientMessage::Mysql(p) => p.seq,
