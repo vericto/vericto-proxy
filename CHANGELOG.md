@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Performance
+
+- **Statements up to 1 KiB are evaluated on the connection's task, not on the
+  blocking pool** (`VERICTO_INLINE_EVAL_MAX_BYTES`, default 1024; `0` = every
+  statement on the pool, as up to 4.18.0). The pool cost two thread hand-offs per
+  statement: system calls per statement 9.9 -> 6.0 on PostgreSQL and 12.0 -> 8.0 on
+  MySQL (`strace -f -c`), user-space instructions -2.5% to -7.9% (callgrind gate),
+  and proxy CPU per transaction -26% (pgbench select-only, extended, 8 clients, one
+  worker; -33% with 1 client) and -41% (sysbench point select, MySQL text) in
+  interleaved local runs. Verdicts, forwarded bytes and telemetry are the same
+  either way (`inline_and_pool_evaluation_give_the_same_outcome`).
+
 ### Added
 
 - **CI performance gate** (`.github/workflows/perf-gate.yml`, `perf/callgrind-gate.sh`,

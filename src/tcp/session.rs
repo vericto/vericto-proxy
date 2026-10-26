@@ -921,18 +921,18 @@ pub async fn intercept_client_to_server(
                 }
 
                 // Evaluation is CPU-bound and synchronous, and so is the sanitize
-                // pass inside `report_telemetry`. Both run on the blocking pool:
-                // on the async reactor they stall the worker thread, freezing every
-                // other connection scheduled on it — a per-connection cost turning
-                // into a multi-tenant one. Measured hop cost is ~7 µs, negligible
-                // next to a database round trip.
+                // pass inside `report_telemetry`. A statement of at most
+                // `VERICTO_INLINE_EVAL_MAX_BYTES` is evaluated on this task (4.19.0):
+                // tens of microseconds, less than the two thread hand-offs of the
+                // blocking pool cost. A larger one runs on the blocking pool, where
+                // its parse cannot stall the other connections of this worker.
                 upstream.flush_answerable().await?;
                 let eval_start = Instant::now();
                 let (decision, eval_us) = {
                     let sql = sql.clone();
                     let dialect = proto.dialect();
                     let config = Arc::clone(config);
-                    tokio::task::spawn_blocking(move || {
+                    run_evaluation(config.inline_eval_max_bytes, sql.len(), move || {
                         let decision = match &policy_ctx {
                             // Policy rules on: the rules the bundle's policies were
                             // compiled from (the same ruleset once a sync ran).
@@ -1742,7 +1742,7 @@ async fn refresh_prepared(
     let evaluated_sql = original.clone();
     let config_for_task = Arc::clone(config);
     let snapshot = current.clone();
-    let decision = tokio::task::spawn_blocking(move || {
+    let decision = run_evaluation(config.inline_eval_max_bytes, original.len(), move || {
         let start = Instant::now();
         let decision = match (&snapshot.bundle, &snapshot.context) {
             (Some(bundle), Some(ctx)) => {
@@ -1818,6 +1818,32 @@ async fn refresh_prepared(
     } else {
         Ok(Some(decision))
     }
+}
+
+/// Runs an evaluation (`work`) of a statement of `sql_len` bytes: on the calling
+/// task when the statement is at most `inline_eval_max_bytes`
+/// (`PgProxyConfig::inline_eval_max_bytes`), on the blocking pool otherwise
+/// (always with `VERICTO_INLINE_EVAL_MAX_BYTES=0`, the behaviour up to 4.18.0).
+/// `Err` only when the pool's task panicked.
+pub(crate) async fn run_evaluation<T, F>(
+    inline_eval_max_bytes: usize,
+    sql_len: usize,
+    work: F,
+) -> Result<T, tokio::task::JoinError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    if evaluates_inline(inline_eval_max_bytes, sql_len) {
+        Ok(work())
+    } else {
+        tokio::task::spawn_blocking(work).await
+    }
+}
+
+/// Whether a statement of `sql_len` bytes is evaluated on the session's own task.
+fn evaluates_inline(inline_eval_max_bytes: usize, sql_len: usize) -> bool {
+    sql_len <= inline_eval_max_bytes && inline_eval_max_bytes > 0
 }
 
 fn stage_parse_action(

@@ -67,6 +67,10 @@ pub struct PgProxyConfig {
     /// Largest query this proxy will evaluate, already clamped to what the wire
     /// protocol can deliver. Resolved once at startup — see `tcp::query_limit`.
     pub max_query_bytes: usize,
+    /// Statements of at most this many bytes are evaluated on the session's own
+    /// task, larger ones on the blocking pool; 0 sends every statement to the pool
+    /// (`VERICTO_INLINE_EVAL_MAX_BYTES`, since 4.19.0; see `tcp::query_limit`).
+    pub inline_eval_max_bytes: usize,
     /// Business policy rules (`VERICTO_POLICY_RULES`, default off): the mode,
     /// the synced principals and compiled policies, the listener (since 4.15.0).
     pub policy_rules: crate::tcp::policy_rules::PolicyRulesRuntime,
@@ -147,7 +151,10 @@ async fn run_session(client: TcpStream, config: Arc<PgProxyConfig>) -> std::io::
         let config = Arc::clone(&config);
         let user = session_user.clone();
         let settings = startup.access_settings;
-        tokio::task::spawn_blocking(move || {
+        // As for statements (4.19.0): on this task when the `SET`s it evaluates are
+        // small, which includes the usual case of none at all.
+        let bytes = settings.iter().map(|(n, v)| n.len() + v.len() + 12).sum();
+        crate::tcp::session::run_evaluation(config.inline_eval_max_bytes, bytes, move || {
             crate::tcp::session::startup_settings_block(&config, user.as_deref(), &settings)
         })
         .await
@@ -2133,6 +2140,7 @@ mod tests {
             )),
             telemetry: None,
             max_query_bytes: crate::tcp::query_limit::DEFAULT_MAX_QUERY_BYTES,
+            inline_eval_max_bytes: crate::tcp::query_limit::DEFAULT_INLINE_EVAL_MAX_BYTES,
             policy_rules: Default::default(),
             cancel_keys: Default::default(),
         })

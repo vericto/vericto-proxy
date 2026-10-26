@@ -216,6 +216,7 @@ pub async fn run_pg_proxy(
             query_limit::configured_max_query_bytes(),
             vericto_engine::Dialect::Postgres,
         ),
+        inline_eval_max_bytes: query_limit::configured_inline_eval_max_bytes(),
         policy_rules: policy_runtime(&opts, policy_rules),
         cancel_keys: Default::default(),
     });
@@ -311,6 +312,7 @@ pub async fn run_mysql_proxy(
             query_limit::configured_max_query_bytes(),
             vericto_engine::Dialect::Mysql,
         ),
+        inline_eval_max_bytes: query_limit::configured_inline_eval_max_bytes(),
         policy_rules: policy_runtime(&opts, policy_rules),
         cancel_keys: Default::default(),
     });

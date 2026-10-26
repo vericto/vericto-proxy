@@ -380,3 +380,60 @@ async fn mysql_query_size_limit_refuses_one_byte_over() {
     assert!(msg.contains(OVERSIZE_RULE_CODE), "{msg}");
     assert_eq!(my_first_query_reaching_db(&mut w).await, "SELECT 1");
 }
+
+// ── Where a statement is evaluated (4.19.0) ──────────────────────────────────
+
+/// Up to the threshold the evaluation runs on the calling thread; above it, and
+/// for every statement with the threshold at 0, on the blocking pool.
+#[tokio::test]
+async fn run_evaluation_is_inline_up_to_the_threshold_and_on_the_pool_above() {
+    use crate::tcp::session::run_evaluation;
+    let here = std::thread::current().id();
+    let on = |max: usize, len: usize| async move {
+        run_evaluation(max, len, || std::thread::current().id())
+            .await
+            .expect("evaluation")
+    };
+    assert_eq!(on(1024, 0).await, here);
+    assert_eq!(on(1024, 1024).await, here, "at the threshold: inline");
+    assert_ne!(on(1024, 1025).await, here, "one byte over: the pool");
+    assert_ne!(on(0, 0).await, here, "0: always the pool");
+    assert_ne!(on(0, 10).await, here);
+}
+
+/// The same statements, evaluated inline or on the pool, give the same verdicts,
+/// the same bytes to the database and to the client, and the same events.
+#[tokio::test]
+async fn inline_and_pool_evaluation_give_the_same_outcome() {
+    fn stable(mut events: Vec<serde_json::Value>) -> Vec<serde_json::Value> {
+        for e in &mut events {
+            let o = e.as_object_mut().unwrap();
+            for k in ["event_id", "occurred_at", "latency_ms"] {
+                o.remove(k);
+            }
+        }
+        events
+    }
+    async fn run(inline_eval_max_bytes: usize) -> (Vec<Vec<u8>>, Vec<serde_json::Value>) {
+        let (cfg, queue) = proxy_config(EnforcementPolicy::default(), None);
+        let mut cfg = Arc::into_inner(cfg).expect("unshared config");
+        cfg.inline_eval_max_bytes = inline_eval_max_bytes;
+        let mut w = wire_with(Box::new(PostgresProtocol), Arc::new(cfg), queue);
+        let mut seen = Vec::new();
+        for sql in [SAFE, DANGEROUS, "BEGIN", "SELECT * FROM users", SAFE] {
+            w.client.write_all(&pg_query(sql)).await.unwrap();
+            if sql == DANGEROUS {
+                pg_expect_block(&mut w, "VERICTO-").await;
+                seen.push(b"blocked".to_vec());
+            } else {
+                seen.push(read_pg(&mut w.db).await.encode());
+            }
+        }
+        (seen, stable(events(&w.queue)))
+    }
+    let inline = run(crate::tcp::query_limit::DEFAULT_INLINE_EVAL_MAX_BYTES).await;
+    let pool = run(0).await;
+    assert_eq!(inline.0, pool.0);
+    assert_eq!(inline.1, pool.1);
+    assert_eq!(inline.1.len(), 5, "one event per statement");
+}

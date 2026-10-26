@@ -101,6 +101,7 @@ pub(super) fn config_with(
             database_id: "00000000-0000-0000-0000-000000000001".to_string(),
         }),
         max_query_bytes: crate::tcp::query_limit::DEFAULT_MAX_QUERY_BYTES,
+        inline_eval_max_bytes: crate::tcp::query_limit::DEFAULT_INLINE_EVAL_MAX_BYTES,
         policy_rules: Default::default(),
         cancel_keys: Default::default(),
     });
