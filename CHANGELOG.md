@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **CI performance gate** (`.github/workflows/perf-gate.yml`, `perf/callgrind-gate.sh`,
+  `examples/perf_gate.rs`, docs/PERFORMANCE.md): every pull request measures the
+  user-space instructions per statement of its head and its base under callgrind, on
+  15 workloads of both dialects (trivial, OLTP over every protocol, a 2,000-row
+  result, a connection per statement, a policy-heavy mix with masks, an allowlist,
+  a business policy and sanitized telemetry), and fails when one grows by more than 3%
+  (`PERF_GATE_THRESHOLD_PCT`) or when any statement of the corpus is answered
+  differently. Repeated runs agree within 0.3%; on 4.17.0 -> 4.17.1 the gate reports
+  the #89 regression (+4.3% to +1,683% on the PostgreSQL workloads).
+
 ## [4.18.0] - 2026-10-25
 
 **The kill switch is VERICTO-105 on the wire, for every statement.** Up to 4.17.x a

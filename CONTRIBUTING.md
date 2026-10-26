@@ -128,6 +128,9 @@ here forward is English.
 ## Pull request acceptance criteria
 
 - ✅ CI passes (`fmt`, `clippy -D warnings`, `cargo test`).
+- ✅ The performance gate passes: no workload of the corpus costs more than 3%
+  more instructions per statement than the base, and every statement is answered
+  as before ([docs/PERFORMANCE.md](docs/PERFORMANCE.md#ci-performance-gate)).
 - ✅ The Contributor License Agreement is signed.
 - ✅ New rules include both a blocked-case and an allowed-case test.
 - ✅ At least one maintainer review.
