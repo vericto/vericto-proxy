@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Performance
 
+- **mimalloc is the global allocator** (the default `mimalloc` cargo feature;
+  `--no-default-features` keeps the system allocator). Callgrind gate against
+  glibc's malloc: -2.1% to -3.3% instructions per statement on the PostgreSQL OLTP
+  and large-result workloads, -10.8% / -14.9% on `pg trivial_cp` / `pg policy_mix`,
+  -6.7% to -28.2% on every MySQL workload. jemalloc measured the same within a
+  point and was not taken (needs `make`; bundles BSD-2-Clause sources the license
+  policy does not list). Peak RSS about 7 MB higher (17 to 18 MB under 8 to 64
+  connections). Cargo.lock: `mimalloc` 0.1.52 and `libmimalloc-sys` 0.1.49 (MIT).
 - **Sanitized telemetry events are built off the query path**
   (`VERICTO_TELEMETRY_BUILD_QUEUE`, default 4096 waiting events; `0` = on the query
   path, as up to 4.18.0). The second normalization of the query text (libpg_query /

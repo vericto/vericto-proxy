@@ -22,6 +22,12 @@
 // No `unsafe` in the proxy itself; keep it that way without a reviewed opt-out.
 #![forbid(unsafe_code)]
 
+// The global allocator (4.19.0): mimalloc unless built with
+// `--no-default-features`, which keeps the system allocator.
+#[cfg(feature = "mimalloc")]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 mod config;
 mod runtime_sizing;
 mod tcp;

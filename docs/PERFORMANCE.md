@@ -108,3 +108,38 @@ with `--cap-add SYS_PTRACE`). The whole run takes under a minute per build.
 System calls per statement, which callgrind does not count: run the proxy under
 `strace -f -c -o out` with the driver at two statement counts and take the
 difference.
+
+## Allocator
+
+Since 4.19.0 the proxy is built with [mimalloc](https://github.com/microsoft/mimalloc)
+as its global allocator (the default `mimalloc` cargo feature;
+`cargo build --release --no-default-features` keeps the system allocator). The
+image is glibc-based (Chainguard `glibc-dynamic`), so the comparison is against
+glibc's malloc; there is no musl build.
+
+Measured with the callgrind gate on the same code (2026-10-26, linux/arm64,
+instructions per statement, change against glibc):
+
+| workload | mimalloc | jemalloc (tikv-jemallocator 0.6) |
+|---|---:|---:|
+| pg trivial | -2.2% | -2.9% |
+| pg oltp_simple / oltp_extended | -2.9% / -3.3% | -3.3% / -3.6% |
+| pg oltp_prepared | -0.3% | -2.6% |
+| pg large_result | -2.1% | -2.8% |
+| pg policy_mix / trivial_cp | -14.9% / -10.8% | -15.1% / -10.0% |
+| mysql trivial | -8.3% | -8.5% |
+| mysql oltp_text / oltp_prepared | -14.0% / -6.7% | -11.3% / -6.4% |
+| mysql large_result | -15.3% | -16.9% |
+| mysql policy_mix / trivial_cp | -28.2% / -17.0% | -26.5% / -16.8% |
+
+Peak resident memory under pgbench / sysbench with 8 and 64 connections and two
+workers: glibc 9.1 to 11.1 MB, mimalloc 17.1 to 18.1 MB, jemalloc 10.3 to
+12.0 MB.
+
+jemalloc and mimalloc save about the same instructions. mimalloc was chosen: it
+builds with the C compiler alone (jemalloc needs `make` and its configure script in
+the builder image) and its sources are MIT like the crate, while the jemalloc
+sources tikv-jemalloc-sys bundles are BSD-2-Clause, a license the dependency policy
+(`deny.toml`, `third-party/about.toml`) does not list and the crate's own
+`MIT/Apache-2.0` metadata does not declare. The cost is about 7 MB more resident
+memory per process, which no supported task size notices.
