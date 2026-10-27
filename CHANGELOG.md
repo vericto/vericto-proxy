@@ -7,14 +7,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Security
+## [4.19.0] - 2026-10-26
 
-- **Runtime image base `cgr.dev/chainguard/glibc-dynamic:latest` pinned to its
-  current digest** (`sha256:5bb932663cff…`, from `2827063c9efb…`, the Dependabot
-  bump merged in #92), in the Dockerfile and Dockerfile.local.
+**Less CPU per statement, with nothing answered differently.** A statement is
+evaluated on its connection's task instead of being handed to the blocking pool
+and back, the trivial statements of every transaction (`BEGIN`, `COMMIT`,
+`SELECT 1`…) reuse the decision their session's full evaluation reached for them,
+sanitized telemetry is built off the query path, the allocator is mimalloc, MySQL
+reads a command in one system call, the database hop keeps one TLS configuration
+(and resumes MySQL sessions), and the published images are built with
+profile-guided optimization. Every change keeps verdicts, forwarded bytes and
+telemetry as they were (the per-change tests say how), and a new CI gate fails a
+pull request that costs more than 3% more instructions per statement on any of
+15 workloads, or answers any statement of its corpus differently. Measured
+against 4.18.0 with that gate (callgrind, linux/arm64, one worker, same corpus):
+
+| workload | PostgreSQL | MySQL |
+|---|---:|---:|
+| `trivial` (`BEGIN`, `SELECT 1`, `COMMIT`) | -87.5% | -82.0% |
+| TPC-B transaction, text / extended protocol | -13.5% / -13.3% | -27.8% (text) |
+| TPC-B, prepared statements | +0.3% | -63.7% |
+| 2,000-row result | -3.2% | -19.3% |
+| a connection per statement | -12.9% | -17.0% |
+| policy mix, control plane on, sanitized telemetry | -15.5% | -28.8% |
+| `trivial` with the control plane on | -12.8% | -19.3% |
+
+With the release images' profile-guided optimization on top: -89.2% / -16.0% /
+-16.1% / -15.4% / -8.6% / -15.8% / -18.5% / -17.7% on PostgreSQL and -84.5% /
+-37.2% / -69.4% / -27.6% / -22.2% / -39.6% / -25.8% on MySQL, in the same order.
+System calls per statement: 9.9 -> 6.0 (PostgreSQL), 12.0 -> 6.0 (MySQL). Every
+statement of the corpus is answered exactly as 4.18.0 answers it (equal outcome
+digests on all 15 workloads). Instruction counts leave out the kernel, memory
+stalls and contention: the CPU per transaction on the EC2 bench is the release
+criterion.
 
 ### Performance
 
+- **Statements up to 1 KiB are evaluated on the connection's task, not on the
+  blocking pool** (`VERICTO_INLINE_EVAL_MAX_BYTES`, default 1024; `0` = every
+  statement on the pool, as up to 4.18.0). The pool cost two thread hand-offs per
+  statement: system calls per statement 9.9 -> 6.0 on PostgreSQL and 12.0 -> 8.0 on
+  MySQL (`strace -f -c`), user-space instructions -2.5% to -7.9% (callgrind gate),
+  and proxy CPU per transaction -26% (pgbench select-only, extended, 8 clients, one
+  worker; -33% with 1 client) and -41% (sysbench point select, MySQL text) in
+  interleaved local runs. Verdicts, forwarded bytes and telemetry are the same
+  either way (`inline_and_pool_evaluation_give_the_same_outcome`). The check of the
+  StartupMessage's settings takes the same way, so a connection no longer hands
+  its start-up to the pool either (futex calls per PostgreSQL connection 6 -> 4).
 - **Trivial statements reuse their session's earlier decision**
   (`VERICTO_TRIVIAL_FAST_PATH`, default `on`; `src/tcp/fast_path.rs`). `BEGIN`,
   `COMMIT`, `ROLLBACK`, `END`, `START TRANSACTION`, `SELECT 1`, `SET autocommit=0/1`
@@ -36,45 +75,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `oltp_simple`, -11.1% on `mysql oltp_text`, -57.2% on `mysql oltp_prepared`
   (BEGIN and COMMIT as text), +1% on `connect` (the first `SELECT 1` of each
   session is kept).
-- **The published images are built with profile-guided optimization**
-  (`release.yml`, `perf/pgo-train.sh`, docs/PERFORMANCE.md "PGO"). Each
-  architecture's runner trains a profile on the performance gate's corpus
-  (PostgreSQL 17 and MySQL 8.0 service containers) and the image build uses it
-  for every Rust crate (`--build-context pgo=…`; without it `docker build .` is the
-  plain build, as before). Callgrind gate, image binaries with and without the
-  profile (linux/arm64): -3.0% to -15.8% instructions per statement on PostgreSQL,
-  -6.5% to -15.4% on MySQL; trained without four of the workloads, those four
-  still gain -0.5% to -10.5%. Release build time per architecture: plus one
-  instrumented build and about a minute of training, and the dependency layer is
-  rebuilt each release. Code generation stays generic: the images run on any
-  x86_64 / aarch64 CPU. `lto = "fat"` was measured and not taken (-0.75% median,
-  2.5 times the crate's build time).
-- **The database hop reuses one TLS client configuration**, rebuilt only when
-  `UPSTREAM_SSLROOTCERT`, `UPSTREAM_SSLCERT` or `UPSTREAM_SSLKEY` changes (inode,
-  size and modification time are checked per connection, so a rotated file applies
-  from the next connection, as before). Up to 4.18.0 each connection read the
-  files and built a configuration of its own, which also discarded rustls' session
-  cache: no connection could resume the TLS session of an earlier one. Callgrind,
-  one connection per statement: -14.8% of the proxy's connection cost with
-  `UPSTREAM_SSLMODE=require`, -8.7% with `verify-full` (PostgreSQL 17, which
-  disables resumption), -9.3% with TLS on both MySQL hops, where every connection
-  after the first now resumes (MySQL 8.0.46 `Ssl_session_cache_hits` 0 -> 63 of 63).
-- **MySQL: the client is read through a 16 KiB buffer, into one reused packet
-  buffer** (`codec_mysql::read_packet_into`), as PostgreSQL is since 4.17.3. A
-  command cost two reads of the socket (header, then payload) and one allocation;
-  it now costs one read and none. Each packet is still forwarded and flushed on its
-  own (nothing is coalesced upstream), now from the sender's reused buffer instead
-  of a new `Vec` per packet. System calls per statement 8.0 -> 6.0
-  (`strace -f -c`, COM_QUERY and COM_STMT_EXECUTE), instructions -0.2% to -5.2% on
-  the MySQL workloads of the gate.
-- **mimalloc is the global allocator** (the default `mimalloc` cargo feature;
-  `--no-default-features` keeps the system allocator). Callgrind gate against
-  glibc's malloc: -2.1% to -3.3% instructions per statement on the PostgreSQL OLTP
-  and large-result workloads, -10.8% / -14.9% on `pg trivial_cp` / `pg policy_mix`,
-  -6.7% to -28.2% on every MySQL workload. jemalloc measured the same within a
-  point and was not taken (needs `make`; bundles BSD-2-Clause sources the license
-  policy does not list). Peak RSS about 7 MB higher (17 to 18 MB under 8 to 64
-  connections). Cargo.lock: `mimalloc` 0.1.52 and `libmimalloc-sys` 0.1.49 (MIT).
 - **Sanitized telemetry events are built off the query path**
   (`VERICTO_TELEMETRY_BUILD_QUEUE`, default 4096 waiting events; `0` = on the query
   path, as up to 4.18.0). The second normalization of the query text (libpg_query /
@@ -91,30 +91,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   +0.6% to +1.8%. Raw-mode events stay on the query path (deferring them saved less
   than the hand-over costs). Export batches were already gzip-compressed
   (`VERICTO_TELEMETRY_GZIP`).
-- **Statements up to 1 KiB are evaluated on the connection's task, not on the
-  blocking pool** (`VERICTO_INLINE_EVAL_MAX_BYTES`, default 1024; `0` = every
-  statement on the pool, as up to 4.18.0). The pool cost two thread hand-offs per
-  statement: system calls per statement 9.9 -> 6.0 on PostgreSQL and 12.0 -> 8.0 on
-  MySQL (`strace -f -c`), user-space instructions -2.5% to -7.9% (callgrind gate),
-  and proxy CPU per transaction -26% (pgbench select-only, extended, 8 clients, one
-  worker; -33% with 1 client) and -41% (sysbench point select, MySQL text) in
-  interleaved local runs. Verdicts, forwarded bytes and telemetry are the same
-  either way (`inline_and_pool_evaluation_give_the_same_outcome`).
+- **mimalloc is the global allocator** (the default `mimalloc` cargo feature;
+  `--no-default-features` keeps the system allocator). Callgrind gate against
+  glibc's malloc: -2.1% to -3.3% instructions per statement on the PostgreSQL OLTP
+  and large-result workloads, -10.8% / -14.9% on `pg trivial_cp` / `pg policy_mix`,
+  -6.7% to -28.2% on every MySQL workload. jemalloc measured the same within a
+  point and was not taken (needs `make`; bundles BSD-2-Clause sources the license
+  policy does not list). Peak RSS about 7 MB higher (17 to 18 MB under 8 to 64
+  connections). Cargo.lock: `mimalloc` 0.1.52 and `libmimalloc-sys` 0.1.49 (MIT).
+- **MySQL: the client is read through a 16 KiB buffer, into one reused packet
+  buffer** (`codec_mysql::read_packet_into`), as PostgreSQL is since 4.17.3. A
+  command cost two reads of the socket (header, then payload) and one allocation;
+  it now costs one read and none. Each packet is still forwarded and flushed on its
+  own (nothing is coalesced upstream), now from the sender's reused buffer instead
+  of a new `Vec` per packet. System calls per statement 8.0 -> 6.0
+  (`strace -f -c`, COM_QUERY and COM_STMT_EXECUTE), instructions -0.2% to -5.2% on
+  the MySQL workloads of the gate.
+- **The database hop reuses one TLS client configuration**, rebuilt only when
+  `UPSTREAM_SSLROOTCERT`, `UPSTREAM_SSLCERT` or `UPSTREAM_SSLKEY` changes (inode,
+  size and modification time are checked per connection, so a rotated file applies
+  from the next connection, as before). Up to 4.18.0 each connection read the
+  files and built a configuration of its own, which also discarded rustls' session
+  cache: no connection could resume the TLS session of an earlier one. Callgrind,
+  one connection per statement: -14.8% of the proxy's connection cost with
+  `UPSTREAM_SSLMODE=require`, -8.7% with `verify-full` (PostgreSQL 17, which
+  disables resumption), -9.3% with TLS on both MySQL hops, where every connection
+  after the first now resumes (MySQL 8.0.46 `Ssl_session_cache_hits` 0 -> 63 of 63).
+- **The published images are built with profile-guided optimization**
+  (`release.yml`, `perf/pgo-train.sh`, docs/PERFORMANCE.md "PGO"). Each
+  architecture's runner trains a profile on the performance gate's corpus
+  (PostgreSQL 17 and MySQL 8.0 service containers) and the image build uses it
+  for every Rust crate (`--build-context pgo=…`; without it `docker build .` is the
+  plain build, as before). Callgrind gate, image binaries with and without the
+  profile (linux/arm64): -3.0% to -15.8% instructions per statement on PostgreSQL,
+  -6.5% to -15.4% on MySQL; trained without four of the workloads, those four
+  still gain -0.5% to -10.5%. Release build time per architecture: plus one
+  instrumented build and about a minute of training, and the dependency layer is
+  rebuilt each release. Code generation stays generic: the images run on any
+  x86_64 / aarch64 CPU. `lto = "fat"` was measured and not taken (-0.75% median,
+  2.5 times the crate's build time).
 
 ### Added
 
-- **`TARGET_CPU` Docker build argument** (opt-in, empty by default): CPU-specific
-  code generation for an image of one's own (e.g. `neoverse-v1` for Graviton3). The
-  published images do not use it.
-- **ECDSA P-256 certificates are documented as the preferred kind** for
-  `PROXY_TLS_CERT` (docs/CONFIGURATION.md, "Certificates, resumption and TLS cost"):
-  a full handshake costs the proxy about 0.1 ms of CPU with one, 0.7 to 1.2 ms with
-  RSA-2048. They already worked (PKCS#8 or SEC1 keys); a test now terminates TLS
-  with one end to end and checks that a client that offers its session back
-  resumes it (the listener's 256-session cache and TLS 1.3 tickets, unchanged).
-  docs/PERFORMANCE.md has the TLS measurements, why the crypto provider stays
-  `ring` (aws-lc-rs measured: no gain on ECDSA or bulk, slower RSA on arm64), and a
-  design note on kernel TLS (not implemented).
 - **CI performance gate** (`.github/workflows/perf-gate.yml`, `perf/callgrind-gate.sh`,
   `examples/perf_gate.rs`, docs/PERFORMANCE.md): every pull request measures the
   user-space instructions per statement of its head and its base under callgrind, on
@@ -124,6 +142,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`PERF_GATE_THRESHOLD_PCT`) or when any statement of the corpus is answered
   differently. Repeated runs agree within 0.3%; on 4.17.0 -> 4.17.1 the gate reports
   the #89 regression (+4.3% to +1,683% on the PostgreSQL workloads).
+- **ECDSA P-256 certificates are documented as the preferred kind** for
+  `PROXY_TLS_CERT` (docs/CONFIGURATION.md, "Certificates, resumption and TLS cost"):
+  a full handshake costs the proxy about 0.1 ms of CPU with one, 0.7 to 1.2 ms with
+  RSA-2048. They already worked (PKCS#8 or SEC1 keys); a test now terminates TLS
+  with one end to end and checks that a client that offers its session back
+  resumes it (the listener's 256-session cache and TLS 1.3 tickets, unchanged).
+  docs/PERFORMANCE.md has the TLS measurements, why the crypto provider stays
+  `ring` (aws-lc-rs measured: no gain on ECDSA or bulk, slower RSA on arm64), and a
+  design note on kernel TLS (not implemented).
+- **`TARGET_CPU` Docker build argument** (opt-in, empty by default): CPU-specific
+  code generation for an image of one's own (e.g. `neoverse-v1` for Graviton3). The
+  published images do not use it.
+
+### Security
+
+- **Runtime image base `cgr.dev/chainguard/glibc-dynamic:latest` pinned to its
+  current digest** (`sha256:5bb932663cff…`, from `2827063c9efb…`, the Dependabot
+  bump merged in #92), in the Dockerfile and Dockerfile.local.
 
 ## [4.18.0] - 2026-10-25
 
