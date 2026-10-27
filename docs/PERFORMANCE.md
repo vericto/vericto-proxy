@@ -109,6 +109,81 @@ System calls per statement, which callgrind does not count: run the proxy under
 `strace -f -c -o out` with the driver at two statement counts and take the
 difference.
 
+## Release build
+
+### Profile-guided optimization (PGO)
+
+The published images (since 4.19.0) are built with a profile of the proxy
+running the performance gate's corpus. `release.yml` builds this commit with
+`-Cprofile-generate` on each architecture's runner, runs every workload of
+`examples/perf_gate.rs` against it natively with PostgreSQL 17 and MySQL 8.0
+service containers (`perf/pgo-train.sh`: a proxy per dialect and control-plane
+setting, two workers, 3,000 statements per workload), merges the profiles with
+`llvm-profdata`, and hands the result to the image build as the `pgo` named
+context. The Dockerfile passes `-Cprofile-use` to every Rust crate (the
+dependencies and the proxy); the C code (libpg_query, mimalloc) is compiled as
+before. Without the context, `docker build .` is the plain release build, as
+before.
+
+Measured with the callgrind gate (2026-10-26, linux/arm64, instructions per
+statement against the same commit without PGO):
+
+| workload | trained on the whole corpus | trained without the four workloads marked * |
+|---|---:|---:|
+| pg trivial / trivial_cp | -5.0% / -5.7% | -4.9% / -5.7% |
+| pg oltp_simple | -3.0% | -2.9% |
+| pg oltp_extended * | -3.7% | -2.7% |
+| pg oltp_prepared * | -18.9% | -10.5% |
+| pg large_result / connect | -6.0% / -3.8% | -5.9% / -4.1% |
+| pg policy_mix * | -3.4% | -0.5% |
+| mysql trivial / trivial_cp | -7.2% / -8.6% | -7.1% / -8.6% |
+| mysql oltp_text * | -11.9% | -10.3% |
+| mysql oltp_prepared | -9.5% | -9.3% |
+| mysql large_result / connect | -14.4% / -6.8% | -13.3% / -6.7% |
+| mysql policy_mix * | -14.8% | -9.1% |
+
+The second column is the honest one for traffic unlike the corpus: a profile
+still helps statements it was not trained on, by less. Instruction counts
+understate PGO, whose code-layout gains show as fewer cache misses and
+mispredicted branches rather than fewer instructions; the EC2 bench measures
+the CPU. The PostgreSQL gains are the smaller ones because most of a PostgreSQL
+statement is libpg_query's C code (its parser and the protobuf round trip of
+its parse tree), which the Rust profile does not reach.
+
+Cost: the instrumented build (about the time of a release build) and a minute
+of training per architecture, and the image's dependency layer is rebuilt on
+every release (the profile is part of its inputs). Locally, with a profile in
+`./pgo/merged.profdata`:
+
+```sh
+docker buildx build --build-context pgo=./pgo -t vericto-proxy:pgo .
+```
+
+### Link-time optimization
+
+`lto = "thin"` stays. `lto = "fat"` (with `codegen-units = 1`, already set) was
+measured on the same commit: +0.2% to -2.9% instructions per statement (median
+-0.75%), a 5% smaller binary, but the proxy crate's release build took 286 s
+instead of 113 s (crate only, dependencies built; 467 s from scratch) and 3.6 GB
+of memory instead of 2.2 GB. The gate builds two release binaries per pull
+request, so fat LTO would add about 6 minutes to every pull request for a gain
+smaller than the threshold the gate enforces.
+
+### CPU-specific code (opt-in)
+
+The published images and binaries use the default target CPU and run on any
+x86_64 or aarch64 machine. A build for one CPU family is opt-in:
+
+```sh
+docker buildx build --build-arg TARGET_CPU=neoverse-v1 -t vericto-proxy:graviton3 .
+```
+
+Such an image fails with an illegal instruction on older CPUs, so it must never
+replace the published tags; publish it, if at all, under a tag of its own.
+Whether it pays off has not been measured: valgrind 3.19 cannot run Neoverse
+code (it stops at the first `LDAPR`), so the comparison has to be made on the
+EC2 bench (Graviton3, `TARGET_CPU=neoverse-v1` against the default build).
+
 ## Allocator
 
 Since 4.19.0 the proxy is built with [mimalloc](https://github.com/microsoft/mimalloc)

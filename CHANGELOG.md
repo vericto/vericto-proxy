@@ -15,6 +15,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Performance
 
+- **The published images are built with profile-guided optimization**
+  (`release.yml`, `perf/pgo-train.sh`, docs/PERFORMANCE.md "PGO"). Each
+  architecture's runner trains a profile on the performance gate's corpus
+  (PostgreSQL 17 and MySQL 8.0 service containers) and the image build uses it
+  for every Rust crate (`--build-context pgo=…`; without it `docker build .` is the
+  plain build, as before). Callgrind gate, image binaries with and without the
+  profile (linux/arm64): -3.0% to -15.8% instructions per statement on PostgreSQL,
+  -6.5% to -15.4% on MySQL; trained without four of the workloads, those four
+  still gain -0.5% to -10.5%. Release build time per architecture: plus one
+  instrumented build and about a minute of training, and the dependency layer is
+  rebuilt each release. Code generation stays generic: the images run on any
+  x86_64 / aarch64 CPU. `lto = "fat"` was measured and not taken (-0.75% median,
+  2.5 times the crate's build time).
 - **The database hop reuses one TLS client configuration**, rebuilt only when
   `UPSTREAM_SSLROOTCERT`, `UPSTREAM_SSLCERT` or `UPSTREAM_SSLKEY` changes (inode,
   size and modification time are checked per connection, so a rotated file applies
@@ -69,6 +82,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`TARGET_CPU` Docker build argument** (opt-in, empty by default): CPU-specific
+  code generation for an image of one's own (e.g. `neoverse-v1` for Graviton3). The
+  published images do not use it.
 - **ECDSA P-256 certificates are documented as the preferred kind** for
   `PROXY_TLS_CERT` (docs/CONFIGURATION.md, "Certificates, resumption and TLS cost"):
   a full handshake costs the proxy about 0.1 ms of CPU with one, 0.7 to 1.2 ms with
