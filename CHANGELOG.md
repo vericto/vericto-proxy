@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Performance
 
+- **The database hop reuses one TLS client configuration**, rebuilt only when
+  `UPSTREAM_SSLROOTCERT`, `UPSTREAM_SSLCERT` or `UPSTREAM_SSLKEY` changes (inode,
+  size and modification time are checked per connection, so a rotated file applies
+  from the next connection, as before). Up to 4.18.0 each connection read the
+  files and built a configuration of its own, which also discarded rustls' session
+  cache: no connection could resume the TLS session of an earlier one. Callgrind,
+  one connection per statement: -14.8% of the proxy's connection cost with
+  `UPSTREAM_SSLMODE=require`, -8.7% with `verify-full` (PostgreSQL 17, which
+  disables resumption), -9.3% with TLS on both MySQL hops, where every connection
+  after the first now resumes (MySQL 8.0.46 `Ssl_session_cache_hits` 0 -> 63 of 63).
 - **MySQL: the client is read through a 16 KiB buffer, into one reused packet
   buffer** (`codec_mysql::read_packet_into`), as PostgreSQL is since 4.17.3. A
   command cost two reads of the socket (header, then payload) and one allocation;
@@ -53,6 +63,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **ECDSA P-256 certificates are documented as the preferred kind** for
+  `PROXY_TLS_CERT` (docs/CONFIGURATION.md, "Certificates, resumption and TLS cost"):
+  a full handshake costs the proxy about 0.1 ms of CPU with one, 0.7 to 1.2 ms with
+  RSA-2048. They already worked (PKCS#8 or SEC1 keys); a test now terminates TLS
+  with one end to end and checks that a client that offers its session back
+  resumes it (the listener's 256-session cache and TLS 1.3 tickets, unchanged).
+  docs/PERFORMANCE.md has the TLS measurements, why the crypto provider stays
+  `ring` (aws-lc-rs measured: no gain on ECDSA or bulk, slower RSA on arm64), and a
+  design note on kernel TLS (not implemented).
 - **CI performance gate** (`.github/workflows/perf-gate.yml`, `perf/callgrind-gate.sh`,
   `examples/perf_gate.rs`, docs/PERFORMANCE.md): every pull request measures the
   user-space instructions per statement of its head and its base under callgrind, on

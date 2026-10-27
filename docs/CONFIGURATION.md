@@ -218,6 +218,37 @@ hop; `PROXY_TLS_MODE` covers the client→proxy hop.
 > leave both off). See
 > [engine-specific notes](#engine-specific-notes).
 
+### Certificates, resumption and TLS cost
+
+- **Prefer ECDSA P-256 certificates** for `PROXY_TLS_CERT` (and for the database,
+  where you choose). The key may be PKCS#8 (`BEGIN PRIVATE KEY`, what
+  `openssl genpkey` and most CAs give) or SEC1 (`BEGIN EC PRIVATE KEY`); RSA keys
+  (PKCS#8 or PKCS#1) keep working. A full TLS 1.3 handshake costs the proxy, as the
+  server, about 0.1 ms of CPU with an ECDSA P-256 certificate against 0.7 to
+  1.2 ms with RSA-2048 (measured in process, linux/arm64, 2026-10-26): with
+  clients that connect often, the certificate type is most of the TLS cost. Bulk
+  encryption (AES-256-GCM, about 1.8 to 2 GB/s per core) does not depend on it.
+- **Session resumption on the client listener** is on: the proxy keeps the last
+  256 TLS sessions in memory and gives TLS 1.3 clients tickets that refer to them
+  (no ticket key to protect). A client that offers its session back skips the
+  certificate signature: about 0.08 ms instead of 0.1 ms with ECDSA, instead of
+  0.7 ms or more with RSA. Whether a client resumes is up to its driver: the JDK
+  (pgJDBC, Connector/J) does; libpq and most Go and Python drivers start every
+  connection with a full handshake.
+- **The database hop** (4.19.0) reuses one rustls client configuration for every
+  connection while `UPSTREAM_SSLROOTCERT`, `UPSTREAM_SSLCERT` and
+  `UPSTREAM_SSLKEY` are unchanged (checked by inode, size and modification time
+  on each connection, so a rotated file applies from the next connection as
+  before). That saves rebuilding the configuration per connection (-15% of the
+  proxy's connection cost with `require`, -9% with `verify-full`), and lets a
+  connection resume the TLS session of an earlier one where the database supports
+  it: MySQL 8.0.29+ does (`Ssl_session_cache_hits` counts them), PostgreSQL
+  disables resumption on its side.
+- The crypto provider is rustls' `ring`. `aws-lc-rs` was measured as well
+  (2026-10-26, linux/arm64): the same ECDSA P-256 handshake and bulk cost within
+  the noise, a slower RSA-2048 handshake (1.1 to 1.2 ms against 0.7 ms), so the
+  provider was not changed.
+
 ## Query size limit
 
 | Variable                  | Default              | Description                                   |

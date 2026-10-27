@@ -143,3 +143,58 @@ sources tikv-jemalloc-sys bundles are BSD-2-Clause, a license the dependency pol
 (`deny.toml`, `third-party/about.toml`) does not list and the crate's own
 `MIT/Apache-2.0` metadata does not declare. The cost is about 7 MB more resident
 memory per process, which no supported task size notices.
+
+## TLS
+
+What a TLS connection costs and the settings that change it are in
+[CONFIGURATION.md, "Certificates, resumption and TLS cost"](CONFIGURATION.md#certificates-resumption-and-tls-cost).
+The measurements behind it: an in-process rustls benchmark (handshake server and
+client side, resumed handshakes with tickets and with the session cache, 64 MiB
+of 16 KiB records encrypted and decrypted), both providers, ECDSA P-256 and
+RSA-2048 certificates, best of 9 rounds of 300 handshakes on linux/arm64; and the
+`connect` workload of the gate (a connection per statement) with
+`PERF_PROXY_ENV="UPSTREAM_SSLMODE=require"` against a PostgreSQL with `ssl=on`,
+and with TLS on both MySQL hops (`PERF_CLIENT_TLS=1`,
+`PROXY_TLS_MODE=require`).
+
+### Kernel TLS (not implemented)
+
+kTLS hands the record layer of an established connection to the kernel: after
+the handshake, user space installs the traffic keys on the socket
+(`setsockopt(SOL_TLS, TLS_TX / TLS_RX)`) and then reads and writes plaintext; the
+kernel encrypts and decrypts, and with a NIC that supports TLS offload, the NIC
+does. What it would take here:
+
+- **Library support.** rustls exports the secrets for it
+  (`ServerConfig::enable_secret_extraction`,
+  `Connection::dangerous_extract_secrets`), but the proxy would own the
+  `setsockopt` calls (`unsafe`, which the crate forbids today, or a dependency
+  such as `ktls` that does it) and the sequence numbers.
+- **What the kernel cannot do.** TLS 1.3 KeyUpdate and post-handshake messages
+  (session tickets, which the listener sends) arrive as control records that
+  user space must handle with `recvmsg` and `cmsg`; rustls expects to see them.
+  TLS 1.3 RX offload needs Linux 5.10 or later, and the cipher suite must be one
+  the kernel has (AES-GCM, ChaCha20-Poly1305 since 5.11).
+- **Where it applies.** Only to the hop the proxy relays without reading: the
+  database to client direction of large results. Every frontend message must
+  still be decrypted in user space, because it is parsed and evaluated. The
+  relay copies the response bytes once; with kTLS on both sockets of that
+  direction (and `splice` between them) the copy goes away and the AES-GCM work
+  moves to the kernel or, with offload, to the NIC.
+- **Expected gain.** Measured with the gate's `large_result` workload on MySQL
+  (2,000 rows, about 200 KB per statement): 133,000 user-space instructions per
+  statement in plaintext, 1,550,000 with TLS on both hops. Decrypting the
+  database's records and encrypting them again for the client is about 90% of
+  what a large result costs the proxy. Software kTLS moves that work into the
+  kernel rather than removing it (the kernel's AES-GCM uses the same CPU
+  instructions), so its gain is the user-space copy and some system calls, a few
+  percent; only a NIC with TLS offload takes the cryptography off the CPU, and
+  then the gain on large results approaches that 90%. For OLTP traffic (small
+  responses) the gain is negligible either way.
+- **Risk.** A second code path for every read and write of a TLS session, kernel
+  version and NIC dependent, in the component that terminates customers'
+  database traffic.
+
+Worth doing only if large-result traffic over TLS on both hops becomes the
+dominant cost of a deployment; the EC2 bench can measure it with `large_result`
+and TLS on both hops first.
