@@ -421,9 +421,36 @@ fn env_usize(env: Lookup<'_>, key: &str) -> Option<usize> {
     env(key).and_then(|v| v.parse().ok())
 }
 
+/// `VERICTO_TELEMETRY_BUILD_QUEUE` (since 4.19.0): how many telemetry events may
+/// wait to be built off the query path (`telemetry::builder`). `0` builds them
+/// on the query path, as up to 4.18.0; unset or not a number is the default.
+pub fn telemetry_build_queue(env: Lookup<'_>) -> usize {
+    env_usize(env, "VERICTO_TELEMETRY_BUILD_QUEUE")
+        .unwrap_or(crate::telemetry::builder::DEFAULT_BUILD_QUEUE)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Unset or garbage is the default; 0 (build on the query path) and any
+    /// other count are taken as they are.
+    #[test]
+    fn telemetry_build_queue_defaults_and_accepts_zero() {
+        let lookup = |v: Option<&'static str>| {
+            move |k: &str| {
+                (k == "VERICTO_TELEMETRY_BUILD_QUEUE")
+                    .then_some(v)
+                    .flatten()
+                    .map(String::from)
+            }
+        };
+        let default = crate::telemetry::builder::DEFAULT_BUILD_QUEUE;
+        assert_eq!(telemetry_build_queue(&lookup(None)), default);
+        assert_eq!(telemetry_build_queue(&lookup(Some("abc"))), default);
+        assert_eq!(telemetry_build_queue(&lookup(Some("0"))), 0);
+        assert_eq!(telemetry_build_queue(&lookup(Some("128"))), 128);
+    }
 
     /// The API refuses a batch of more than 500 events as a whole (400, dropped),
     /// so a larger setting is lowered instead of losing every batch.

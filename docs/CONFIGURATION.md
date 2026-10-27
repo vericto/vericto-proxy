@@ -58,6 +58,7 @@ buffer), or to an empty value to turn it off.
 | `VERICTO_TELEMETRY_FLUSH_SECS`      | `5`     | Longest the oldest pending event waits before a partial batch is sent (whichever comes first with the batch size) |
 | `VERICTO_TELEMETRY_MAX_IN_FLIGHT`   | `4`     | POSTs outstanding at once (1–64)                 |
 | `VERICTO_TELEMETRY_GZIP`            | `true`  | gzip request bodies (`Content-Encoding: gzip`); turned off automatically if the API refuses them |
+| `VERICTO_TELEMETRY_BUILD_QUEUE`     | `4096`  | 4.19.0+. Sanitized-mode events waiting to be built on the telemetry builder thread, off the query path; past it an event is dropped and counted in `dropped_queue_full`. `0` builds every event on the query path, as up to 4.18.0. See [Telemetry off the query path](#telemetry-off-the-query-path) |
 | `VERICTO_TELEMETRY_RETRY_BASE_MS`   | `1000`  | First wait after a retryable delivery failure; doubles per consecutive failure |
 | `VERICTO_TELEMETRY_RETRY_MAX_SECS`  | `60`    | Longest wait between delivery retries            |
 | `VERICTO_TELEMETRY_QUEUE_CAPACITY`  | `2048`  | buffer=disk: events queued in memory for the spool writer; past it new events are dropped and counted, queries never wait |
@@ -98,6 +99,30 @@ is: `oldest_undelivered_age_s` (seconds since the oldest event still waiting was
 recorded, 0 when none waits), `last_delivery_at` (the last 2xx, `null` before the
 first) and `spool_max_bytes` (the spool's bound, 0 with the memory buffer). The
 same figures are in [Metrics](#metrics).
+
+### Telemetry off the query path
+
+In sanitized mode (`telemetry_query_mode: sanitized`) each event normalizes the
+statement's text a second time, after the evaluation: libpg_query for PostgreSQL,
+the MySQL tokenizer for MySQL. Since 4.19.0 that work runs on a thread of its own
+(`vericto-telemetry-build`): the query path hands it the statement's SQL, decision
+and identity, the telemetry mode and the time, and answers the client without
+waiting. The event is the one the query path would have built (same fields, same
+normalized text, same `occurred_at`; `event_id` is random either way), events keep
+their order, and a shutdown flush includes the events still being built.
+
+- The hand-over never blocks: past `VERICTO_TELEMETRY_BUILD_QUEUE` waiting events
+  an event is dropped, counted in `dropped_queue_full` and logged (rate-limited).
+  The builder normally keeps up by a wide margin; a full queue means its thread
+  gets no CPU.
+- Raw-mode events are still built on the query path, where they cost less than
+  the hand-over (one exception: while the builder holds sanitized events, a raw one
+  waits behind them, so a mode change does not reorder events).
+- Measured with the callgrind gate (one worker, mimalloc): the query path of the
+  sanitized workloads costs 7 to 14% fewer instructions per statement, the process
+  as a whole 0.6 to 1.8% more (the hand-over). A deployment whose limit is CPU
+  rather than latency, such as a small Fargate task near its quota, can set
+  `VERICTO_TELEMETRY_BUILD_QUEUE=0`.
 
 ### Over the monthly quota
 

@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Performance
 
+- **Sanitized telemetry events are built off the query path**
+  (`VERICTO_TELEMETRY_BUILD_QUEUE`, default 4096 waiting events; `0` = on the query
+  path, as up to 4.18.0). The second normalization of the query text (libpg_query /
+  the MySQL tokenizer), the violation mapping and the event id now run on the
+  `vericto-telemetry-build` thread, which collects events for up to 25 ms at a time
+  so that handing one over costs the query path a lock and no system call. Bounded:
+  a full queue drops the event and counts it in `dropped_queue_full`; the query path
+  never waits. Same event content and order (`deferred_events_equal_the_query_path_ones_in_sanitized_mode`,
+  the event time is taken on the query path), and the shutdown flush waits for the
+  events still being built. Callgrind, one worker, sanitized mode, with the 4.19.0
+  allocator (mimalloc, below): query-path
+  instructions per statement -11.3% (`pg trivial_cp`), -9.9% (`pg policy_mix`),
+  -7.2% (`mysql trivial_cp`), -14.2% (`mysql policy_mix`); the whole process
+  +0.6% to +1.8%. Raw-mode events stay on the query path (deferring them saved less
+  than the hand-over costs). Export batches were already gzip-compressed
+  (`VERICTO_TELEMETRY_GZIP`).
 - **Statements up to 1 KiB are evaluated on the connection's task, not on the
   blocking pool** (`VERICTO_INLINE_EVAL_MAX_BYTES`, default 1024; `0` = every
   statement on the pool, as up to 4.18.0). The pool cost two thread hand-offs per

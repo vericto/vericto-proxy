@@ -84,6 +84,27 @@ pub struct PgProxyConfig {
 pub struct TelemetrySink {
     pub queue: Arc<dyn crate::telemetry::EventQueue>,
     pub database_id: String,
+    /// The event builder in front of `queue` (4.19.0,
+    /// `VERICTO_TELEMETRY_BUILD_QUEUE`): sanitized events are built on its
+    /// thread rather than on the query path. `None` builds every event on the
+    /// query path, as up to 4.18.0.
+    pub deferred: Option<Arc<crate::telemetry::builder::DeferredQueue>>,
+}
+
+impl TelemetrySink {
+    /// The builder to hand an event to, if any. Sanitized events go to it: their
+    /// query text is normalized again, which is most of what an event costs
+    /// (6 to 15% of a statement). Raw events are built here, where they cost less
+    /// than the hand-over, unless the builder still holds events, which they
+    /// would overtake.
+    fn builder_for(
+        &self,
+        mode: crate::tcp::rules_sync::TelemetryQueryMode,
+    ) -> Option<&crate::telemetry::builder::DeferredQueue> {
+        let deferred = self.deferred.as_deref()?;
+        (mode == crate::tcp::rules_sync::TelemetryQueryMode::Sanitized || deferred.pending() > 0)
+            .then_some(deferred)
+    }
 }
 
 /// Handles a complete incoming connection. Any error closes the connection.
@@ -880,6 +901,7 @@ fn build_telemetry_event(
         latency_us,
         crate::tcp::rules_sync::TelemetryQueryMode::Raw,
         &EventIdentity::default(),
+        chrono::Utc::now(),
     )
 }
 
@@ -892,6 +914,7 @@ fn build_telemetry_event(
 /// policy rules `observe`, is the would-be rewrite). Sanitizing happens before the
 /// size cut, because a cut statement no longer parses and would only ever be
 /// reported as redacted.
+#[allow(clippy::too_many_arguments)]
 fn build_event(
     database_id: &str,
     sql: &str,
@@ -900,6 +923,7 @@ fn build_event(
     latency_us: u128,
     mode: crate::tcp::rules_sync::TelemetryQueryMode,
     identity: &EventIdentity,
+    occurred_at: chrono::DateTime<chrono::Utc>,
 ) -> crate::telemetry::TelemetryEvent {
     use crate::tcp::evaluator::SENSITIVE_RULE_CODE;
     use crate::tcp::rules_sync::TelemetryQueryMode;
@@ -1094,7 +1118,7 @@ fn build_event(
             .map(crate::telemetry::truncate_reported_parse_error),
         latency_ms: Some(latency_us as f64 / 1000.0),
         client_ip: None,
-        occurred_at: chrono::Utc::now().to_rfc3339(),
+        occurred_at: occurred_at.to_rfc3339(),
         rewritten_query,
         sensitive_columns,
         db_user: identity.db_user.clone(),
@@ -1290,16 +1314,36 @@ pub(crate) fn report_telemetry(
     let Some(sink) = &config.telemetry else {
         return;
     };
-    let event = build_event(
-        &sink.database_id,
-        sql,
-        dialect,
-        decision,
-        latency_us,
-        **config.telemetry_mode.load(),
-        identity,
-    );
-    sink.queue.push(event);
+    // The mode and the time are those of the statement, wherever it is built.
+    let mode = **config.telemetry_mode.load();
+    let occurred_at = chrono::Utc::now();
+    if let Some(builder) = sink.builder_for(mode) {
+        let (database_id, sql) = (sink.database_id.clone(), sql.to_string());
+        let (decision, identity) = (decision.clone(), identity.clone());
+        builder.submit(Box::new(move || {
+            build_event(
+                &database_id,
+                &sql,
+                dialect,
+                &decision,
+                latency_us,
+                mode,
+                &identity,
+                occurred_at,
+            )
+        }));
+    } else {
+        sink.queue.push(build_event(
+            &sink.database_id,
+            sql,
+            dialect,
+            decision,
+            latency_us,
+            mode,
+            identity,
+            occurred_at,
+        ));
+    }
 }
 
 /// The decision of a statement the kill switch refused: VERICTO-105, critical,
@@ -1338,17 +1382,31 @@ pub(crate) fn report_kill_switch(
     let Some(sink) = &config.telemetry else {
         return;
     };
-    let mut event = build_event(
-        &sink.database_id,
-        sql,
-        dialect,
-        &kill_switch_decision(block),
-        0,
-        **config.telemetry_mode.load(),
-        identity,
-    );
-    event.kill_switch_id = Some(block.block_id.clone());
-    sink.queue.push(event);
+    let mode = **config.telemetry_mode.load();
+    let occurred_at = chrono::Utc::now();
+    let build = {
+        let (database_id, sql) = (sink.database_id.clone(), sql.to_string());
+        let (decision, identity) = (kill_switch_decision(block), identity.clone());
+        let block_id = block.block_id.clone();
+        move || {
+            let mut event = build_event(
+                &database_id,
+                &sql,
+                dialect,
+                &decision,
+                0,
+                mode,
+                &identity,
+                occurred_at,
+            );
+            event.kill_switch_id = Some(block_id);
+            event
+        }
+    };
+    match sink.builder_for(mode) {
+        Some(builder) => builder.submit(Box::new(build)),
+        None => sink.queue.push(build()),
+    }
 }
 
 /// A VERICTO-085 suggestion in sanitized mode. It is either SQL (the would-be
@@ -1483,6 +1541,7 @@ mod tests {
                 412,
                 crate::tcp::rules_sync::TelemetryQueryMode::Raw,
                 &identity,
+                chrono::Utc::now(),
             );
             event.event_id = uuid::Uuid::new_v4().to_string();
             total += serde_json::to_vec(&event).unwrap().len() + 1;
@@ -1918,6 +1977,7 @@ mod tests {
             1,
             crate::tcp::rules_sync::TelemetryQueryMode::Sanitized,
             &EventIdentity::default(),
+            chrono::Utc::now(),
         );
         let s0 = ev.violations[0].suggested_safe_query.as_deref().unwrap();
         assert!(!s0.contains("Alice"), "{s0}");
@@ -2011,6 +2071,7 @@ mod tests {
             1,
             crate::tcp::rules_sync::TelemetryQueryMode::Sanitized,
             &EventIdentity::default(),
+            chrono::Utc::now(),
         );
         assert_eq!(ev.query_text, "SELECT card FROM customers WHERE name = ?");
         assert_eq!(
@@ -2039,6 +2100,52 @@ mod tests {
                 .count()
                 <= 80
         );
+    }
+
+    /// Sanitized events go to the builder; raw ones are built on the query path
+    /// unless the builder still holds events, which a raw one must not overtake;
+    /// without a builder everything is built on the query path.
+    #[test]
+    fn only_sanitized_events_or_those_behind_pending_ones_are_deferred() {
+        use crate::tcp::rules_sync::TelemetryQueryMode::{Raw, Sanitized};
+        use crate::telemetry::builder::DeferredQueue;
+        use std::sync::{Barrier, mpsc};
+        let below = Arc::new(crate::telemetry::queue::MemoryQueue::new(10));
+        let deferred = Arc::new(DeferredQueue::new(below.clone(), 4).unwrap());
+        let mut sink = TelemetrySink {
+            queue: deferred.clone(),
+            database_id: "db".into(),
+            deferred: Some(deferred.clone()),
+        };
+        assert!(sink.builder_for(Sanitized).is_some());
+        assert!(sink.builder_for(Raw).is_none(), "nothing pending");
+
+        let (started_tx, started_rx) = mpsc::channel();
+        let gate = Arc::new(Barrier::new(2));
+        let held = Arc::clone(&gate);
+        deferred.submit(Box::new(move || {
+            started_tx.send(()).unwrap();
+            held.wait();
+            let allowed = TcpDecision::Forward {
+                observation: None,
+                violations: Vec::new(),
+                rewritten_query: None,
+                sensitive_columns: Vec::new(),
+                access_denied: Vec::new(),
+            };
+            build_telemetry_event("db", "SELECT 1", Dialect::Postgres, &allowed, 1)
+        }));
+        started_rx.recv().unwrap();
+        assert!(sink.builder_for(Raw).is_some(), "behind a pending event");
+        gate.wait();
+        assert!(crate::telemetry::EventQueue::flush(
+            &*deferred,
+            std::time::Duration::from_secs(5)
+        ));
+        assert!(sink.builder_for(Raw).is_none());
+
+        sink.deferred = None;
+        assert!(sink.builder_for(Sanitized).is_none());
     }
 
     #[test]
