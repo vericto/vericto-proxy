@@ -447,6 +447,19 @@ impl MySqlPacket {
         out
     }
 
+    /// Appends the complete on-wire bytes (header + payload) to `out`.
+    pub fn encode_into(&self, out: &mut Vec<u8>) {
+        let len = self.payload.len();
+        out.reserve(4 + len);
+        out.extend_from_slice(&[
+            (len & 0xFF) as u8,
+            ((len >> 8) & 0xFF) as u8,
+            ((len >> 16) & 0xFF) as u8,
+            self.seq,
+        ]);
+        out.extend_from_slice(&self.payload);
+    }
+
     /// Command tag (first payload byte), or None for an empty payload.
     pub fn command_tag(&self) -> Option<u8> {
         self.payload.first().copied()
@@ -614,6 +627,68 @@ where
     Ok(Some(MySqlPacket { seq, payload }))
 }
 
+/// The capacity a reused payload buffer keeps between packets: a larger one (a
+/// rare big packet) is released before the next read.
+const REUSED_PAYLOAD_CAPACITY: usize = 64 * 1024;
+
+/// [`read_packet`] into `pkt`, reusing its payload buffer (4.19.0: the
+/// interception loop reads every client packet into the same one, as it does
+/// PostgreSQL messages). A packet the reader's buffer holds whole is framed from
+/// it without a read. `false` on clean EOF; the same length cap.
+pub async fn read_packet_into<R>(
+    reader: &mut tokio::io::BufReader<R>,
+    pkt: &mut MySqlPacket,
+) -> std::io::Result<bool>
+where
+    R: AsyncRead + Unpin,
+{
+    use tokio::io::AsyncBufReadExt;
+    if pkt.payload.capacity() > REUSED_PAYLOAD_CAPACITY {
+        pkt.payload = Vec::new();
+    }
+    // Nothing buffered: one read fills the buffer (a whole command, usually).
+    if reader.buffer().is_empty() && reader.fill_buf().await?.is_empty() {
+        return Ok(false); // clean EOF before a new packet
+    }
+    let buffered = reader.buffer();
+    if buffered.len() >= 4 {
+        let len =
+            (buffered[0] as usize) | ((buffered[1] as usize) << 8) | ((buffered[2] as usize) << 16);
+        if len > MYSQL_MAX_PACKET_LEN {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("MySQL packet length {len} exceeds cap"),
+            ));
+        }
+        if buffered.len() >= 4 + len {
+            pkt.seq = buffered[3];
+            pkt.payload.clear();
+            pkt.payload.extend_from_slice(&buffered[4..4 + len]);
+            reader.consume(4 + len);
+            return Ok(true);
+        }
+    }
+    // A packet larger than what is buffered: read it as `read_packet` does.
+    let mut header = [0u8; 4];
+    match reader.read_exact(&mut header).await {
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(false),
+        Err(e) => return Err(e),
+    }
+    let len = (header[0] as usize) | ((header[1] as usize) << 8) | ((header[2] as usize) << 16);
+    if len > MYSQL_MAX_PACKET_LEN {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("MySQL packet length {len} exceeds cap"),
+        ));
+    }
+    pkt.seq = header[3];
+    pkt.payload.clear();
+    pkt.payload.resize(len, 0);
+    reader.read_exact(&mut pkt.payload).await?;
+    Ok(true)
+}
+
 /// Builds a native ERR_Packet to reject a blocked query. The client driver
 /// surfaces this as a normal SQL error (not a dropped connection).
 ///
@@ -651,6 +726,26 @@ pub const VERICTO_BLOCK_SQLSTATE: &str = "42000";
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `encode_into` appends exactly what `encode` returns.
+    #[test]
+    fn encode_into_appends_the_encoded_packet() {
+        let pkt = MySqlPacket {
+            seq: 3,
+            payload: b"\x03SELECT 1".to_vec(),
+        };
+        let mut out = b"prefix".to_vec();
+        pkt.encode_into(&mut out);
+        assert_eq!(&out[..6], b"prefix");
+        assert_eq!(&out[6..], &pkt.encode()[..]);
+        let mut empty = Vec::new();
+        MySqlPacket {
+            seq: 0,
+            payload: Vec::new(),
+        }
+        .encode_into(&mut empty);
+        assert_eq!(empty, [0, 0, 0, 0]);
+    }
 
     #[test]
     fn encode_roundtrips_header_and_payload() {
@@ -819,6 +914,84 @@ mod tests {
         let pkt = read_packet(&mut cursor).await.unwrap().unwrap();
         assert_eq!(pkt.seq, 0);
         assert_eq!(pkt.extract_sql().as_deref(), Some("SELECT 1"));
+    }
+
+    /// Several packets in one read are framed from the buffer, into the same
+    /// payload buffer, exactly as `read_packet` reads them one by one.
+    #[tokio::test]
+    async fn read_packet_into_frames_buffered_packets_like_read_packet() {
+        let packets = [
+            MySqlPacket {
+                seq: 0,
+                payload: [&[COM_QUERY][..], b"SELECT 1"].concat(),
+            },
+            MySqlPacket {
+                seq: 0,
+                payload: [&[COM_QUERY][..], b"BEGIN"].concat(),
+            },
+            MySqlPacket {
+                seq: 3,
+                payload: vec![],
+            },
+            MySqlPacket {
+                seq: 0,
+                payload: vec![0x0e],
+            },
+        ];
+        let wire: Vec<u8> = packets.iter().flat_map(MySqlPacket::encode).collect();
+        let mut reader = tokio::io::BufReader::with_capacity(16 * 1024, std::io::Cursor::new(wire));
+        let mut slot = MySqlPacket {
+            seq: 9,
+            payload: Vec::with_capacity(32),
+        };
+        let reused = slot.payload.as_ptr();
+        for want in &packets {
+            assert!(read_packet_into(&mut reader, &mut slot).await.unwrap());
+            assert_eq!(&slot, want);
+        }
+        assert_eq!(
+            slot.payload.as_ptr(),
+            reused,
+            "the payload buffer is reused"
+        );
+        assert!(
+            !read_packet_into(&mut reader, &mut slot).await.unwrap(),
+            "clean EOF"
+        );
+    }
+
+    /// A packet larger than the reader's buffer is read as `read_packet` reads
+    /// it; a large payload buffer is not kept; a truncated packet is an error.
+    #[tokio::test]
+    async fn read_packet_into_reads_large_packets_and_refuses_truncated_ones() {
+        let big = MySqlPacket {
+            seq: 0,
+            payload: vec![b'x'; 100 * 1024],
+        };
+        let small = MySqlPacket {
+            seq: 1,
+            payload: b"ok".to_vec(),
+        };
+        let wire = [big.encode(), small.encode()].concat();
+        let mut reader = tokio::io::BufReader::with_capacity(1024, std::io::Cursor::new(wire));
+        let mut slot = MySqlPacket {
+            seq: 0,
+            payload: Vec::new(),
+        };
+        assert!(read_packet_into(&mut reader, &mut slot).await.unwrap());
+        assert_eq!(slot, big);
+        assert!(read_packet_into(&mut reader, &mut slot).await.unwrap());
+        assert_eq!(slot, small);
+        assert!(
+            slot.payload.capacity() <= REUSED_PAYLOAD_CAPACITY,
+            "the 100 KiB buffer was released"
+        );
+
+        let mut over = vec![0xff, 0xff, 0xff, 0x00];
+        over.extend_from_slice(&[0u8; 16]);
+        let mut reader = tokio::io::BufReader::new(std::io::Cursor::new(over));
+        // The largest length a header can carry, and the stream ends first.
+        assert!(read_packet_into(&mut reader, &mut slot).await.is_err());
     }
 
     #[tokio::test]

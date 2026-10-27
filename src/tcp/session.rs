@@ -358,10 +358,11 @@ pub async fn intercept_client_to_server(
     // one is handled, before its bytes leave, as before.
     let coalesce = pg_responses.is_some() && proto.client_read_buffer() > 0;
     // Capacity 1 buffers nothing: `BufReader` passes every read of at least
-    // its capacity straight to the socket (0 is not a valid capacity).
+    // its capacity straight to the socket (0 is not a valid capacity). MySQL
+    // reads through the buffer too (4.19.0), without coalescing.
     let mut client_read = tokio::io::BufReader::with_capacity(
-        if coalesce {
-            proto.client_read_buffer()
+        if coalesce || proto.buffers_client_reads() {
+            proto.client_read_buffer().max(1)
         } else {
             1
         },
@@ -1980,8 +1981,17 @@ impl<'a> UpstreamSender<'a> {
     pub(crate) async fn send(&mut self, msg: &RawClientMessage) -> std::io::Result<()> {
         match msg {
             RawClientMessage::Postgres(message) if self.coalesce => self.send_pg(message).await,
+            // One write and one flush per message, from the sender's own buffer
+            // (4.19.0: no allocation per message). Nothing is pending here: a
+            // sender that does not coalesce never holds bytes.
             _ => {
-                self.inner.write_all(&msg.encode()).await?;
+                msg.encode_into(&mut self.pending);
+                let written = self.inner.write_all(&self.pending).await;
+                self.pending.clear();
+                if self.pending.capacity() > 2 * COALESCE_LIMIT {
+                    self.pending = Vec::new();
+                }
+                written?;
                 self.inner.flush().await
             }
         }

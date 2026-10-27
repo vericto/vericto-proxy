@@ -40,11 +40,11 @@ pub enum RawClientMessage {
 }
 
 impl RawClientMessage {
-    /// The complete on-wire bytes to forward upstream unchanged.
-    pub fn encode(&self) -> Vec<u8> {
+    /// Appends the complete on-wire bytes to forward upstream unchanged to `out`.
+    pub fn encode_into(&self, out: &mut Vec<u8>) {
         match self {
-            RawClientMessage::Postgres(m) => m.encode(),
-            RawClientMessage::Mysql(m) => m.encode(),
+            RawClientMessage::Postgres(m) => m.encode_into(out),
+            RawClientMessage::Mysql(m) => m.encode_into(out),
         }
     }
 }
@@ -160,10 +160,18 @@ pub trait WireProtocol: Send + Sync {
 
     /// The bytes the interception loop reads the client through before they
     /// are framed (4.17.3): PostgreSQL buffers, so the messages of one client
-    /// read go upstream in one write; 0 reads the socket directly (MySQL).
-    /// Only used with PostgreSQL's ordered response coordinator.
+    /// read go upstream in one write; 0 reads the socket directly. Used with
+    /// PostgreSQL's ordered response coordinator, and when
+    /// [`Self::buffers_client_reads`] says so.
     fn client_read_buffer(&self) -> usize {
         0
+    }
+
+    /// Whether the client is read through [`Self::client_read_buffer`] bytes
+    /// without the response coordinator too (MySQL, since 4.19.0): fewer reads
+    /// of the socket, and no coalescing of what goes upstream.
+    fn buffers_client_reads(&self) -> bool {
+        false
     }
 
     /// Whether `buffered` (the client bytes read but not yet framed) holds a

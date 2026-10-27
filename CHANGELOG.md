@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Performance
 
+- **MySQL: the client is read through a 16 KiB buffer, into one reused packet
+  buffer** (`codec_mysql::read_packet_into`), as PostgreSQL is since 4.17.3. A
+  command cost two reads of the socket (header, then payload) and one allocation;
+  it now costs one read and none. Each packet is still forwarded and flushed on its
+  own (nothing is coalesced upstream), now from the sender's reused buffer instead
+  of a new `Vec` per packet. System calls per statement 8.0 -> 6.0
+  (`strace -f -c`, COM_QUERY and COM_STMT_EXECUTE), instructions -0.2% to -5.2% on
+  the MySQL workloads of the gate.
 - **mimalloc is the global allocator** (the default `mimalloc` cargo feature;
   `--no-default-features` keeps the system allocator). Callgrind gate against
   glibc's malloc: -2.1% to -3.3% instructions per statement on the PostgreSQL OLTP
