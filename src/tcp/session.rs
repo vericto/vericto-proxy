@@ -369,6 +369,8 @@ pub async fn intercept_client_to_server(
         client_read,
     );
     let mut upstream = UpstreamSender::new(server_write, coalesce);
+    // The decisions of trivial statements this session sent (4.19.0).
+    let mut verdicts = crate::tcp::fast_path::Verdicts::default();
     // Every frontend message is read into this one (PostgreSQL reuses its
     // buffer from message to message).
     let mut msg = RawClientMessage::Postgres(PgMessage {
@@ -929,7 +931,28 @@ pub async fn intercept_client_to_server(
                 // its parse cannot stall the other connections of this worker.
                 upstream.flush_answerable().await?;
                 let eval_start = Instant::now();
-                let (decision, eval_us) = {
+                // A trivial statement this session already sent, under the same
+                // snapshots: the decision the full evaluation reached for it then
+                // (`fast_path`; never under business policy rules).
+                let remembered_here = config.trivial_fast_path && policy_ctx.is_none();
+                let remembered = if remembered_here {
+                    verdicts.get(&sql, kind, &rules, &policy).cloned()
+                } else {
+                    None
+                };
+                let snapshots = remembered_here.then(|| (Arc::clone(&rules), Arc::clone(&policy)));
+                let (decision, eval_us) = if let Some(decision) = remembered {
+                    let eval_us = eval_start.elapsed().as_micros();
+                    crate::tcp::postgres::report_telemetry(
+                        config,
+                        &sql,
+                        proto.dialect(),
+                        &decision,
+                        eval_us,
+                        &identity,
+                    );
+                    (decision, eval_us)
+                } else {
                     let sql = sql.clone();
                     let dialect = proto.dialect();
                     let config = Arc::clone(config);
@@ -967,6 +990,9 @@ pub async fn intercept_client_to_server(
                     .expect("evaluation task panicked")
                 };
                 let _ = eval_us;
+                if let Some((rules, policy)) = &snapshots {
+                    verdicts.keep(&sql, kind, rules, policy, &decision);
+                }
 
                 if let TcpDecision::Block {
                     rule_code,

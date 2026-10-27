@@ -103,6 +103,7 @@ pub(super) fn config_with(
         }),
         max_query_bytes: crate::tcp::query_limit::DEFAULT_MAX_QUERY_BYTES,
         inline_eval_max_bytes: crate::tcp::query_limit::DEFAULT_INLINE_EVAL_MAX_BYTES,
+        trivial_fast_path: true,
         policy_rules: Default::default(),
         cancel_keys: Default::default(),
     });

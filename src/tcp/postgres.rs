@@ -71,6 +71,9 @@ pub struct PgProxyConfig {
     /// task, larger ones on the blocking pool; 0 sends every statement to the pool
     /// (`VERICTO_INLINE_EVAL_MAX_BYTES`, since 4.19.0; see `tcp::query_limit`).
     pub inline_eval_max_bytes: usize,
+    /// A session remembers the decisions of trivial statements
+    /// (`VERICTO_TRIVIAL_FAST_PATH`, since 4.19.0, default on; see `tcp::fast_path`).
+    pub trivial_fast_path: bool,
     /// Business policy rules (`VERICTO_POLICY_RULES`, default off): the mode,
     /// the synced principals and compiled policies, the listener (since 4.15.0).
     pub policy_rules: crate::tcp::policy_rules::PolicyRulesRuntime,
@@ -2248,6 +2251,7 @@ mod tests {
             telemetry: None,
             max_query_bytes: crate::tcp::query_limit::DEFAULT_MAX_QUERY_BYTES,
             inline_eval_max_bytes: crate::tcp::query_limit::DEFAULT_INLINE_EVAL_MAX_BYTES,
+            trivial_fast_path: true,
             policy_rules: Default::default(),
             cancel_keys: Default::default(),
         })

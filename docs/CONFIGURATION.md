@@ -538,6 +538,7 @@ your monitoring, and never expose it to the internet.
 |----------|---------|-------------|
 | `VERICTO_WORKER_THREADS` | from the CPU limit | 4.16.2+. Async worker threads (1–1024; anything else stops the proxy at startup). By default the CPU limit rounded up, at most the CPUs the process may run on: the cgroup CPU quota visible in the container, or the ECS task's `Limits.CPU` from the task metadata endpoint, whichever is lower; without a limit, one per CPU. `TOKIO_WORKER_THREADS` is still honoured when this is unset |
 
+| `VERICTO_TRIVIAL_FAST_PATH` | `on` | 4.19.0+. `on` or `off` (any case; anything else stops the proxy at startup). A session remembers the decision the full evaluation reached for a trivial statement (`BEGIN`, `COMMIT`, `ROLLBACK`, `END`, `START TRANSACTION`, `SELECT 1`, `SET autocommit=0/1`, `SET NAMES utf8mb4`) and answers the same bytes with it while the ruleset and its effective policy are the same; see [The trivial-statement fast path](#the-trivial-statement-fast-path) |
 | `VERICTO_INLINE_EVAL_MAX_BYTES` | `1024` | 4.19.0+. Statements up to this many bytes are evaluated on the connection's own async task; larger ones on the blocking pool, as every statement was up to 4.18.0. `0` sends every statement to the pool. A value that is not a non-negative integer falls back to the default, with a warning |
 
 The proxy logs its choice once at startup (`"Runtime sizing"`, with
@@ -591,6 +592,38 @@ task's CPU metric against its statement rate.
   period (`--cpu-period`) shortens each stall but does not raise the capacity.
 - Set `VERICTO_WORKER_THREADS` only to override the detection, e.g. on a platform
   that neither exposes the quota nor ECS task metadata.
+
+### The trivial-statement fast path
+
+Transaction control and the connection checks of pools cost as much evaluation as
+a real query, and an OLTP application sends two of them per transaction. Since
+4.19.0 a session evaluates each of them fully the first time and then reuses that
+decision, which is a cache of the engine's own answer and never a verdict of the
+proxy's:
+
+- Only these statements, compared after trimming ASCII whitespace and one trailing
+  `;`, in any ASCII case: `BEGIN`, `COMMIT`, `ROLLBACK`, `END`, `START TRANSACTION`,
+  `SELECT 1`, `SET autocommit=0`, `SET autocommit=1`, `SET NAMES utf8mb4`. A
+  comment, a second statement (`BEGIN; DROP …`), other whitespace or a Unicode
+  look-alike is not one of them and is evaluated every time; so are `SET ROLE`,
+  `SET SESSION AUTHORIZATION` and `SET search_path`.
+- The decision is reused for the **same bytes** only (`begin;` and `BEGIN` are
+  evaluated apart), sent the same way (simple query, Parse, COM_QUERY or
+  COM_STMT_PREPARE), and only while the session's ruleset and effective policy are
+  the ones it was reached under: a sync, a change of database or user, monitor
+  mode switched on or off, an allowlist changed, all evaluate again.
+- Never with business policy rules on (`VERICTO_POLICY_RULES`), where a verdict
+  also depends on the declared context and the time.
+- The kill switch, the size limit and everything after the decision (forwarding,
+  telemetry, transaction state) are unchanged. The event is the one the full path
+  reports, but for `latency_ms`.
+
+Measured with the callgrind gate: -86% instructions per statement on PostgreSQL
+`trivial`, -78% on MySQL, -8% on a pgbench TPC-B transaction (simple or extended
+protocol), -11% over MySQL COM_QUERY. A test sends every entry and thirty near
+misses through a session with and a session without the fast path, under every
+policy configuration that can bear on them, and requires the same bytes, answers
+and events (`fast_path_tests`). `off` evaluates every statement, as up to 4.18.0.
 
 ---
 

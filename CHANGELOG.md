@@ -15,6 +15,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Performance
 
+- **Trivial statements reuse their session's earlier decision**
+  (`VERICTO_TRIVIAL_FAST_PATH`, default `on`; `src/tcp/fast_path.rs`). `BEGIN`,
+  `COMMIT`, `ROLLBACK`, `END`, `START TRANSACTION`, `SELECT 1`, `SET autocommit=0/1`
+  and `SET NAMES utf8mb4` (after trimming ASCII whitespace and one trailing `;`,
+  any ASCII case) are evaluated in full the first time a session sends them; the
+  same bytes, sent the same way, under the same ruleset and effective policy
+  (the same `Arc`s, held so they cannot be reused) then get that decision without a
+  parse. Never under business policy rules. A cache of the engine's own answer
+  (evaluation is a pure function of the statement, the rules and the policy), not
+  a table of verdicts: `fast_path_tests` sends every entry and thirty near misses
+  (comments, `BEGIN; DROP …`, whitespace, case, Unicode look-alikes, `SET ROLE`,
+  `SET SESSION AUTHORIZATION`…) twice through a session with and one without it,
+  under the built-in rules, monitor mode, parse errors blocked, sensitive columns,
+  an enforced allowlist and a custom rule against SELECT, raw and sanitized
+  telemetry, simple query, Parse, COM_QUERY and COM_STMT_PREPARE, and requires the
+  same bytes, answers and events (but `latency_ms`); a ruleset or policy swap is
+  answered from the new one. Callgrind: -86.3% instructions per statement on
+  `pg trivial`, -78.3% on `mysql trivial`, -8.1% / -8.4% on `pg oltp_extended` /
+  `oltp_simple`, -11.1% on `mysql oltp_text`, -57.2% on `mysql oltp_prepared`
+  (BEGIN and COMMIT as text), +1% on `connect` (the first `SELECT 1` of each
+  session is kept).
 - **The published images are built with profile-guided optimization**
   (`release.yml`, `perf/pgo-train.sh`, docs/PERFORMANCE.md "PGO"). Each
   architecture's runner trains a profile on the performance gate's corpus
