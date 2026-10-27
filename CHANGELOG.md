@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- **Runtime image base `cgr.dev/chainguard/glibc-dynamic:latest` pinned to its
+  current digest** (`sha256:5bb932663cff…`, from `2827063c9efb…`, the Dependabot
+  bump merged in #92), in the Dockerfile and Dockerfile.local.
+
 ### Performance
 
 - **The database hop reuses one TLS client configuration**, rebuilt only when

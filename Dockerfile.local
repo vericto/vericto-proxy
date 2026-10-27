@@ -55,7 +55,7 @@ RUN cargo build --release
 
 # Stage 2: Runtime — the production Dockerfile's base (see the notes there): no
 # shell, so the health check is the binary's own `healthcheck` subcommand.
-FROM cgr.dev/chainguard/glibc-dynamic:latest@sha256:2827063c9efb4ba971d8621eb75f4e61b8d19850a6293a797df37358cc6f687b AS runner
+FROM cgr.dev/chainguard/glibc-dynamic:latest@sha256:5bb932663cff4fb276186720e0357af55c5e47f12e4d9f44ea0060fa3e7bca88 AS runner
 
 COPY --from=builder /app/target/release/vericto-proxy /usr/local/bin/vericto-proxy
 
