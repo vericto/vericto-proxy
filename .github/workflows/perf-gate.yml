@@ -93,13 +93,6 @@ jobs:
             cargo build --release --locked --bin vericto-proxy --manifest-path "$RUNNER_TEMP/base/Cargo.toml"
           cp target/release/vericto-proxy "$RUNNER_TEMP/bin/base"
 
-      - name: Create the corpus tables
-        run: |
-          "$RUNNER_TEMP/bin/perf_gate" setup --dialect pg \
-            --url "host=127.0.0.1 port=5432 user=bench password=bench dbname=bench"
-          "$RUNNER_TEMP/bin/perf_gate" setup --dialect mysql \
-            --url "mysql://bench:bench@127.0.0.1:3306/bench"
-
       # callgrind_control reaches the proxy through vgdb, which needs ptrace on a
       # process that is not its child.
       - name: Allow vgdb to attach
@@ -108,8 +101,19 @@ jobs:
       - name: Measure base and head
         env:
           PERF_DRIVER: ${{ runner.temp }}/bin/perf_gate
+        # The corpus writes (TPC-B updates, policy_mix inserts), so each build is
+        # measured on freshly created tables: otherwise the head would see the
+        # rows the base's run left behind and its answers would differ.
         run: |
+          setup() {
+            "$PERF_DRIVER" setup --dialect pg \
+              --url "host=127.0.0.1 port=5432 user=bench password=bench dbname=bench"
+            "$PERF_DRIVER" setup --dialect mysql \
+              --url "mysql://bench:bench@127.0.0.1:3306/bench"
+          }
+          setup
           perf/callgrind-gate.sh measure "$RUNNER_TEMP/bin/base" "$RUNNER_TEMP/base.jsonl"
+          setup
           perf/callgrind-gate.sh measure "$RUNNER_TEMP/bin/head" "$RUNNER_TEMP/head.jsonl"
 
       # A pull request that changes what a statement is answered on purpose (a new
