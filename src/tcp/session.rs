@@ -358,16 +358,19 @@ pub async fn intercept_client_to_server(
     // one is handled, before its bytes leave, as before.
     let coalesce = pg_responses.is_some() && proto.client_read_buffer() > 0;
     // Capacity 1 buffers nothing: `BufReader` passes every read of at least
-    // its capacity straight to the socket (0 is not a valid capacity).
+    // its capacity straight to the socket (0 is not a valid capacity). MySQL
+    // reads through the buffer too (4.19.0), without coalescing.
     let mut client_read = tokio::io::BufReader::with_capacity(
-        if coalesce {
-            proto.client_read_buffer()
+        if coalesce || proto.buffers_client_reads() {
+            proto.client_read_buffer().max(1)
         } else {
             1
         },
         client_read,
     );
     let mut upstream = UpstreamSender::new(server_write, coalesce);
+    // The decisions of trivial statements this session sent (4.19.0).
+    let mut verdicts = crate::tcp::fast_path::Verdicts::default();
     // Every frontend message is read into this one (PostgreSQL reuses its
     // buffer from message to message).
     let mut msg = RawClientMessage::Postgres(PgMessage {
@@ -382,9 +385,12 @@ pub async fn intercept_client_to_server(
         if !proto.has_buffered_message(client_read.buffer()) {
             upstream.flush().await?;
         }
-        if !proto
-            .read_client_message_into(&mut client_read, &mut msg)
-            .await?
+        // A message already buffered is framed here, without the boxed future
+        // of the trait's async read (4.20.0).
+        if !proto.take_buffered_message(&mut client_read, &mut msg)
+            && !proto
+                .read_client_message_into(&mut client_read, &mut msg)
+                .await?
         {
             break; // client closed
         }
@@ -921,18 +927,39 @@ pub async fn intercept_client_to_server(
                 }
 
                 // Evaluation is CPU-bound and synchronous, and so is the sanitize
-                // pass inside `report_telemetry`. Both run on the blocking pool:
-                // on the async reactor they stall the worker thread, freezing every
-                // other connection scheduled on it — a per-connection cost turning
-                // into a multi-tenant one. Measured hop cost is ~7 µs, negligible
-                // next to a database round trip.
+                // pass inside `report_telemetry`. A statement of at most
+                // `VERICTO_INLINE_EVAL_MAX_BYTES` is evaluated on this task (4.19.0):
+                // tens of microseconds, less than the two thread hand-offs of the
+                // blocking pool cost. A larger one runs on the blocking pool, where
+                // its parse cannot stall the other connections of this worker.
                 upstream.flush_answerable().await?;
                 let eval_start = Instant::now();
-                let (decision, eval_us) = {
+                // A trivial statement this session already sent, under the same
+                // snapshots: the decision the full evaluation reached for it then
+                // (`fast_path`; never under business policy rules).
+                let remembered_here = config.trivial_fast_path && policy_ctx.is_none();
+                let remembered = if remembered_here {
+                    verdicts.get(&sql, kind, &rules, &policy).cloned()
+                } else {
+                    None
+                };
+                let snapshots = remembered_here.then(|| (Arc::clone(&rules), Arc::clone(&policy)));
+                let (decision, eval_us) = if let Some(decision) = remembered {
+                    let eval_us = eval_start.elapsed().as_micros();
+                    crate::tcp::postgres::report_telemetry(
+                        config,
+                        &sql,
+                        proto.dialect(),
+                        &decision,
+                        eval_us,
+                        &identity,
+                    );
+                    (decision, eval_us)
+                } else {
                     let sql = sql.clone();
                     let dialect = proto.dialect();
                     let config = Arc::clone(config);
-                    tokio::task::spawn_blocking(move || {
+                    run_evaluation(config.inline_eval_max_bytes, sql.len(), move || {
                         let decision = match &policy_ctx {
                             // Policy rules on: the rules the bundle's policies were
                             // compiled from (the same ruleset once a sync ran).
@@ -966,6 +993,9 @@ pub async fn intercept_client_to_server(
                     .expect("evaluation task panicked")
                 };
                 let _ = eval_us;
+                if let Some((rules, policy)) = &snapshots {
+                    verdicts.keep(&sql, kind, rules, policy, &decision);
+                }
 
                 if let TcpDecision::Block {
                     rule_code,
@@ -1176,6 +1206,13 @@ async fn run_mysql_session(
             "no MySQL handshake from upstream",
         )
     })?;
+    // Recorded for the heartbeat (4.20.0) and logged at debug once per upstream.
+    if let Some(version) = mc::read_server_version(&handshake.payload) {
+        crate::tcp::upstream_version::global().observe_mysql(
+            &format!("{}:{}", config.upstream_host, config.upstream_port),
+            version,
+        );
+    }
     let server_caps = mc::read_server_capabilities(&handshake.payload).unwrap_or(0);
     if upstream_tls && server_caps & mc::CLIENT_SSL == 0 {
         return Err(std::io::Error::other(
@@ -1742,7 +1779,7 @@ async fn refresh_prepared(
     let evaluated_sql = original.clone();
     let config_for_task = Arc::clone(config);
     let snapshot = current.clone();
-    let decision = tokio::task::spawn_blocking(move || {
+    let decision = run_evaluation(config.inline_eval_max_bytes, original.len(), move || {
         let start = Instant::now();
         let decision = match (&snapshot.bundle, &snapshot.context) {
             (Some(bundle), Some(ctx)) => {
@@ -1818,6 +1855,32 @@ async fn refresh_prepared(
     } else {
         Ok(Some(decision))
     }
+}
+
+/// Runs an evaluation (`work`) of a statement of `sql_len` bytes: on the calling
+/// task when the statement is at most `inline_eval_max_bytes`
+/// (`PgProxyConfig::inline_eval_max_bytes`), on the blocking pool otherwise
+/// (always with `VERICTO_INLINE_EVAL_MAX_BYTES=0`, the behaviour up to 4.18.0).
+/// `Err` only when the pool's task panicked.
+pub(crate) async fn run_evaluation<T, F>(
+    inline_eval_max_bytes: usize,
+    sql_len: usize,
+    work: F,
+) -> Result<T, tokio::task::JoinError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    if evaluates_inline(inline_eval_max_bytes, sql_len) {
+        Ok(work())
+    } else {
+        tokio::task::spawn_blocking(work).await
+    }
+}
+
+/// Whether a statement of `sql_len` bytes is evaluated on the session's own task.
+fn evaluates_inline(inline_eval_max_bytes: usize, sql_len: usize) -> bool {
+    sql_len <= inline_eval_max_bytes && inline_eval_max_bytes > 0
 }
 
 fn stage_parse_action(
@@ -1954,8 +2017,17 @@ impl<'a> UpstreamSender<'a> {
     pub(crate) async fn send(&mut self, msg: &RawClientMessage) -> std::io::Result<()> {
         match msg {
             RawClientMessage::Postgres(message) if self.coalesce => self.send_pg(message).await,
+            // One write and one flush per message, from the sender's own buffer
+            // (4.19.0: no allocation per message). Nothing is pending here: a
+            // sender that does not coalesce never holds bytes.
             _ => {
-                self.inner.write_all(&msg.encode()).await?;
+                msg.encode_into(&mut self.pending);
+                let written = self.inner.write_all(&self.pending).await;
+                self.pending.clear();
+                if self.pending.capacity() > 2 * COALESCE_LIMIT {
+                    self.pending = Vec::new();
+                }
+                written?;
                 self.inner.flush().await
             }
         }

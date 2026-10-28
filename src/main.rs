@@ -22,6 +22,12 @@
 // No `unsafe` in the proxy itself; keep it that way without a reviewed opt-out.
 #![forbid(unsafe_code)]
 
+// The global allocator (4.19.0): mimalloc unless built with
+// `--no-default-features`, which keeps the system allocator.
+#[cfg(feature = "mimalloc")]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 mod config;
 mod runtime_sizing;
 mod tcp;
@@ -235,6 +241,26 @@ async fn run() {
                     telemetry::new_queue(&cp),
                     Arc::clone(&quota_gate),
                 ));
+            // Events are built off the query path (4.19.0) unless
+            // VERICTO_TELEMETRY_BUILD_QUEUE=0. Everything else (the reporter, the
+            // stats, the shutdown flush) goes through the builder's queue, so a
+            // flush includes the events still being built.
+            let build_queue = config::telemetry_build_queue(&|k| std::env::var(k).ok());
+            let deferred = if build_queue > 0 {
+                match telemetry::builder::DeferredQueue::new(queue.clone(), build_queue) {
+                    Ok(d) => Some(Arc::new(d)),
+                    Err(e) => {
+                        tracing::warn!(error = %e, "Could not start the telemetry builder thread; events are built on the query path");
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+            let queue: Arc<dyn telemetry::EventQueue> = match &deferred {
+                Some(d) => d.clone(),
+                None => queue,
+            };
             let reporter =
                 telemetry::Reporter::new(cp.clone(), queue.clone()).with_quota_gate(quota_gate);
             // Its counters ride on every rule sync (4.12.0).
@@ -351,7 +377,11 @@ async fn run() {
             tcp_opts
                 .database_id
                 .clone()
-                .map(|database_id| tcp::postgres::TelemetrySink { queue, database_id })
+                .map(|database_id| tcp::postgres::TelemetrySink {
+                    queue,
+                    database_id,
+                    deferred,
+                })
         }
         None => {
             tracing::info!(

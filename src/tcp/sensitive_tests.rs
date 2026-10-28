@@ -99,8 +99,11 @@ pub(super) fn config_with(
         telemetry: Some(TelemetrySink {
             queue: queue.clone() as Arc<dyn EventQueue>,
             database_id: "00000000-0000-0000-0000-000000000001".to_string(),
+            deferred: None,
         }),
         max_query_bytes: crate::tcp::query_limit::DEFAULT_MAX_QUERY_BYTES,
+        inline_eval_max_bytes: crate::tcp::query_limit::DEFAULT_INLINE_EVAL_MAX_BYTES,
+        trivial_fast_path: true,
         policy_rules: Default::default(),
         cancel_keys: Default::default(),
     });
@@ -1395,4 +1398,91 @@ async fn real_mysql_block_and_flag() {
         c.disconnect().await.unwrap();
     })
     .await;
+}
+
+// ── Events built off the query path (4.19.0) ─────────────────────────────────
+
+/// Events built on the builder thread (`telemetry::builder`) are the events the
+/// query path builds: the same fields and sanitized text, in the same order, on
+/// both protocols, for forwarded, masked, flagged and blocked statements alike.
+#[tokio::test]
+async fn deferred_events_equal_the_query_path_ones_in_sanitized_mode() {
+    use crate::telemetry::builder::DeferredQueue;
+
+    const STATEMENTS: &[&str] = &[
+        "SELECT id, name FROM customers WHERE id = 42",
+        "SELECT email, card FROM customers WHERE name = 'Alice'",
+        "SELECT phone FROM customers WHERE id = 7",
+        "SELECT ssn FROM customers WHERE id = 7",
+        "DELETE FROM customers",
+        "BEGIN",
+        "SELEC broken 'Alice'",
+    ];
+
+    async fn run(mysql: bool, deferred: bool) -> Vec<serde_json::Value> {
+        let (cfg, queue) = config(
+            ("unused", 0),
+            policy_with_tags(),
+            TelemetryQueryMode::Sanitized,
+        );
+        let mut cfg = Arc::into_inner(cfg).expect("unshared config");
+        let builder = deferred.then(|| {
+            Arc::new(DeferredQueue::new(queue.clone() as Arc<dyn EventQueue>, 16).unwrap())
+        });
+        if let (Some(b), Some(sink)) = (&builder, cfg.telemetry.as_mut()) {
+            sink.queue = b.clone();
+            sink.deferred = Some(b.clone());
+        }
+        let proto: Box<dyn WireProtocol> = if mysql {
+            Box::new(MysqlProtocol)
+        } else {
+            Box::new(PostgresProtocol)
+        };
+        let mut w = wire_with(proto, Arc::new(cfg), queue.clone());
+        // Each statement is either forwarded or answered by the proxy: whichever
+        // side gets a message first (the other has nothing to read, so dropping
+        // its read loses nothing).
+        for sql in STATEMENTS {
+            if mysql {
+                w.client.write_all(&my_cmd(COM_QUERY, sql)).await.unwrap();
+                tokio::select! {
+                    _ = read_my(&mut w.db) => {}
+                    _ = read_my(&mut w.client) => {}
+                }
+            } else {
+                w.client.write_all(&pg_query(sql)).await.unwrap();
+                let answered = tokio::select! {
+                    _ = read_pg(&mut w.db) => false,
+                    m = read_pg(&mut w.client) => m.tag == b'E',
+                };
+                if answered {
+                    assert_eq!(read_pg(&mut w.client).await.tag, b'Z', "{sql}");
+                }
+            }
+        }
+        if let Some(b) = &builder {
+            assert!(b.flush(std::time::Duration::from_secs(5)));
+        }
+        events(&queue)
+            .into_iter()
+            .map(|mut e| {
+                let o = e.as_object_mut().unwrap();
+                for k in ["event_id", "occurred_at", "latency_ms"] {
+                    o.remove(k);
+                }
+                e
+            })
+            .collect()
+    }
+
+    for mysql in [false, true] {
+        let inline = run(mysql, false).await;
+        let deferred = run(mysql, true).await;
+        assert_eq!(inline.len(), STATEMENTS.len(), "mysql={mysql}");
+        assert_eq!(inline, deferred, "mysql={mysql}");
+        assert!(
+            inline.iter().all(|e| !e.to_string().contains("Alice")),
+            "sanitized: {inline:?}"
+        );
+    }
 }

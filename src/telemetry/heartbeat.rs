@@ -21,6 +21,11 @@
 //! spool's bound, `spool_max_bytes`. Fields are only ever added, so `v` stays 1 and
 //! an API that does not know them ignores them. The same figures feed `/metrics`
 //! and the CloudWatch EMF line (`telemetry::metrics`).
+//!
+//! Since 4.20.0 it also carries `upstream`: the database version the upstream
+//! reported and, on PostgreSQL, whether it is newer than the proxy's SQL parser
+//! (`tcp::upstream_version`), so the dashboard can show it. `null` until a
+//! connection has reached the database. Never the database's address.
 
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -80,6 +85,9 @@ pub struct HeartbeatStats {
     pub last_delivery_at: Option<String>,
     /// The disk spool's byte bound; 0 for the memory buffer (since 4.12.0).
     pub spool_max_bytes: u64,
+    /// The upstream database's version against the parser's (since 4.20.0);
+    /// `None` before the first connection reached it.
+    pub upstream: Option<crate::tcp::upstream_version::UpstreamVersionReport>,
 }
 
 /// Everything the pipeline can say about itself at one instant (since 4.12.0):
@@ -128,6 +136,7 @@ pub struct StatsSource {
     quota: Arc<QuotaGate>,
     spool_max_bytes: u64,
     started_at: SystemTime,
+    upstream: &'static crate::tcp::upstream_version::UpstreamVersions,
 }
 
 impl StatsSource {
@@ -144,7 +153,18 @@ impl StatsSource {
             reporter,
             spool_max_bytes: 0,
             started_at: SystemTime::now(),
+            upstream: crate::tcp::upstream_version::global(),
         }
+    }
+
+    /// Reads the upstream versions from `table` instead of the process's.
+    #[cfg(test)]
+    pub fn with_upstream_versions(
+        mut self,
+        table: &'static crate::tcp::upstream_version::UpstreamVersions,
+    ) -> Self {
+        self.upstream = table;
+        self
     }
 
     /// The disk spool's byte bound, reported as `spool_max_bytes` (0 by default:
@@ -230,6 +250,7 @@ impl StatsSource {
             oldest_undelivered_age_s: p.oldest_undelivered_age_s,
             last_delivery_at: p.last_delivery_at.map(|t| t.to_rfc3339()),
             spool_max_bytes: p.spool_max_bytes,
+            upstream: self.upstream.report(),
         }
     }
 
@@ -274,7 +295,8 @@ mod tests {
     fn the_header_carries_the_pipeline_counters() {
         let queue: Arc<dyn EventQueue> = Arc::new(MemoryQueue::new(2));
         let reporter = Reporter::new(cfg(), Arc::clone(&queue));
-        let source = StatsSource::new(BufferMode::Memory, Arc::clone(&queue), reporter);
+        let source = StatsSource::new(BufferMode::Memory, Arc::clone(&queue), reporter)
+            .with_upstream_versions(Box::leak(Box::default()));
         for i in 0..3 {
             queue.push(event(&format!("e{i}")));
         }
@@ -298,6 +320,10 @@ mod tests {
         assert!(json["last_delivery_at"].is_null());
         assert_eq!(json["spool_max_bytes"], 0);
         assert!(json["oldest_undelivered_age_s"].is_u64());
+        assert!(
+            json["upstream"].is_null(),
+            "no connection reached the database yet"
+        );
         assert!(uuid::Uuid::parse_str(json["instance_id"].as_str().unwrap()).is_ok());
         assert!(source.header_value().is_ascii());
         // Same process, same instance: the API computes deltas against it.
@@ -332,6 +358,36 @@ mod tests {
         assert_eq!(p.spooled_events, 2);
         let _ = queue.drain_batch(10);
         assert_eq!(source.pipeline_at(now).oldest_undelivered_age_s, 0);
+    }
+
+    /// The upstream's version (4.20.0) rides along once a connection reported
+    /// it, without the database's address.
+    #[test]
+    fn the_header_carries_the_upstream_version() {
+        let queue: Arc<dyn EventQueue> = Arc::new(MemoryQueue::new(2));
+        let table: &'static _ = Box::leak(Box::new(
+            crate::tcp::upstream_version::UpstreamVersions::new(),
+        ));
+        let source = StatsSource::new(
+            BufferMode::Memory,
+            Arc::clone(&queue),
+            Reporter::new(cfg(), Arc::clone(&queue)),
+        )
+        .with_upstream_versions(table);
+        table.observe_postgres("db.internal:5432", b"99.1 (Debian 99.1-1)");
+        let header = source.header_value();
+        assert!(header.is_ascii());
+        assert!(!header.contains("db.internal"), "{header}");
+        let json: serde_json::Value = serde_json::from_str(&header).unwrap();
+        let parser = crate::tcp::upstream_version::parser_pg_major().unwrap();
+        assert_eq!(
+            json["upstream"],
+            serde_json::json!({
+                "dialect": "postgres", "server_version": "99.1 (Debian 99.1-1)",
+                "server_major": 99, "parser_major": parser, "newer_than_parser": true
+            })
+        );
+        assert_eq!(json["v"], 1, "fields are only added");
     }
 
     #[test]

@@ -122,7 +122,8 @@ pub struct QueueStats {
     pub spool_bytes: u64,
     /// Events accepted by `push`.
     pub enqueued: u64,
-    /// Events refused by `push` because the channel to the disk writer was full.
+    /// Events refused by `push` because the channel to the disk writer was full,
+    /// or (since 4.19.0) the channel to the event builder (`telemetry::builder`).
     pub dropped_queue_full: u64,
     /// Oldest events discarded to stay within the buffer's bounds (events, and
     /// bytes and files for the disk spool).
@@ -215,7 +216,7 @@ pub fn new_queue(cfg: &ControlPlaneConfig) -> Box<dyn EventQueue> {
 
 /// Rate limit for a warning emitted from the query path: lets one through per
 /// `DROP_WARN_EVERY`, lock-free.
-struct WarnLimiter {
+pub(crate) struct WarnLimiter {
     /// Milliseconds since `epoch()` of the last warning, plus one; 0 = never.
     last: AtomicU64,
 }
@@ -226,13 +227,13 @@ fn epoch() -> Instant {
 }
 
 impl WarnLimiter {
-    const fn new() -> Self {
+    pub(crate) const fn new() -> Self {
         Self {
             last: AtomicU64::new(0),
         }
     }
 
-    fn allow(&self) -> bool {
+    pub(crate) fn allow(&self) -> bool {
         let now = epoch().elapsed().as_millis() as u64 + 1;
         let last = self.last.load(Ordering::Relaxed);
         if last != 0 && now.saturating_sub(last) < DROP_WARN_EVERY.as_millis() as u64 {

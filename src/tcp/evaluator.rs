@@ -22,7 +22,9 @@ use crate::tcp::protocol::QueryKind;
 /// the proxy's own fail-safe blocks below.
 pub const SENSITIVE_RULE_CODE: &str = "VERICTO-085";
 
-/// Result of evaluating a query on the TCP path.
+/// Result of evaluating a query on the TCP path. `Clone` for the telemetry
+/// event built off the query path (`telemetry::builder`).
+#[derive(Clone)]
 pub enum TcpDecision {
     /// Forward to the real DB. `observation` carries violation info when the
     /// action was Flag or Monitor (for telemetry), the parse-error allow-report
@@ -179,6 +181,7 @@ pub fn access_command_decision(label: &str, mode: AccessMode, monitor_mode: bool
 }
 
 /// A non-blocking violation (or parse-error allow-report) recorded for telemetry.
+#[derive(Clone)]
 pub struct Observation {
     pub rule_code: String,
     pub ast_node_path: String,

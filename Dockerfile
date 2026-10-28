@@ -41,12 +41,29 @@ FROM chef AS planner
 COPY . .
 RUN cargo chef prepare --recipe-path recipe.json
 
+# ── Optional PGO profile (4.19.0) ─────────────────────────────────────────────
+# Empty unless the build is given one as a named context:
+#   docker buildx build --build-context pgo=<dir holding merged.profdata> .
+# release.yml trains it on the performance gate's corpus (perf/pgo-train.sh,
+# docs/PERFORMANCE.md "PGO"). Without it the build is the plain release build.
+FROM scratch AS pgo
+
 # ── Stage 3: compile deps (cached layer) + source ────────────────────────────
 FROM chef AS builder
 
-# Deps layer — only invalidated when Cargo.toml changes
+# The profile, when there is one: `-Cprofile-use` for the dependencies and the
+# proxy alike (both steps need the same RUSTFLAGS, or cargo rebuilds the deps).
+COPY --from=pgo / /pgo/
+# Opt-in code generation for one CPU family, e.g. `--build-arg TARGET_CPU=neoverse-v1`
+# for an image that only runs on Graviton3. Empty for the published images, which
+# must run on any x86_64 / aarch64 machine.
+ARG TARGET_CPU=
+
+# Deps layer — only invalidated when Cargo.toml changes (or the profile does)
 COPY --from=planner /app/recipe.json recipe.json
-RUN cargo chef cook --release --locked --recipe-path recipe.json
+RUN RUSTFLAGS="${TARGET_CPU:+-Ctarget-cpu=$TARGET_CPU}"; \
+    if [ -f /pgo/merged.profdata ]; then RUSTFLAGS="$RUSTFLAGS -Cprofile-use=/pgo/merged.profdata"; fi; \
+    RUSTFLAGS="$RUSTFLAGS" cargo chef cook --release --locked --recipe-path recipe.json
 
 # Source layer — only recompiles your code (seconds on rebuilds). The manifest
 # and lockfile are required here: `cargo chef cook` builds only dependencies
@@ -55,7 +72,9 @@ RUN cargo chef cook --release --locked --recipe-path recipe.json
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 # --locked: build exactly the reviewed Cargo.lock, never a re-resolved one.
-RUN cargo build --release --locked
+RUN RUSTFLAGS="${TARGET_CPU:+-Ctarget-cpu=$TARGET_CPU}"; \
+    if [ -f /pgo/merged.profdata ]; then RUSTFLAGS="$RUSTFLAGS -Cprofile-use=/pgo/merged.profdata"; fi; \
+    RUSTFLAGS="$RUSTFLAGS" cargo build --release --locked
 
 # Notices for everything compiled into the binary; see third-party/build-notices.sh.
 COPY third-party ./third-party
@@ -73,7 +92,7 @@ RUN sh third-party/build-notices.sh THIRD_PARTY_LICENSES
 # Only the `latest` tag is free on cgr.dev, so it is pinned by digest and
 # Dependabot (docker, weekly) proposes the new digest; Chainguard does not
 # promise to keep old digests, so a stale pin can stop pulling.
-FROM cgr.dev/chainguard/glibc-dynamic:latest@sha256:2827063c9efb4ba971d8621eb75f4e61b8d19850a6293a797df37358cc6f687b AS runner
+FROM cgr.dev/chainguard/glibc-dynamic:latest@sha256:5bb932663cff4fb276186720e0357af55c5e47f12e4d9f44ea0060fa3e7bca88 AS runner
 
 # Owned by root and not writable by the user the proxy runs as.
 COPY --from=builder /app/target/release/vericto-proxy /usr/local/bin/vericto-proxy

@@ -26,6 +26,21 @@ pub struct PostgresProtocol;
 /// plaintext at most, so a client read is usually framed whole from it.
 pub const CLIENT_READ_BUFFER: usize = 16 * 1024;
 
+/// The PostgreSQL message `slot` holds, making it one first (its buffer is then
+/// reused from message to message).
+fn pg_slot(slot: &mut RawClientMessage) -> &mut crate::tcp::codec::PgMessage {
+    if !matches!(slot, RawClientMessage::Postgres(_)) {
+        *slot = RawClientMessage::Postgres(crate::tcp::codec::PgMessage {
+            tag: 0,
+            body: Vec::new(),
+        });
+    }
+    let RawClientMessage::Postgres(message) = slot else {
+        unreachable!("set above")
+    };
+    message
+}
+
 #[async_trait::async_trait]
 impl WireProtocol for PostgresProtocol {
     fn dialect(&self) -> Dialect {
@@ -50,16 +65,15 @@ impl WireProtocol for PostgresProtocol {
         client_read: &mut crate::tcp::client_tls::ClientReader<'_>,
         slot: &mut RawClientMessage,
     ) -> std::io::Result<bool> {
-        if !matches!(slot, RawClientMessage::Postgres(_)) {
-            *slot = RawClientMessage::Postgres(crate::tcp::codec::PgMessage {
-                tag: 0,
-                body: Vec::new(),
-            });
-        }
-        let RawClientMessage::Postgres(message) = slot else {
-            unreachable!("set above")
-        };
-        crate::tcp::codec::read_message_into(client_read, message).await
+        crate::tcp::codec::read_message_into(client_read, pg_slot(slot)).await
+    }
+
+    fn take_buffered_message(
+        &self,
+        client_read: &mut crate::tcp::client_tls::ClientReader<'_>,
+        slot: &mut RawClientMessage,
+    ) -> bool {
+        crate::tcp::codec::frame_buffered_into(client_read, pg_slot(slot))
     }
 
     fn client_read_buffer(&self) -> usize {

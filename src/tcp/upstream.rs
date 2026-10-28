@@ -116,9 +116,8 @@ pub async fn connect_upstream(
         )));
     }
 
-    let client_auth = load_client_auth(client_cert_path, client_key_path)?;
-    let config = build_client_config(mode, ca_path, client_auth)?;
-    let connector = TlsConnector::from(Arc::new(config));
+    let config = shared_client_config(mode, ca_path, client_cert_path, client_key_path)?;
+    let connector = TlsConnector::from(config);
     let server_name = ServerName::try_from(host.to_string()).map_err(|_| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -150,9 +149,8 @@ pub async fn upgrade_to_tls_client(
     client_cert_path: Option<&str>,
     client_key_path: Option<&str>,
 ) -> io::Result<(UpstreamRead, UpstreamWrite)> {
-    let client_auth = load_client_auth(client_cert_path, client_key_path)?;
-    let config = build_client_config(mode, ca_path, client_auth)?;
-    let connector = TlsConnector::from(Arc::new(config));
+    let config = shared_client_config(mode, ca_path, client_cert_path, client_key_path)?;
+    let connector = TlsConnector::from(config);
     let server_name = ServerName::try_from(host.to_string()).map_err(|_| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -164,8 +162,98 @@ pub async fn upgrade_to_tls_client(
     Ok((Box::new(r), Box::new(w)))
 }
 
-/// Loads the upstream TLS material once, exactly as [`connect_upstream`] does for
-/// every connection, so that a missing or unreadable CA bundle, one without a
+/// Which files a client config was built from, and their state then.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ConfigSource {
+    mode: UpstreamTlsMode,
+    paths: [Option<String>; 3],
+    stamps: [Option<FileStamp>; 3],
+}
+
+/// What tells a rotated file from the one a config was built from: its inode,
+/// size and modification time (a Kubernetes secret or a `mv` into place gives a
+/// new inode; an in-place rewrite a new time).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FileStamp {
+    len: u64,
+    modified: Option<std::time::SystemTime>,
+    #[cfg(unix)]
+    inode: u64,
+}
+
+impl FileStamp {
+    /// `None` when the file cannot be read: the build then fails as it did.
+    fn of(path: &str) -> Option<Self> {
+        let meta = std::fs::metadata(path).ok()?;
+        Some(Self {
+            len: meta.len(),
+            modified: meta.modified().ok(),
+            #[cfg(unix)]
+            inode: std::os::unix::fs::MetadataExt::ino(&meta),
+        })
+    }
+}
+
+/// The rustls client config of the database hop, shared by every connection
+/// (4.19.0). Up to 4.18.0 each connection read the CA bundle and the
+/// mutual-TLS pair again and built a config of its own, which cost CPU on every
+/// connect and threw away rustls' session cache, so no connection could resume
+/// the TLS session of an earlier one (MySQL 8.0.29+ resumes; PostgreSQL turns
+/// resumption off on its side). The config is now built once and kept while the
+/// files it was built from are unchanged: a connection checks their inode, size
+/// and modification time (one `stat` each) and rebuilds when one of them moved,
+/// so a rotated certificate still applies from the next connection, as before.
+fn shared_client_config(
+    mode: UpstreamTlsMode,
+    ca_path: Option<&str>,
+    client_cert_path: Option<&str>,
+    client_key_path: Option<&str>,
+) -> io::Result<Arc<ClientConfig>> {
+    static CACHE: ConfigCache = ConfigCache::new();
+    CACHE.get(mode, ca_path, client_cert_path, client_key_path)
+}
+
+/// One cached client config and the files it was built from.
+struct ConfigCache(std::sync::Mutex<Option<(ConfigSource, Arc<ClientConfig>)>>);
+
+impl ConfigCache {
+    const fn new() -> Self {
+        Self(std::sync::Mutex::new(None))
+    }
+
+    /// The config for these settings: the cached one while its files are
+    /// unchanged, otherwise a new one, which replaces it.
+    fn get(
+        &self,
+        mode: UpstreamTlsMode,
+        ca_path: Option<&str>,
+        client_cert_path: Option<&str>,
+        client_key_path: Option<&str>,
+    ) -> io::Result<Arc<ClientConfig>> {
+        let files = [ca_path, client_cert_path, client_key_path];
+        let source = ConfigSource {
+            mode,
+            paths: files.map(|p| p.map(str::to_string)),
+            stamps: files.map(|p| p.and_then(FileStamp::of)),
+        };
+        if let Some((_, config)) = self
+            .0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .filter(|(cached, _)| *cached == source)
+        {
+            return Ok(Arc::clone(config));
+        }
+        let client_auth = load_client_auth(client_cert_path, client_key_path)?;
+        let config = Arc::new(build_client_config(mode, ca_path, client_auth)?);
+        *self.0.lock().unwrap_or_else(|e| e.into_inner()) = Some((source, Arc::clone(&config)));
+        Ok(config)
+    }
+}
+
+/// Loads the upstream TLS material once, exactly as [`connect_upstream`] does
+/// (and keeps the config it builds for the connections), so that a missing or unreadable CA bundle, one without a
 /// certificate, half a mutual-TLS pair, or a client certificate or key that does
 /// not parse fails the proxy at startup instead of every connection.
 ///
@@ -179,8 +267,8 @@ pub fn validate_upstream_tls(
     if mode == UpstreamTlsMode::Disable {
         return Ok(());
     }
-    let client_auth = load_client_auth(client_cert_path, client_key_path)?;
-    build_client_config(mode, ca_path, client_auth).map(drop)
+    // Builds the shared config the first connection then reuses.
+    shared_client_config(mode, ca_path, client_cert_path, client_key_path).map(drop)
 }
 
 /// Optional client certificate chain + private key for upstream mutual TLS.
@@ -797,6 +885,45 @@ mod tests {
             .unwrap()
             .expect("both halves parsed");
         assert_eq!(certs.len(), 1);
+    }
+
+    /// The config is built once and shared while its files are unchanged; a
+    /// rotated CA bundle, other settings, or a file that is gone mean a new one
+    /// (or the same error as before), never a stale config.
+    #[test]
+    fn the_client_config_is_shared_until_a_file_changes() {
+        install_provider();
+        let cache = ConfigCache::new();
+        let ca_pem = |name: &str| {
+            let key = rcgen::KeyPair::generate().unwrap();
+            let mut params = rcgen::CertificateParams::new(vec![name.to_string()]).unwrap();
+            params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+            params.self_signed(&key).unwrap().pem()
+        };
+        let ca = TempPem::new(&ca_pem("first-ca"));
+        let get = |mode, ca: Option<&str>| cache.get(mode, ca, None, None);
+
+        let a = get(UpstreamTlsMode::VerifyCa, Some(ca.path())).unwrap();
+        let b = get(UpstreamTlsMode::VerifyCa, Some(ca.path())).unwrap();
+        assert!(Arc::ptr_eq(&a, &b), "unchanged files: the same config");
+
+        // Rotated in place (another size, another time) or moved into place
+        // (another inode): a new config.
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        std::fs::write(&ca.0, ca_pem("second-ca-with-a-longer-name")).unwrap();
+        let c = get(UpstreamTlsMode::VerifyCa, Some(ca.path())).unwrap();
+        assert!(!Arc::ptr_eq(&b, &c), "a rotated CA bundle is read again");
+        let d = get(UpstreamTlsMode::VerifyCa, Some(ca.path())).unwrap();
+        assert!(Arc::ptr_eq(&c, &d));
+
+        let e = get(UpstreamTlsMode::Require, None).unwrap();
+        assert!(!Arc::ptr_eq(&d, &e), "other settings: another config");
+
+        drop(ca);
+        let gone = std::env::temp_dir().join("vericto-upstream-test-gone.pem");
+        let err = get(UpstreamTlsMode::VerifyCa, gone.to_str())
+            .expect_err("a missing bundle fails as before");
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
     }
 
     #[test]

@@ -15,6 +15,7 @@ pub mod cancel;
 pub mod codec;
 pub mod codec_mysql;
 pub mod evaluator;
+pub mod fast_path;
 pub mod healthz;
 pub mod kill_switch;
 pub mod pg_response;
@@ -25,6 +26,7 @@ pub mod query_limit;
 pub mod session;
 pub mod tx_state;
 pub mod upstream;
+pub mod upstream_version;
 
 use std::sync::Arc;
 
@@ -84,6 +86,8 @@ pub struct TcpProxyOptions {
     pub healthz_port: Option<u16>,
     /// `VERICTO_POLICY_RULES=off|observe|enforce` (default off, since 4.15.0).
     pub policy_rules: crate::tcp::policy_rules::PolicyRulesMode,
+    /// `VERICTO_TRIVIAL_FAST_PATH=on|off` (default on, since 4.19.0).
+    pub trivial_fast_path: bool,
 }
 
 impl TcpProxyOptions {
@@ -144,6 +148,9 @@ impl TcpProxyOptions {
             // Business policy rules; an unsupported value fails startup.
             policy_rules: crate::tcp::policy_rules::PolicyRulesMode::parse(
                 env("VERICTO_POLICY_RULES").as_deref(),
+            )?,
+            trivial_fast_path: crate::tcp::fast_path::enabled_from(
+                env("VERICTO_TRIVIAL_FAST_PATH").as_deref(),
             )?,
         }))
     }
@@ -216,6 +223,8 @@ pub async fn run_pg_proxy(
             query_limit::configured_max_query_bytes(),
             vericto_engine::Dialect::Postgres,
         ),
+        inline_eval_max_bytes: query_limit::configured_inline_eval_max_bytes(),
+        trivial_fast_path: opts.trivial_fast_path,
         policy_rules: policy_runtime(&opts, policy_rules),
         cancel_keys: Default::default(),
     });
@@ -311,6 +320,8 @@ pub async fn run_mysql_proxy(
             query_limit::configured_max_query_bytes(),
             vericto_engine::Dialect::Mysql,
         ),
+        inline_eval_max_bytes: query_limit::configured_inline_eval_max_bytes(),
+        trivial_fast_path: opts.trivial_fast_path,
         policy_rules: policy_runtime(&opts, policy_rules),
         cancel_keys: Default::default(),
     });
@@ -348,6 +359,8 @@ mod access_tests;
 #[cfg(test)]
 mod fake_pg_tests;
 #[cfg(test)]
+mod fast_path_tests;
+#[cfg(test)]
 mod kill_switch_tests;
 #[cfg(test)]
 mod mysql_auth_tests;
@@ -363,6 +376,8 @@ mod rewrite_limit_tests;
 mod sensitive_tests;
 #[cfg(test)]
 mod session_tests;
+#[cfg(test)]
+mod upstream_version_tests;
 
 #[cfg(test)]
 mod tests {
@@ -381,6 +396,28 @@ mod tests {
 
     fn options(vars: &[(&str, &str)]) -> Option<TcpProxyOptions> {
         try_options(vars).expect("a valid configuration")
+    }
+
+    /// `VERICTO_TRIVIAL_FAST_PATH`: on unless set to `off`; anything else stops
+    /// the proxy at startup with the variable named.
+    #[test]
+    fn the_trivial_fast_path_is_on_by_default_and_off_only_when_asked() {
+        let host = ("UPSTREAM_HOST", "db");
+        assert!(options(&[host]).unwrap().trivial_fast_path);
+        assert!(
+            options(&[host, ("VERICTO_TRIVIAL_FAST_PATH", "on")])
+                .unwrap()
+                .trivial_fast_path
+        );
+        assert!(
+            !options(&[host, ("VERICTO_TRIVIAL_FAST_PATH", "OFF")])
+                .unwrap()
+                .trivial_fast_path
+        );
+        let err = try_options(&[host, ("VERICTO_TRIVIAL_FAST_PATH", "no")])
+            .err()
+            .expect("an unknown value is an error");
+        assert!(err.contains("VERICTO_TRIVIAL_FAST_PATH"), "{err}");
     }
 
     /// Both TLS modes are read in any case, with surrounding whitespace ignored;

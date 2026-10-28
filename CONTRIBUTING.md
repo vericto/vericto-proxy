@@ -96,7 +96,9 @@ in two steps:
    major version as the engine (the comment there explains why). If `pg_query`
    changes version, update `third-party/pg_query-bundled.txt` too: it holds the
    licenses of the C code that crate compiles in, and the image build stops when
-   its version line does not match `Cargo.lock`.
+   its version line does not match `Cargo.lock`. The same goes for
+   `third-party/mimalloc-bundled.txt` and the `libmimalloc-sys` crate (the C
+   allocator it compiles in).
 2. If the rule should be part of the built-in ruleset used without the
    control-plane link, add its code, severity and default action to
    `default_ruleset()` in `src/tcp/evaluator.rs`, and to the table its tests check.
@@ -128,6 +130,9 @@ here forward is English.
 ## Pull request acceptance criteria
 
 - ✅ CI passes (`fmt`, `clippy -D warnings`, `cargo test`).
+- ✅ The performance gate passes: no workload of the corpus costs more than 3%
+  more instructions per statement than the base, and every statement is answered
+  as before ([docs/PERFORMANCE.md](docs/PERFORMANCE.md#ci-performance-gate)).
 - ✅ The Contributor License Agreement is signed.
 - ✅ New rules include both a blocked-case and an allowed-case test.
 - ✅ At least one maintainer review.

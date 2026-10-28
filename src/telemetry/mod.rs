@@ -11,6 +11,7 @@
 //! (see `queue`). If the API is down, events buffer (and drop when full, counted
 //! and logged) — the proxy keeps evaluating and blocking queries.
 
+pub mod builder;
 pub mod heartbeat;
 pub mod metrics;
 pub mod queue;

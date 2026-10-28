@@ -728,6 +728,7 @@ fn relayed(mysql: bool) -> Relayed {
             tx.clone(),
             None,
             responses.clone().expect("PostgreSQL coordinator"),
+            None,
         ))
     };
     let relayed_tx = tx.clone();

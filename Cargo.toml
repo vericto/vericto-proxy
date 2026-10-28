@@ -1,6 +1,6 @@
 [package]
 name = "vericto-proxy"
-version = "4.18.0"
+version = "4.20.0"
 edition = "2024"
 rust-version = "1.88"
 description = "Vericto — Deterministic SQL firewall — TCP wire-protocol proxy for customer infrastructure"
@@ -73,6 +73,16 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 # Utilities
 uuid = { version = "1.10", features = ["v4"] }
 chrono = { version = "0.4", features = ["serde"] }
+
+# Global allocator (4.19.0, the default `mimalloc` feature): fewer instructions
+# per statement than glibc's malloc on every workload of the performance gate
+# (docs/PERFORMANCE.md, "Allocator"). MIT, C sources compiled by `cc`, no system
+# library. `--no-default-features` builds with the system allocator.
+mimalloc = { version = "0.1", optional = true, default-features = false }
+
+[features]
+default = ["mimalloc"]
+mimalloc = ["dep:mimalloc"]
 
 [dev-dependencies]
 tempfile = "3"

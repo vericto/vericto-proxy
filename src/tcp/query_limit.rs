@@ -113,6 +113,49 @@ pub fn effective_max_query_bytes(configured: usize, dialect: Dialect) -> usize {
     }
 }
 
+/// Default of `VERICTO_INLINE_EVAL_MAX_BYTES` (since 4.19.0): statements up to
+/// this size are evaluated on the session's own task rather than on the blocking
+/// pool.
+///
+/// The pool costs two thread hand-offs per statement (a futex wake to the pool
+/// thread, an eventfd write and an epoll wake back to the worker), about 4 of the
+/// 10 system calls a PostgreSQL statement costs the proxy, plus two context
+/// switches. Below this size the evaluation is shorter than that: measured at
+/// 0.1 to 0.25 µs per byte, 1 KiB is about 120 to 200 µs at the worst, and the
+/// statements of OLTP traffic (50 to 500 bytes) take 10 to 80 µs. Above it the
+/// pool keeps one large statement from stalling the other connections a worker
+/// serves, as before.
+pub const DEFAULT_INLINE_EVAL_MAX_BYTES: usize = 1024;
+
+/// Read `VERICTO_INLINE_EVAL_MAX_BYTES`, falling back to
+/// [`DEFAULT_INLINE_EVAL_MAX_BYTES`]. `0` evaluates every statement on the
+/// blocking pool (the behaviour up to 4.18.0).
+pub fn configured_inline_eval_max_bytes() -> usize {
+    inline_eval_max_bytes_from(
+        std::env::var("VERICTO_INLINE_EVAL_MAX_BYTES")
+            .ok()
+            .as_deref(),
+    )
+}
+
+/// [`configured_inline_eval_max_bytes`] for the raw value of the variable.
+fn inline_eval_max_bytes_from(raw: Option<&str>) -> usize {
+    match raw {
+        None => DEFAULT_INLINE_EVAL_MAX_BYTES,
+        Some(raw) => match raw.trim().parse::<usize>() {
+            Ok(v) => v,
+            Err(_) => {
+                tracing::warn!(
+                    value = %raw,
+                    default = DEFAULT_INLINE_EVAL_MAX_BYTES,
+                    "VERICTO_INLINE_EVAL_MAX_BYTES is not a non-negative integer; using the default"
+                );
+                DEFAULT_INLINE_EVAL_MAX_BYTES
+            }
+        },
+    }
+}
+
 /// Rule code reported when a query is refused for its size.
 ///
 /// Not a rule violation: there is no AST to point at and no severity to resolve,
@@ -189,6 +232,25 @@ mod tests {
     use super::*;
     use crate::tcp::evaluator::TcpDecision;
     use vericto_engine::rules::engine::EnforcementAction;
+
+    /// Unset is the default; any non-negative integer is taken as is, 0
+    /// included (every statement on the blocking pool); garbage is the default.
+    #[test]
+    fn inline_eval_threshold_parses_zero_and_falls_back_on_garbage() {
+        assert_eq!(
+            inline_eval_max_bytes_from(None),
+            DEFAULT_INLINE_EVAL_MAX_BYTES
+        );
+        assert_eq!(inline_eval_max_bytes_from(Some(" 4096 ")), 4096);
+        assert_eq!(inline_eval_max_bytes_from(Some("0")), 0);
+        for bad in ["", "-1", "1k", "abc"] {
+            assert_eq!(
+                inline_eval_max_bytes_from(Some(bad)),
+                DEFAULT_INLINE_EVAL_MAX_BYTES,
+                "{bad:?}"
+            );
+        }
+    }
 
     #[test]
     fn postgres_and_mysql_have_different_caps() {

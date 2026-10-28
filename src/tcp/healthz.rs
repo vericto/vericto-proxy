@@ -217,6 +217,7 @@ async fn respond(head: &[u8], extras: &HealthzExtras) -> Vec<u8> {
         if let Some(sig) = &extras.bundle_signatures {
             body.push_str(&sig.render_prometheus());
         }
+        body.push_str(&crate::tcp::upstream_version::global().render_prometheus());
         return http_response("200 OK", "text/plain; version=0.0.4; charset=utf-8", &body);
     }
     http_response("404 Not Found", "text/plain; charset=utf-8", "not found\n")

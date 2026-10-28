@@ -58,6 +58,7 @@ buffer), or to an empty value to turn it off.
 | `VERICTO_TELEMETRY_FLUSH_SECS`      | `5`     | Longest the oldest pending event waits before a partial batch is sent (whichever comes first with the batch size) |
 | `VERICTO_TELEMETRY_MAX_IN_FLIGHT`   | `4`     | POSTs outstanding at once (1–64)                 |
 | `VERICTO_TELEMETRY_GZIP`            | `true`  | gzip request bodies (`Content-Encoding: gzip`); turned off automatically if the API refuses them |
+| `VERICTO_TELEMETRY_BUILD_QUEUE`     | `4096`  | 4.19.0+. Sanitized-mode events waiting to be built on the telemetry builder thread, off the query path; past it an event is dropped and counted in `dropped_queue_full`. `0` builds every event on the query path, as up to 4.18.0. See [Telemetry off the query path](#telemetry-off-the-query-path) |
 | `VERICTO_TELEMETRY_RETRY_BASE_MS`   | `1000`  | First wait after a retryable delivery failure; doubles per consecutive failure |
 | `VERICTO_TELEMETRY_RETRY_MAX_SECS`  | `60`    | Longest wait between delivery retries            |
 | `VERICTO_TELEMETRY_QUEUE_CAPACITY`  | `2048`  | buffer=disk: events queued in memory for the spool writer; past it new events are dropped and counted, queries never wait |
@@ -97,7 +98,35 @@ does not know the header ignores it. The header also says how far behind deliver
 is: `oldest_undelivered_age_s` (seconds since the oldest event still waiting was
 recorded, 0 when none waits), `last_delivery_at` (the last 2xx, `null` before the
 first) and `spool_max_bytes` (the spool's bound, 0 with the memory buffer). The
-same figures are in [Metrics](#metrics).
+same figures are in [Metrics](#metrics). Since 4.20.0 it also carries `upstream`:
+the database version the last connections reported (`dialect`, `server_version`,
+`server_major`, `parser_major`, `newer_than_parser`; never the database's
+address), `null` until a connection has reached the database; see
+[SQL parser version and database version](#sql-parser-version-and-database-version).
+
+### Telemetry off the query path
+
+In sanitized mode (`telemetry_query_mode: sanitized`) each event normalizes the
+statement's text a second time, after the evaluation: libpg_query for PostgreSQL,
+the MySQL tokenizer for MySQL. Since 4.19.0 that work runs on a thread of its own
+(`vericto-telemetry-build`): the query path hands it the statement's SQL, decision
+and identity, the telemetry mode and the time, and answers the client without
+waiting. The event is the one the query path would have built (same fields, same
+normalized text, same `occurred_at`; `event_id` is random either way), events keep
+their order, and a shutdown flush includes the events still being built.
+
+- The hand-over never blocks: past `VERICTO_TELEMETRY_BUILD_QUEUE` waiting events
+  an event is dropped, counted in `dropped_queue_full` and logged (rate-limited).
+  The builder normally keeps up by a wide margin; a full queue means its thread
+  gets no CPU.
+- Raw-mode events are still built on the query path, where they cost less than
+  the hand-over (one exception: while the builder holds sanitized events, a raw one
+  waits behind them, so a mode change does not reorder events).
+- Measured with the callgrind gate (one worker, mimalloc): the query path of the
+  sanitized workloads costs 7 to 14% fewer instructions per statement, the process
+  as a whole 0.6 to 1.8% more (the hand-over). A deployment whose limit is CPU
+  rather than latency, such as a small Fargate task near its quota, can set
+  `VERICTO_TELEMETRY_BUILD_QUEUE=0`.
 
 ### Over the monthly quota
 
@@ -192,6 +221,37 @@ hop; `PROXY_TLS_MODE` covers the client→proxy hop.
 > `UPSTREAM_SSLMODE=require` (or `verify-ca` / `verify-full`) together (or
 > leave both off). See
 > [engine-specific notes](#engine-specific-notes).
+
+### Certificates, resumption and TLS cost
+
+- **Prefer ECDSA P-256 certificates** for `PROXY_TLS_CERT` (and for the database,
+  where you choose). The key may be PKCS#8 (`BEGIN PRIVATE KEY`, what
+  `openssl genpkey` and most CAs give) or SEC1 (`BEGIN EC PRIVATE KEY`); RSA keys
+  (PKCS#8 or PKCS#1) keep working. A full TLS 1.3 handshake costs the proxy, as the
+  server, about 0.1 ms of CPU with an ECDSA P-256 certificate against 0.7 to
+  1.2 ms with RSA-2048 (measured in process, linux/arm64, 2026-10-26): with
+  clients that connect often, the certificate type is most of the TLS cost. Bulk
+  encryption (AES-256-GCM, about 1.8 to 2 GB/s per core) does not depend on it.
+- **Session resumption on the client listener** is on: the proxy keeps the last
+  256 TLS sessions in memory and gives TLS 1.3 clients tickets that refer to them
+  (no ticket key to protect). A client that offers its session back skips the
+  certificate signature: about 0.08 ms instead of 0.1 ms with ECDSA, instead of
+  0.7 ms or more with RSA. Whether a client resumes is up to its driver: the JDK
+  (pgJDBC, Connector/J) does; libpq and most Go and Python drivers start every
+  connection with a full handshake.
+- **The database hop** (4.19.0) reuses one rustls client configuration for every
+  connection while `UPSTREAM_SSLROOTCERT`, `UPSTREAM_SSLCERT` and
+  `UPSTREAM_SSLKEY` are unchanged (checked by inode, size and modification time
+  on each connection, so a rotated file applies from the next connection as
+  before). That saves rebuilding the configuration per connection (-15% of the
+  proxy's connection cost with `require`, -9% with `verify-full`), and lets a
+  connection resume the TLS session of an earlier one where the database supports
+  it: MySQL 8.0.29+ does (`Ssl_session_cache_hits` counts them), PostgreSQL
+  disables resumption on its side.
+- The crypto provider is rustls' `ring`. `aws-lc-rs` was measured as well
+  (2026-10-26, linux/arm64): the same ECDSA P-256 handshake and bulk cost within
+  the noise, a slower RSA-2048 handshake (1.1 to 1.2 ms against 0.7 ms), so the
+  provider was not changed.
 
 ## Query size limit
 
@@ -454,6 +514,8 @@ the same figures. All names start with `vericto_proxy_`:
 | `vericto_proxy_info{version,buffer}` / `vericto_proxy_telemetry_enabled` | gauge | Build and buffer; whether the control-plane link is on |
 | `vericto_proxy_bundle_signature_verified` | gauge | 4.16.0+, Prometheus only, policy rules on only: 1 once a verified sync bundle is in effect, 0 while the built-in ruleset is |
 | `vericto_proxy_bundle_signature_accepted_total` / `_rejected_total{reason}` | counter | Same conditions. Bundles (responses and the rules cache) whose signature verified, and those refused; `reason` is `missing`, `malformed`, `unsupported_scheme`, `digest_mismatch`, `unknown_key_id`, `bad_signature` or `no_trusted_key` |
+| `vericto_proxy_upstream_newer_than_parser` | gauge | 4.20.0+, Prometheus only, PostgreSQL only, after the first connection: 1 when the database reports a newer PostgreSQL major than the SQL parser's (see [SQL parser version and database version](#sql-parser-version-and-database-version)) |
+| `vericto_proxy_upstream_server_major_version` / `vericto_proxy_parser_major_version` | gauge | Same conditions. The database's PostgreSQL major (0 when its version cannot be read) and the parser's |
 
 - **Prometheus**: `VERICTO_METRICS_PROMETHEUS=true` serves `GET /metrics` on the
   health-check listener (`VERICTO_HEALTHZ_PORT`), never on the database port.
@@ -482,8 +544,22 @@ your monitoring, and never expose it to the internet.
 |----------|---------|-------------|
 | `VERICTO_WORKER_THREADS` | from the CPU limit | 4.16.2+. Async worker threads (1–1024; anything else stops the proxy at startup). By default the CPU limit rounded up, at most the CPUs the process may run on: the cgroup CPU quota visible in the container, or the ECS task's `Limits.CPU` from the task metadata endpoint, whichever is lower; without a limit, one per CPU. `TOKIO_WORKER_THREADS` is still honoured when this is unset |
 
+| `VERICTO_TRIVIAL_FAST_PATH` | `on` | 4.19.0+. `on` or `off` (any case; anything else stops the proxy at startup). A session remembers the decision the full evaluation reached for a trivial statement (`BEGIN`, `COMMIT`, `ROLLBACK`, `END`, `START TRANSACTION`, `SELECT 1`, `SET autocommit=0/1`, `SET NAMES utf8mb4`) and answers the same bytes with it while the ruleset and its effective policy are the same; see [The trivial-statement fast path](#the-trivial-statement-fast-path) |
+| `VERICTO_INLINE_EVAL_MAX_BYTES` | `1024` | 4.19.0+. Statements up to this many bytes are evaluated on the connection's own async task; larger ones on the blocking pool, as every statement was up to 4.18.0. `0` sends every statement to the pool. A value that is not a non-negative integer falls back to the default, with a warning |
+
 The proxy logs its choice once at startup (`"Runtime sizing"`, with
 `worker_threads`, `source`, `cpu_limit` and `available_cpus`).
+
+**Where a statement is evaluated (4.19.0).** The blocking pool hands every
+statement to another thread and back: a futex wake, an eventfd write and an epoll
+wake, about 4 of the 10 system calls a PostgreSQL statement costs the proxy, and
+two context switches. Evaluation takes 0.1 to 0.25 µs per byte of SQL, so the
+statements of an OLTP workload (50 to 500 bytes) take 10 to 80 µs, less than the
+hand-off; they now run on the connection's task. A statement over
+`VERICTO_INLINE_EVAL_MAX_BYTES` still goes to the pool, so one large statement
+cannot hold the other connections of its worker for long. Lower the value if a
+tail-latency budget is tighter than about 200 µs of evaluation per statement;
+`0` restores the 4.18.0 behaviour exactly.
 
 **Why a limit, not the CPU count.** On ECS Fargate the CPU quota of a task sits on
 the task's cgroup, which the container cannot see: a 0.5 vCPU task runs on a host
@@ -523,6 +599,38 @@ task's CPU metric against its statement rate.
 - Set `VERICTO_WORKER_THREADS` only to override the detection, e.g. on a platform
   that neither exposes the quota nor ECS task metadata.
 
+### The trivial-statement fast path
+
+Transaction control and the connection checks of pools cost as much evaluation as
+a real query, and an OLTP application sends two of them per transaction. Since
+4.19.0 a session evaluates each of them fully the first time and then reuses that
+decision, which is a cache of the engine's own answer and never a verdict of the
+proxy's:
+
+- Only these statements, compared after trimming ASCII whitespace and one trailing
+  `;`, in any ASCII case: `BEGIN`, `COMMIT`, `ROLLBACK`, `END`, `START TRANSACTION`,
+  `SELECT 1`, `SET autocommit=0`, `SET autocommit=1`, `SET NAMES utf8mb4`. A
+  comment, a second statement (`BEGIN; DROP …`), other whitespace or a Unicode
+  look-alike is not one of them and is evaluated every time; so are `SET ROLE`,
+  `SET SESSION AUTHORIZATION` and `SET search_path`.
+- The decision is reused for the **same bytes** only (`begin;` and `BEGIN` are
+  evaluated apart), sent the same way (simple query, Parse, COM_QUERY or
+  COM_STMT_PREPARE), and only while the session's ruleset and effective policy are
+  the ones it was reached under: a sync, a change of database or user, monitor
+  mode switched on or off, an allowlist changed, all evaluate again.
+- Never with business policy rules on (`VERICTO_POLICY_RULES`), where a verdict
+  also depends on the declared context and the time.
+- The kill switch, the size limit and everything after the decision (forwarding,
+  telemetry, transaction state) are unchanged. The event is the one the full path
+  reports, but for `latency_ms`.
+
+Measured with the callgrind gate: -86% instructions per statement on PostgreSQL
+`trivial`, -78% on MySQL, -8% on a pgbench TPC-B transaction (simple or extended
+protocol), -11% over MySQL COM_QUERY. A test sends every entry and thirty near
+misses through a session with and a session without the fast path, under every
+policy configuration that can bear on them, and requires the same bytes, answers
+and events (`fast_path_tests`). `off` evaluates every statement, as up to 4.18.0.
+
 ---
 
 ## Engine-specific notes
@@ -539,6 +647,48 @@ Only two things differ per engine; everything above is shared.
   transaction block, `E` in a failed one; 4.16.1+, with policy rules off too),
   and a MySQL `ERR_Packet` carries no status flags, so the client keeps those
   of the server's last OK.
+
+### SQL parser version and database version
+
+The engine reads PostgreSQL with libpg_query, the parser of **one PostgreSQL major
+version**: PostgreSQL 17 in this release (`pg_query` 6.x). It reads every
+statement of that version and of older ones. A database of a newer major (18, for
+example) also accepts syntax the parser does not know, such as virtual generated
+columns (`GENERATED ALWAYS AS (…) VIRTUAL`) or `RETURNING WITH (OLD AS o, NEW AS n)`.
+Such a statement cannot be parsed, so it is handled as a parse error
+(`VERICTO-PARSE-ERROR`, recorded with the parser's message):
+
+- **refused**, with the native error of a blocked query, when parse errors fail
+  closed: the workspace's parse-error policy says so, a `block` or `mask`
+  sensitive column is configured, or an agent allowlist applies in `enforce` mode;
+- **forwarded and flagged** under the fail-open default.
+
+Every statement the parser can read is evaluated as with any other version.
+
+Since 4.20.0 the proxy reads the `server_version` the database sends when a
+session starts and compares its major with the parser's (read from libpg_query
+itself, so it follows any parser update). When the database is newer, it logs one
+warning per upstream (`host:port`) for the life of the process, not per
+connection or statement, and again only if a later connection reports a still
+newer major:
+
+```json
+{"level":"WARN","fields":{"alert":"upstream_newer_than_parser","upstream":"db.internal:5432",
+ "server_version":"18.1 (Debian 18.1-1.pgdg13+2)","server_major":18,"parser_major":17,
+ "message":"The database runs a newer PostgreSQL major version than the proxy's SQL parser. …"}}
+```
+
+Search the logs for `upstream_newer_than_parser`. An equal or older database is
+logged at `debug` only, as is a `server_version` the proxy cannot read, which is
+otherwise ignored. Nothing about this changes a verdict or the bytes relayed, and it is read once per connection,
+never per statement. The same state is in `/metrics`
+(`vericto_proxy_upstream_newer_than_parser`, see [Metrics](#metrics)) and, with
+the control-plane link on, in the rule-sync heartbeat's `upstream` field, which
+the dashboard can show.
+
+MySQL: the server version of the handshake greeting is recorded (heartbeat, and
+a `debug` log line when it first appears) with no comparison: the MySQL parser
+(`sqlparser`) has no grammar per server version.
 
 ### Postgres details
 

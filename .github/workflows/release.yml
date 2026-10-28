@@ -33,9 +33,58 @@ jobs:
             runner: ubuntu-latest
           - platform: linux/arm64
             runner: ubuntu-24.04-arm
+    # The databases the PGO profile is trained against (perf/pgo-train.sh), as
+    # in perf-gate.yml. Both images are multi-arch indexes.
+    services:
+      postgres:
+        image: postgres:17@sha256:b8faeff7712663c2773a190181e1246e37e364b887611c04658c28b44e2408fe
+        env:
+          POSTGRES_USER: bench
+          POSTGRES_PASSWORD: bench
+          POSTGRES_DB: bench
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U bench" --health-interval 2s --health-timeout 5s --health-retries 30
+      mysql:
+        image: mysql:8.0@sha256:7dcddc01f13bab2f15cde676d44d01f61fc9f99fe7785e86196dfc07d358ae2b
+        env:
+          MYSQL_ROOT_PASSWORD: bench
+          MYSQL_DATABASE: bench
+          MYSQL_USER: bench
+          MYSQL_PASSWORD: bench
+        ports: ['3306:3306']
+        options: >-
+          --health-cmd "mysqladmin ping -h 127.0.0.1 -pbench" --health-interval 2s --health-timeout 5s --health-retries 60
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # ── PGO profile (4.19.0, docs/PERFORMANCE.md "PGO") ──────────────────────
+      # An instrumented build of this commit runs the performance gate's corpus
+      # against the two databases above; the merged profile goes to the image
+      # build as the `pgo` named context. Same rustc as the image (1.88.0), so the
+      # profile matches. Code generation stays generic (no target-cpu).
+      - name: Install Rust toolchain (PGO training)
+        uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
+        with:
+          toolchain: "1.88.0"
+          components: llvm-tools
+
+      - name: Install system dependencies (libclang + protoc for pg_query)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libclang-dev clang protobuf-compiler
+
+      - name: Train the PGO profile
+        run: |
+          RUSTFLAGS="-Cprofile-generate=$RUNNER_TEMP/pgo-build" \
+            cargo build --release --locked --bin vericto-proxy --example perf_gate
+          export PERF_DRIVER=target/release/examples/perf_gate
+          export LLVM_PROFILE_FILE="$RUNNER_TEMP/pgo-build/setup-%p.profraw"
+          "$PERF_DRIVER" setup --dialect pg --url "host=127.0.0.1 port=5432 user=bench password=bench dbname=bench"
+          "$PERF_DRIVER" setup --dialect mysql --url "mysql://bench:bench@127.0.0.1:3306/bench"
+          perf/pgo-train.sh target/release/vericto-proxy "$RUNNER_TEMP/pgo/merged.profdata"
+          rm -rf target "$RUNNER_TEMP/pgo-build"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
@@ -74,6 +123,7 @@ jobs:
           push: false
           labels: ${{ steps.meta.outputs.labels }}
           provenance: false
+          build-contexts: pgo=${{ runner.temp }}/pgo
           cache-from: type=gha,scope=${{ matrix.platform }}
           outputs: type=docker,dest=${{ runner.temp }}/image.tar
 
@@ -108,6 +158,7 @@ jobs:
           push: true
           labels: ${{ steps.meta.outputs.labels }}
           provenance: false
+          build-contexts: pgo=${{ runner.temp }}/pgo
           # Separate cache scope per arch so they don't overwrite each other
           cache-from: type=gha,scope=${{ matrix.platform }}
           cache-to: type=gha,mode=max,scope=${{ matrix.platform }}

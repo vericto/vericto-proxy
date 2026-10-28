@@ -1,0 +1,39 @@
+================================================================================
+C CODE COMPILED IN BY THE LIBMIMALLOC-SYS CRATE
+
+The libmimalloc-sys crate (the `mimalloc` feature, on by default since 4.19.0)
+compiles Microsoft's mimalloc allocator from the sources it bundles
+(c_src/mimalloc/v3, its default) and links it statically into the vericto-proxy binary.
+cargo-about only sees the crate's own license (MIT, Octavian Oncescu), so the
+notice of the C library is kept here and appended by build-notices.sh.
+
+Refresh this file when libmimalloc-sys changes version: the image build stops if
+the version below does not match Cargo.lock.
+
+libmimalloc-sys version: 0.1.49
+
+================================================================================
+mimalloc 3.3.2 (C library, bundled by libmimalloc-sys 0.1.49) - MIT License
+Source: https://github.com/microsoft/mimalloc/blob/v3.3.2/LICENSE
+
+MIT License
+
+Copyright (c) 2018-2025 Microsoft Corporation, Daan Leijen
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.

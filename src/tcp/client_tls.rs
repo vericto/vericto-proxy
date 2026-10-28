@@ -333,4 +333,80 @@ mod tests {
         let err = res.expect_err("PEM without a certificate must error");
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
+
+    /// A rustls client that trusts only `cert` (so a handshake that succeeds
+    /// was signed with its key), keeping its sessions when `resume`.
+    fn client_config(
+        cert: &CertificateDer<'static>,
+        resume: bool,
+    ) -> Arc<tokio_rustls::rustls::ClientConfig> {
+        let mut roots = tokio_rustls::rustls::RootCertStore::empty();
+        roots.add(cert.clone()).unwrap();
+        let mut config = tokio_rustls::rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        if !resume {
+            config.resumption = tokio_rustls::rustls::client::Resumption::disabled();
+        }
+        Arc::new(config)
+    }
+
+    /// One TLS handshake with the proxy's acceptor; how it went, client side.
+    async fn handshake(
+        acceptor: &TlsAcceptor,
+        config: Arc<tokio_rustls::rustls::ClientConfig>,
+    ) -> tokio_rustls::rustls::HandshakeKind {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let acceptor = acceptor.clone();
+        let server = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let (mut r, mut w) = accept_tls(&acceptor, tcp).await.unwrap();
+            let mut byte = [0u8; 1];
+            r.read_exact(&mut byte).await.unwrap();
+            w.write_all(&byte).await.unwrap();
+            w.flush().await.unwrap();
+        });
+        let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let name = tokio_rustls::rustls::pki_types::ServerName::try_from("proxy.test").unwrap();
+        let mut tls = tokio_rustls::TlsConnector::from(config)
+            .connect(name, tcp)
+            .await
+            .unwrap();
+        tls.write_all(b"x").await.unwrap();
+        let mut echo = [0u8; 1];
+        // Reading also takes in the session tickets the server sent.
+        tls.read_exact(&mut echo).await.unwrap();
+        server.await.unwrap();
+        tls.get_ref().1.handshake_kind().unwrap()
+    }
+
+    /// An ECDSA P-256 certificate, its key inline as PKCS#8 (what rcgen, `openssl
+    /// genpkey` and most CAs give), terminates client TLS, and a client that
+    /// offers the session it got resumes it on its next connection: the
+    /// listener keeps a session cache (rustls' default of 256 sessions) and
+    /// hands out TLS 1.3 tickets that refer to it. A client that does not offer
+    /// a session gets a full handshake.
+    #[tokio::test]
+    async fn ecdsa_p256_certificates_terminate_tls_and_sessions_resume() {
+        let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
+        let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+        let cert = rcgen::CertificateParams::new(vec!["proxy.test".to_string()])
+            .unwrap()
+            .self_signed(&key)
+            .unwrap();
+        let acceptor =
+            build_acceptor(&cert.pem(), &key.serialize_pem()).expect("ECDSA P-256 accepted");
+        use tokio_rustls::rustls::HandshakeKind::{Full, Resumed};
+
+        let resuming = client_config(cert.der(), true);
+        assert_eq!(handshake(&acceptor, resuming.clone()).await, Full);
+        assert_eq!(handshake(&acceptor, resuming.clone()).await, Resumed);
+        assert_eq!(handshake(&acceptor, resuming).await, Resumed);
+
+        let fresh = client_config(cert.der(), false);
+        assert_eq!(handshake(&acceptor, fresh.clone()).await, Full);
+        assert_eq!(handshake(&acceptor, fresh).await, Full);
+    }
 }

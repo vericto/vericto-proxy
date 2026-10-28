@@ -21,7 +21,8 @@ vericto-proxy 4.14.0) is itself licensed under FSL-1.1-ALv2.
 
 The vericto-proxy binary also contains third-party Rust crates and the C code
 that the pg_query crate compiles in (libpg_query, PostgreSQL, protobuf-c and
-xxHash), each under its own license. The Docker image lists them with their
+xxHash) and, since 4.19.0, that the libmimalloc-sys crate compiles in (mimalloc),
+each under its own license. The Docker image lists them with their
 license texts in /usr/share/doc/vericto-proxy/THIRD_PARTY_LICENSES, which
 third-party/build-notices.sh generates when the image is built.
 

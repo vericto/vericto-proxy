@@ -39,6 +39,34 @@ impl WireProtocol for MysqlProtocol {
         Ok(read_packet(client_read).await?.map(RawClientMessage::Mysql))
     }
 
+    async fn read_client_message_into(
+        &self,
+        client_read: &mut crate::tcp::client_tls::ClientReader<'_>,
+        slot: &mut RawClientMessage,
+    ) -> std::io::Result<bool> {
+        if !matches!(slot, RawClientMessage::Mysql(_)) {
+            *slot = RawClientMessage::Mysql(MySqlPacket {
+                seq: 0,
+                payload: Vec::new(),
+            });
+        }
+        let RawClientMessage::Mysql(packet) = slot else {
+            unreachable!("set above")
+        };
+        crate::tcp::codec_mysql::read_packet_into(client_read, packet).await
+    }
+
+    /// 4.19.0: the client is read through a buffer, so a command costs one read
+    /// of the socket instead of two (header, then payload). Nothing is coalesced
+    /// upstream: each packet is still forwarded and flushed on its own.
+    fn client_read_buffer(&self) -> usize {
+        crate::tcp::protocol::postgres::CLIENT_READ_BUFFER
+    }
+
+    fn buffers_client_reads(&self) -> bool {
+        true
+    }
+
     fn classify(&self, msg: &RawClientMessage) -> Classified {
         let RawClientMessage::Mysql(pkt) = msg else {
             // A protocol mismatch is a programming error; forward defensively.
