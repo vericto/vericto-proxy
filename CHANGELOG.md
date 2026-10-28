@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [4.20.0] - 2026-10-27
+
+**The proxy says when the database is a newer PostgreSQL than its parser.** The
+engine reads PostgreSQL with the PostgreSQL 17 parser; a PostgreSQL 18 database
+accepts syntax that parser cannot read, which the proxy handles as a parse error.
+The proxy now compares the `server_version` the database reports with the parser's
+version and, when the database is newer, logs one warning per upstream and shows
+it on `/metrics` and in the rule-sync heartbeat. Observability only: every
+statement is answered exactly as in 4.19.0, and nothing runs per statement.
+
 ### Added
 
 - **A warning when the database is a newer PostgreSQL than the parser**
