@@ -158,6 +158,19 @@ pub trait WireProtocol: Send + Sync {
         }
     }
 
+    /// Frames the next client message from what `client_read` already holds,
+    /// without I/O, into `slot`: `true` when it did. The interception loop tries
+    /// it before [`Self::read_client_message_into`], whose future the trait boxes
+    /// (PostgreSQL, 4.20.0: the messages of one client read after the first cost
+    /// no allocation). `false`, the default, leaves both untouched.
+    fn take_buffered_message(
+        &self,
+        _client_read: &mut crate::tcp::client_tls::ClientReader<'_>,
+        _slot: &mut RawClientMessage,
+    ) -> bool {
+        false
+    }
+
     /// The bytes the interception loop reads the client through before they
     /// are framed (4.17.3): PostgreSQL buffers, so the messages of one client
     /// read go upstream in one write; 0 reads the socket directly. Used with

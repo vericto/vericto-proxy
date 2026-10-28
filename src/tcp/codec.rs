@@ -277,6 +277,34 @@ pub fn frontend_message_size(buffered: &[u8]) -> Option<std::io::Result<usize>> 
 /// (a rare big message) is released before the next read.
 const REUSED_BODY_CAPACITY: usize = 64 * 1024;
 
+/// Frames the message at the start of `reader`'s buffer into `msg` when the
+/// buffer holds it whole: no read, and called directly (not through the
+/// protocol trait) no boxed future either (4.20.0: the `Bind`, `Execute` and
+/// `Sync` of one client read cost one allocation, not three). `false`, with
+/// nothing consumed, when the buffer holds no whole message or a length
+/// PostgreSQL never sends (which [`read_message_into`] then refuses).
+pub fn frame_buffered_into<R>(reader: &mut tokio::io::BufReader<R>, msg: &mut PgMessage) -> bool
+where
+    R: AsyncRead + Unpin,
+{
+    use tokio::io::AsyncBufReadExt;
+    let buffered = reader.buffer();
+    let Some(Ok(total)) = frontend_message_size(buffered) else {
+        return false;
+    };
+    if buffered.len() < total {
+        return false;
+    }
+    if msg.body.capacity() > REUSED_BODY_CAPACITY {
+        msg.body = Vec::new();
+    }
+    msg.tag = buffered[0];
+    msg.body.clear();
+    msg.body.extend_from_slice(&buffered[5..total]);
+    reader.consume(total);
+    true
+}
+
 /// [`read_message`] into `msg`, reusing its body buffer (4.17.3: the
 /// interception loop reads every frontend message into the same one, so the
 /// usual message costs no allocation). A message the reader's buffer holds
@@ -289,24 +317,19 @@ where
     R: AsyncRead + Unpin,
 {
     use tokio::io::AsyncBufReadExt;
-    if msg.body.capacity() > REUSED_BODY_CAPACITY {
-        msg.body = Vec::new();
-    }
     // Nothing buffered: one read fills the buffer (a whole client read,
     // usually), then the message is framed from it.
     if reader.buffer().is_empty() && reader.fill_buf().await?.is_empty() {
         return Ok(false); // clean EOF before a new message
     }
-    let buffered = reader.buffer();
-    if let Some(size) = frontend_message_size(buffered) {
-        let total = size?;
-        if buffered.len() >= total {
-            msg.tag = buffered[0];
-            msg.body.clear();
-            msg.body.extend_from_slice(&buffered[5..total]);
-            reader.consume(total);
-            return Ok(true);
-        }
+    if let Some(Err(e)) = frontend_message_size(reader.buffer()) {
+        return Err(e);
+    }
+    if frame_buffered_into(reader, msg) {
+        return Ok(true);
+    }
+    if msg.body.capacity() > REUSED_BODY_CAPACITY {
+        msg.body = Vec::new();
     }
 
     let mut tag = [0u8; 1];
@@ -593,5 +616,52 @@ mod tests {
     fn ready_for_query_is_idle() {
         let z = build_ready_for_query();
         assert_eq!(z, vec![b'Z', 0, 0, 0, 5, b'I']);
+    }
+
+    fn frame(tag: u8, body: &[u8]) -> Vec<u8> {
+        let mut out = vec![tag];
+        out.extend_from_slice(&(body.len() as i32 + 4).to_be_bytes());
+        out.extend_from_slice(body);
+        out
+    }
+
+    /// The messages a client read holds whole after the first are framed
+    /// without a read, exactly as the async read frames them; a partial message
+    /// or an impossible length is left to the async read.
+    #[tokio::test]
+    async fn buffered_messages_are_framed_without_a_read() {
+        let mut wire = frame(b'B', b"\0s1\0\0\0\0\0\0\0");
+        wire.extend(frame(b'E', b"\0\0\0\0\0"));
+        wire.extend(frame(b'S', b""));
+        let partial = frame(b'E', b"\0\0\0\0\0");
+        wire.extend_from_slice(&partial[..3]);
+        let mut reader = tokio::io::BufReader::with_capacity(1024, &wire[..]);
+        let mut msg = PgMessage {
+            tag: 0,
+            body: Vec::new(),
+        };
+        assert!(
+            !frame_buffered_into(&mut reader, &mut msg),
+            "nothing read yet"
+        );
+        assert!(read_message_into(&mut reader, &mut msg).await.unwrap());
+        assert_eq!((msg.tag, &msg.body[..]), (b'B', &b"\0s1\0\0\0\0\0\0\0"[..]));
+        assert!(frame_buffered_into(&mut reader, &mut msg));
+        assert_eq!((msg.tag, &msg.body[..]), (b'E', &b"\0\0\0\0\0"[..]));
+        assert!(frame_buffered_into(&mut reader, &mut msg));
+        assert_eq!((msg.tag, msg.body.len()), (b'S', 0));
+        assert!(!frame_buffered_into(&mut reader, &mut msg), "partial");
+        assert_eq!(reader.buffer(), &partial[..3]);
+        assert_eq!((msg.tag, msg.body.len()), (b'S', 0), "untouched");
+        assert!(read_message_into(&mut reader, &mut msg).await.is_err());
+
+        let bad = [b'Q', 0, 0, 0, 1, 0];
+        let mut reader = tokio::io::BufReader::with_capacity(1024, &bad[..]);
+        use tokio::io::AsyncBufReadExt;
+        reader.fill_buf().await.unwrap();
+        assert!(!frame_buffered_into(&mut reader, &mut msg));
+        assert_eq!(reader.buffer().len(), bad.len(), "nothing consumed");
+        let err = read_message_into(&mut reader, &mut msg).await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
     }
 }

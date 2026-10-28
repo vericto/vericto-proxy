@@ -385,9 +385,12 @@ pub async fn intercept_client_to_server(
         if !proto.has_buffered_message(client_read.buffer()) {
             upstream.flush().await?;
         }
-        if !proto
-            .read_client_message_into(&mut client_read, &mut msg)
-            .await?
+        // A message already buffered is framed here, without the boxed future
+        // of the trait's async read (4.20.0).
+        if !proto.take_buffered_message(&mut client_read, &mut msg)
+            && !proto
+                .read_client_message_into(&mut client_read, &mut msg)
+                .await?
         {
             break; // client closed
         }

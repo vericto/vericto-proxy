@@ -41,6 +41,19 @@ statement is answered exactly as in 4.19.0, and nothing runs per statement.
   and never per statement, and the table holds at most 16 upstreams. No new
   setting. See [docs/CONFIGURATION.md](docs/CONFIGURATION.md#sql-parser-version-and-database-version).
 
+### Performance
+
+- **PostgreSQL: a message the client read already holds is framed without an
+  allocation.** The interception loop read every frontend message through the
+  protocol trait's async read, whose future is boxed: one allocation and one free
+  per message. Under mimalloc (4.19.0's allocator) that alternation misses the
+  allocator's fast path every time, so a prepared statement's `Bind`, `Execute`
+  and `Sync` cost more than under glibc, and the CI performance gate measured
+  `pg oltp_prepared` at +3.6% instructions per statement over 4.18.0 on x86_64.
+  The loop now frames a message the read buffer holds whole directly; only the
+  first message of a client read goes through the async read. Nothing read,
+  relayed or answered changes.
+
 ## [4.19.0] - 2026-10-26
 
 **Less CPU per statement, with nothing answered differently.** A statement is
