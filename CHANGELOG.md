@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **A warning when the database is a newer PostgreSQL than the parser**
+  (`src/tcp/upstream_version.rs`). The engine parses PostgreSQL with libpg_query,
+  the grammar of one major version (17 with `pg_query` 6.x); a newer database
+  accepts syntax it cannot read, and such a statement is a parse error
+  (`VERICTO-PARSE-ERROR`: refused when parse errors fail closed, forwarded and
+  flagged under the fail-open default). The proxy now reads the `server_version`
+  the database sends at startup and, when its major is newer than the parser's
+  (read from `pg_query` itself, not a constant), logs one warning per upstream
+  `host:port` for the life of the process, under `alert="upstream_newer_than_parser"`
+  with `server_version`, `server_major` and `parser_major`; again only for a still
+  newer major. Equal and older versions, and a `server_version` that cannot be
+  read, are logged at `debug`. The same state is in `/metrics`
+  (`vericto_proxy_upstream_newer_than_parser`,
+  `vericto_proxy_upstream_server_major_version`, `vericto_proxy_parser_major_version`)
+  and in the rule-sync heartbeat (`X-Vericto-Telemetry-Stats`, new field
+  `upstream`; `v` stays 1), so the dashboard can show it. MySQL: the greeting's
+  server version is recorded there too and logged at `debug`, with no comparison
+  (`sqlparser` has no grammar per server version). Observability only: no verdict
+  and no relayed byte changes, the check runs once per connection during startup
+  and never per statement, and the table holds at most 16 upstreams. No new
+  setting. See [docs/CONFIGURATION.md](docs/CONFIGURATION.md#sql-parser-version-and-database-version).
+
 ## [4.19.0] - 2026-10-26
 
 **Less CPU per statement, with nothing answered differently.** A statement is

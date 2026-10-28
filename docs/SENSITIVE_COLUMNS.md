@@ -56,7 +56,10 @@ What holds under `mask`:
 With any `block` or `mask` tag configured, a query the engine cannot parse is
 **blocked**, whatever the workspace's parse-error policy says: a query that cannot be
 read cannot be shown not to read the column. With no tags, or only `flag` tags,
-parse errors behave as before.
+parse errors behave as before. A PostgreSQL newer than the proxy's parser accepts
+syntax the parser cannot read; the proxy logs one warning per upstream when it
+connects to one: see
+[SQL parser version and database version](CONFIGURATION.md#sql-parser-version-and-database-version).
 
 Every read of a tagged column is reported with rule code `VERICTO-085`, the tagged
 columns it touched and, for a mask, the rewritten query next to the original (both

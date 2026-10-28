@@ -118,6 +118,7 @@ fn relay(after_startup: bool) -> Relay {
         tx.clone(),
         Some(keys.clone()),
         responses.clone(),
+        None,
     ));
     Relay {
         upstream,

@@ -1203,6 +1203,13 @@ async fn run_mysql_session(
             "no MySQL handshake from upstream",
         )
     })?;
+    // Recorded for the heartbeat (4.20.0) and logged at debug once per upstream.
+    if let Some(version) = mc::read_server_version(&handshake.payload) {
+        crate::tcp::upstream_version::global().observe_mysql(
+            &format!("{}:{}", config.upstream_host, config.upstream_port),
+            version,
+        );
+    }
     let server_caps = mc::read_server_capabilities(&handshake.payload).unwrap_or(0);
     if upstream_tls && server_caps & mc::CLIENT_SSL == 0 {
         return Err(std::io::Error::other(

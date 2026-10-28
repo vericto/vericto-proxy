@@ -261,6 +261,7 @@ async fn run_session(client: TcpStream, config: Arc<PgProxyConfig>) -> std::io::
         tx_state.clone(),
         Some(config.cancel_keys.clone()),
         responses.clone(),
+        Some(format!("{}:{}", config.upstream_host, config.upstream_port)),
     ));
 
     // ── Phase 4: client→server interception loop
@@ -510,6 +511,11 @@ const RELAY_BUFFER: usize = 64 * 1024;
 /// the session's BackendKeyData is registered there before it reaches the
 /// client, and stays registered until the relay ends (the session closes).
 ///
+/// With `upstream_target` (host:port), the `server_version` ParameterStatus of
+/// the startup phase is reported to `tcp::upstream_version` (4.20.0), which
+/// warns once per target when it is newer than the parser. Startup only: no
+/// statement pays for it, and nothing it finds changes what is relayed.
+///
 /// How (4.17.2): each upstream read is framed by the messages' length
 /// prefixes. The messages the buffer holds whole are passed to the coordinator
 /// in one batch (one lock), then written to the client with one write and one
@@ -526,6 +532,7 @@ pub(crate) async fn relay_server_to_client(
     tx_state: Arc<crate::tcp::tx_state::ServerTxState>,
     mut cancel_keys: Option<Arc<crate::tcp::cancel::CancelRegistry>>,
     responses: crate::tcp::pg_response::PgResponseCoordinator,
+    upstream_target: Option<String>,
 ) -> std::io::Result<()> {
     use crate::tcp::pg_response::BackendDisposition;
 
@@ -589,6 +596,14 @@ pub(crate) async fn relay_server_to_client(
                     && let Some(registry) = cancel_keys.take()
                 {
                     _registration = Some(registry.register(key));
+                }
+                if startup
+                    && tag == b'S'
+                    && let Some(target) = upstream_target.as_deref()
+                    && let Some(version) =
+                        crate::tcp::upstream_version::server_version_parameter(body)
+                {
+                    crate::tcp::upstream_version::global().observe_postgres(target, version);
                 }
                 let disposition = if startup {
                     BackendDisposition::Forward

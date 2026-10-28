@@ -98,7 +98,11 @@ does not know the header ignores it. The header also says how far behind deliver
 is: `oldest_undelivered_age_s` (seconds since the oldest event still waiting was
 recorded, 0 when none waits), `last_delivery_at` (the last 2xx, `null` before the
 first) and `spool_max_bytes` (the spool's bound, 0 with the memory buffer). The
-same figures are in [Metrics](#metrics).
+same figures are in [Metrics](#metrics). Since 4.20.0 it also carries `upstream`:
+the database version the last connections reported (`dialect`, `server_version`,
+`server_major`, `parser_major`, `newer_than_parser`; never the database's
+address), `null` until a connection has reached the database; see
+[SQL parser version and database version](#sql-parser-version-and-database-version).
 
 ### Telemetry off the query path
 
@@ -510,6 +514,8 @@ the same figures. All names start with `vericto_proxy_`:
 | `vericto_proxy_info{version,buffer}` / `vericto_proxy_telemetry_enabled` | gauge | Build and buffer; whether the control-plane link is on |
 | `vericto_proxy_bundle_signature_verified` | gauge | 4.16.0+, Prometheus only, policy rules on only: 1 once a verified sync bundle is in effect, 0 while the built-in ruleset is |
 | `vericto_proxy_bundle_signature_accepted_total` / `_rejected_total{reason}` | counter | Same conditions. Bundles (responses and the rules cache) whose signature verified, and those refused; `reason` is `missing`, `malformed`, `unsupported_scheme`, `digest_mismatch`, `unknown_key_id`, `bad_signature` or `no_trusted_key` |
+| `vericto_proxy_upstream_newer_than_parser` | gauge | 4.20.0+, Prometheus only, PostgreSQL only, after the first connection: 1 when the database reports a newer PostgreSQL major than the SQL parser's (see [SQL parser version and database version](#sql-parser-version-and-database-version)) |
+| `vericto_proxy_upstream_server_major_version` / `vericto_proxy_parser_major_version` | gauge | Same conditions. The database's PostgreSQL major (0 when its version cannot be read) and the parser's |
 
 - **Prometheus**: `VERICTO_METRICS_PROMETHEUS=true` serves `GET /metrics` on the
   health-check listener (`VERICTO_HEALTHZ_PORT`), never on the database port.
@@ -641,6 +647,48 @@ Only two things differ per engine; everything above is shared.
   transaction block, `E` in a failed one; 4.16.1+, with policy rules off too),
   and a MySQL `ERR_Packet` carries no status flags, so the client keeps those
   of the server's last OK.
+
+### SQL parser version and database version
+
+The engine reads PostgreSQL with libpg_query, the parser of **one PostgreSQL major
+version**: PostgreSQL 17 in this release (`pg_query` 6.x). It reads every
+statement of that version and of older ones. A database of a newer major (18, for
+example) also accepts syntax the parser does not know, such as virtual generated
+columns (`GENERATED ALWAYS AS (…) VIRTUAL`) or `RETURNING WITH (OLD AS o, NEW AS n)`.
+Such a statement cannot be parsed, so it is handled as a parse error
+(`VERICTO-PARSE-ERROR`, recorded with the parser's message):
+
+- **refused**, with the native error of a blocked query, when parse errors fail
+  closed: the workspace's parse-error policy says so, a `block` or `mask`
+  sensitive column is configured, or an agent allowlist applies in `enforce` mode;
+- **forwarded and flagged** under the fail-open default.
+
+Every statement the parser can read is evaluated as with any other version.
+
+Since 4.20.0 the proxy reads the `server_version` the database sends when a
+session starts and compares its major with the parser's (read from libpg_query
+itself, so it follows any parser update). When the database is newer, it logs one
+warning per upstream (`host:port`) for the life of the process, not per
+connection or statement, and again only if a later connection reports a still
+newer major:
+
+```json
+{"level":"WARN","fields":{"alert":"upstream_newer_than_parser","upstream":"db.internal:5432",
+ "server_version":"18.1 (Debian 18.1-1.pgdg13+2)","server_major":18,"parser_major":17,
+ "message":"The database runs a newer PostgreSQL major version than the proxy's SQL parser. …"}}
+```
+
+Search the logs for `upstream_newer_than_parser`. An equal or older database is
+logged at `debug` only, as is a `server_version` the proxy cannot read, which is
+otherwise ignored. Nothing about this changes a verdict or the bytes relayed, and it is read once per connection,
+never per statement. The same state is in `/metrics`
+(`vericto_proxy_upstream_newer_than_parser`, see [Metrics](#metrics)) and, with
+the control-plane link on, in the rule-sync heartbeat's `upstream` field, which
+the dashboard can show.
+
+MySQL: the server version of the handshake greeting is recorded (heartbeat, and
+a `debug` log line when it first appears) with no comparison: the MySQL parser
+(`sqlparser`) has no grammar per server version.
 
 ### Postgres details
 

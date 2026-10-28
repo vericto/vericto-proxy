@@ -26,6 +26,7 @@ pub mod query_limit;
 pub mod session;
 pub mod tx_state;
 pub mod upstream;
+pub mod upstream_version;
 
 use std::sync::Arc;
 
@@ -375,6 +376,8 @@ mod rewrite_limit_tests;
 mod sensitive_tests;
 #[cfg(test)]
 mod session_tests;
+#[cfg(test)]
+mod upstream_version_tests;
 
 #[cfg(test)]
 mod tests {

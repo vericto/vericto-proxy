@@ -338,6 +338,16 @@ pub fn read_server_capabilities(payload: &[u8]) -> Option<u32> {
     Some((upper << 16) | lower)
 }
 
+/// The `server_version` of an Initial Handshake (protocol v10) payload, as
+/// bytes (4.20.0, for `tcp::upstream_version`). None for anything else: an
+/// ERR_Packet in place of the greeting (`0xff`), another protocol version, or a
+/// version with no terminating NUL.
+pub fn read_server_version(payload: &[u8]) -> Option<&[u8]> {
+    let rest = payload.strip_prefix(&[10u8])?;
+    let nul = rest.iter().position(|&b| b == 0)?;
+    Some(&rest[..nul])
+}
+
 /// Offsets of the two capability halves in an Initial Handshake (v10) payload:
 /// the lower 2 bytes, and the upper 2 bytes when the packet carries them (very old
 /// servers end right after the lower half). None if the packet is malformed.
@@ -1058,6 +1068,27 @@ mod tests {
         assert_eq!(classify_auth_packet(&[0x01, 0x03, 0x00]), AuthPhase::More);
         // Empty payload is defensively treated as More (never end on malformed).
         assert_eq!(classify_auth_packet(&[]), AuthPhase::More);
+    }
+
+    #[test]
+    fn the_server_version_is_read_from_a_v10_greeting_only() {
+        let mut p = vec![10u8];
+        p.extend_from_slice(b"8.0.46\0");
+        p.extend_from_slice(&[1, 0, 0, 0]);
+        assert_eq!(read_server_version(&p), Some(&b"8.0.46"[..]));
+        let mut maria = vec![10u8];
+        maria.extend_from_slice(b"5.5.5-10.11.6-MariaDB\0");
+        assert_eq!(
+            read_server_version(&maria),
+            Some(&b"5.5.5-10.11.6-MariaDB"[..])
+        );
+        // An ERR_Packet greeting (e.g. "Host is not allowed to connect").
+        assert_eq!(
+            read_server_version(b"\xff\x6a\x04Host '1.2.3.4' is not allowed"),
+            None
+        );
+        assert_eq!(read_server_version(b"\x0a8.0.46"), None, "no NUL");
+        assert_eq!(read_server_version(b""), None);
     }
 
     #[test]
