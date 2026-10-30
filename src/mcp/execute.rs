@@ -26,7 +26,6 @@
 //! steps) follow the shared contract `tests/mcp-contract/`.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use serde_json::{Map, Value, json};
@@ -99,6 +98,65 @@ fn capitalize(s: &str) -> String {
         }
         None => String::new(),
     }
+}
+
+/// Why the `$n` placeholders of a statement (sorted, deduplicated) do not
+/// take the `params` sent, if they do not. They must be exactly `$1…$n`, one
+/// per param: a gap cannot be filled by sending more params (the database
+/// cannot type a parameter the statement never uses), so it is named.
+fn placeholder_error(placeholders: &[i32], params: usize) -> Option<InputError> {
+    let contiguous = placeholders
+        .iter()
+        .enumerate()
+        .all(|(i, &n)| i64::from(n) == i as i64 + 1);
+    if contiguous {
+        if placeholders.len() == params {
+            return None;
+        }
+        let placeholders = placeholders.len();
+        return Some(InputError {
+            field: "params",
+            reason: InvalidReason::ParamsMismatch {
+                placeholders,
+                params,
+            },
+            message: format!(
+                "The statement has {placeholders} placeholder{} and {params} param{} sent.",
+                if placeholders == 1 { "" } else { "s" },
+                if params == 1 { " was" } else { "s were" }
+            ),
+        });
+    }
+    if let Some(&n) = placeholders.first().filter(|&&n| n < 1) {
+        return Some(arg_error(
+            "sql",
+            format!("${n} is not a placeholder; they are numbered from $1"),
+        ));
+    }
+    // All at least $1, sorted, with a gap below the highest: name the first
+    // missing ones (lazily: `$2147483647` alone must not build a list).
+    const LISTED: usize = 5;
+    let highest = placeholders.last().copied().unwrap_or(0);
+    let missing_count = highest as usize - placeholders.len();
+    let mut names: Vec<String> = (1..highest)
+        .filter(|n| placeholders.binary_search(n).is_err())
+        .take(LISTED)
+        .map(|n| format!("${n}"))
+        .collect();
+    if missing_count > LISTED {
+        names.push(format!("{} more", missing_count - LISTED));
+    }
+    let listed = match names.split_last() {
+        Some((last, [])) => last.clone(),
+        Some((last, rest)) => format!("{} and {last}", rest.join(", ")),
+        None => String::new(),
+    };
+    Some(arg_error(
+        "sql",
+        format!(
+            "the placeholders skip {listed} (the highest is ${highest}); number them from $1 without gaps, one param each ({params} sent)"
+        ),
+    ))
 }
 
 /// Reads the tool arguments (§6.2): what the input schema of
@@ -484,7 +542,7 @@ pub async fn execute_sql(rt: &Arc<Runtime>, caller: &Caller, args: &Value) -> To
         Ok(i) => i,
         Err(e) => {
             let raw = args.get("sql").and_then(Value::as_str).unwrap_or("");
-            return invalid(rt, caller, raw, e.reason, &e.message, e.field, None);
+            return invalid(rt, caller, raw, e.reason, &e.message, e.field);
         }
     };
     execute_once(rt, caller, input).await
@@ -499,30 +557,53 @@ fn invalid(
     reason: InvalidReason,
     message: &str,
     field: &str,
-    tier: Option<(Tier, String)>,
 ) -> ToolOutput {
-    let event_id = emit_unevaluated(
+    refuse_input(
         rt,
         caller,
         sql,
-        "INVALID",
-        "invalid",
-        tier.as_ref().map(|t| t.0),
-    );
+        Outcome::InvalidInput(reason),
+        message,
+        field,
+        None,
+    )
+}
+
+/// The declared tier is not the computed one: also `INVALID_INPUT`, but an
+/// outcome of its own (`tier_mismatch` in the contract, not an invalid-input
+/// reason), with the computed tier in the answer and in the event.
+fn tier_mismatch(
+    rt: &Runtime,
+    caller: &Caller,
+    sql: &str,
+    computed: Tier,
+    command: String,
+    message: &str,
+) -> ToolOutput {
+    let outcome = Outcome::TierMismatch {
+        tier: computed.as_str(),
+        command,
+    };
+    refuse_input(rt, caller, sql, outcome, message, "tier", Some(computed))
+}
+
+fn refuse_input(
+    rt: &Runtime,
+    caller: &Caller,
+    sql: &str,
+    outcome: Outcome,
+    message: &str,
+    field: &str,
+    tier: Option<Tier>,
+) -> ToolOutput {
+    let event_id = emit_unevaluated(rt, caller, sql, "INVALID", "invalid", tier);
     let access = rt.access();
     let ruleset = rt.ruleset_version();
     let c = ctx(rt, &ruleset, &access);
-    let outcome = match &tier {
-        Some((t, command)) => Outcome::TierMismatch {
-            tier: t.as_str(),
-            command: command.clone(),
-        },
-        None => Outcome::InvalidInput(reason),
-    };
     let v = next_steps::execute_verdict(&outcome, &c);
     let mut extra = vec![("field", json!(field))];
     let mut a = Answer::new();
-    if let Some((t, _)) = &tier {
+    if let Some(t) = tier {
         extra.push(("tier", json!(t.as_str())));
         a = a.set("tier", json!(t.as_str()));
     }
@@ -592,7 +673,6 @@ pub async fn execute_once(rt: &Arc<Runtime>, caller: &Caller, input: Input) -> T
             InvalidReason::MultipleStatements,
             "Send one statement per call.",
             "sql",
-            None,
         );
     }
     match &original {
@@ -604,7 +684,6 @@ pub async fn execute_once(rt: &Arc<Runtime>, caller: &Caller, input: Input) -> T
                 InvalidReason::Empty,
                 "The SQL is empty.",
                 "sql",
-                None,
             );
         }
         Err(Unclassifiable::MultipleStatements(_)) => {
@@ -615,32 +694,11 @@ pub async fn execute_once(rt: &Arc<Runtime>, caller: &Caller, input: Input) -> T
                 InvalidReason::MultipleStatements,
                 "Send one statement per call.",
                 "sql",
-                None,
             );
         }
         Ok(cl) => {
-            let expected: Vec<i32> = (1..=input.params.len() as i32).collect();
-            if cl.placeholders != expected {
-                let placeholders =
-                    cl.placeholders.iter().copied().max().unwrap_or(0).max(0) as usize;
-                let params = input.params.len();
-                let message = format!(
-                    "The statement has {placeholders} placeholder{} and {params} param{} sent.",
-                    if placeholders == 1 { "" } else { "s" },
-                    if params == 1 { " was" } else { "s were" }
-                );
-                return invalid(
-                    rt,
-                    caller,
-                    &sql,
-                    InvalidReason::ParamsMismatch {
-                        placeholders,
-                        params,
-                    },
-                    &message,
-                    "params",
-                    None,
-                );
+            if let Some(e) = placeholder_error(&cl.placeholders, input.params.len()) {
+                return invalid(rt, caller, &sql, e.reason, &e.message, e.field);
             }
             // The declared tier is checked, never trusted (§6.2).
             if let (Some(declared), Class::Tier(computed)) = (input.tier, &cl.class)
@@ -652,15 +710,7 @@ pub async fn execute_once(rt: &Arc<Runtime>, caller: &Caller, input: Input) -> T
                     computed.as_str(),
                     declared.as_str()
                 );
-                return invalid(
-                    rt,
-                    caller,
-                    &sql,
-                    InvalidReason::Empty,
-                    &message,
-                    "tier",
-                    Some((*computed, cl.command.clone())),
-                );
+                return tier_mismatch(rt, caller, &sql, *computed, cl.command.clone(), &message);
             }
         }
         Err(Unclassifiable::Parse(_)) => {}
@@ -1173,6 +1223,16 @@ fn kill_switch(
         .finish(&v, event_id)
 }
 
+/// What the watcher of a running statement did.
+enum Watch {
+    /// Stopped before it had to act.
+    Quiet,
+    /// The kill switch engaged for the caller: the statement was cancelled.
+    Killed(Arc<KillBlock>),
+    /// The client-side deadline passed: the statement was cancelled.
+    Cancelled,
+}
+
 /// How a read went.
 pub enum Ran {
     Done(Box<RunOutcome>),
@@ -1271,29 +1331,31 @@ pub async fn run_in_read_transaction(
         }
     }
 
-    // The watcher: client-side deadline and the kill switch.
-    let done = Arc::new(AtomicBool::new(false));
-    let killed: Arc<std::sync::Mutex<Option<Arc<KillBlock>>>> = Arc::default();
+    // The watcher: client-side deadline and the kill switch. It is stopped
+    // through `stop` and then awaited (never aborted), so its answer is final
+    // when it is read and a CancelRequest it sent is never still in flight
+    // when the connection goes back to the pool.
+    let (stop, mut stopped) = tokio::sync::oneshot::channel::<()>();
     let watcher = checkout.conn.cancel_handle().map(|handle| {
-        let (rt, done, killed) = (Arc::clone(rt), Arc::clone(&done), Arc::clone(&killed));
+        let rt = Arc::clone(rt);
         let caller = caller.cloned();
         tokio::spawn(async move {
             let deadline =
                 tokio::time::Instant::now() + Duration::from_millis(u64::from(timeout_ms) + 1_500);
             let mut tick = tokio::time::interval(Duration::from_millis(200));
             loop {
-                tick.tick().await;
-                if done.load(Ordering::Acquire) {
-                    return;
+                tokio::select! {
+                    biased;
+                    _ = &mut stopped => return Watch::Quiet,
+                    _ = tick.tick() => {}
                 }
                 if let Some(b) = caller.as_ref().and_then(|c| rt.kill_switch_block(c)) {
-                    *killed.lock().unwrap_or_else(|e| e.into_inner()) = Some(b);
                     handle.cancel().await;
-                    return;
+                    return Watch::Killed(b);
                 }
                 if tokio::time::Instant::now() >= deadline {
                     handle.cancel().await;
-                    return;
+                    return Watch::Cancelled;
                 }
             }
         })
@@ -1311,11 +1373,20 @@ pub async fn run_in_read_transaction(
             .run(bytes, params, read_limits, control::ROLLBACK),
     )
     .await;
-    done.store(true, Ordering::Release);
-    if let Some(w) = watcher {
-        w.abort();
+    let _ = stop.send(());
+    let watch = match watcher {
+        Some(w) => w.await.unwrap_or(Watch::Quiet),
+        None => Watch::Quiet,
+    };
+    if !matches!(watch, Watch::Quiet) {
+        // A CancelRequest was sent: the server may still act on it after the
+        // statement ended, so this connection is not reused.
+        checkout.conn.broken = true;
     }
-    let killed = killed.lock().unwrap_or_else(|e| e.into_inner()).take();
+    let killed = match watch {
+        Watch::Killed(b) => Some(b),
+        Watch::Quiet | Watch::Cancelled => None,
+    };
     match result {
         Err(_) => {
             checkout.conn.broken = true;
@@ -1343,5 +1414,88 @@ pub async fn run_in_read_transaction(
                 None => Ran::Done(Box::new(outcome)),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn err(placeholders: &[i32], params: usize) -> InputError {
+        placeholder_error(placeholders, params).expect("an error")
+    }
+
+    #[test]
+    fn placeholders_numbered_one_to_n_take_n_params() {
+        assert_eq!(placeholder_error(&[], 0), None);
+        assert_eq!(placeholder_error(&[1, 2, 3], 3), None);
+    }
+
+    #[test]
+    fn a_count_mismatch_keeps_the_contract_reason() {
+        let e = err(&[1, 2], 1);
+        assert_eq!(e.field, "params");
+        assert_eq!(
+            e.reason,
+            InvalidReason::ParamsMismatch {
+                placeholders: 2,
+                params: 1
+            }
+        );
+        assert_eq!(
+            e.message,
+            "The statement has 2 placeholders and 1 param was sent."
+        );
+        assert_eq!(
+            err(&[], 2).message,
+            "The statement has 0 placeholders and 2 params were sent."
+        );
+    }
+
+    #[test]
+    fn a_gap_names_the_missing_placeholders() {
+        let e = err(&[3], 0);
+        assert_eq!(e.field, "sql");
+        assert_eq!(
+            e.message,
+            "The placeholders skip $1 and $2 (the highest is $3); number them from $1 without gaps, one param each (0 sent)."
+        );
+        assert!(
+            matches!(e.reason, InvalidReason::Argument(ref m) if m.starts_with("the placeholders skip $1 and $2"))
+        );
+        // Same count as params, still a gap: not reported as a count mismatch.
+        let e = err(&[1, 3], 2);
+        assert_eq!(
+            e.message,
+            "The placeholders skip $2 (the highest is $3); number them from $1 without gaps, one param each (2 sent)."
+        );
+        let e = err(&[2, 4, 9], 3);
+        assert!(
+            e.message.starts_with(
+                "The placeholders skip $1, $3, $5, $6, $7 and 1 more (the highest is $9)"
+            ),
+            "{}",
+            e.message
+        );
+        let e = err(&[i32::MAX], 1);
+        assert!(
+            e.message.starts_with(&format!(
+                "The placeholders skip $1, $2, $3, $4, $5 and {} more (the highest is ${})",
+                i32::MAX - 6,
+                i32::MAX
+            )),
+            "{}",
+            e.message
+        );
+    }
+
+    #[test]
+    fn dollar_zero_is_not_a_placeholder() {
+        let e = err(&[0], 0);
+        assert_eq!(e.field, "sql");
+        assert_eq!(
+            e.message,
+            "$0 is not a placeholder; they are numbered from $1."
+        );
     }
 }

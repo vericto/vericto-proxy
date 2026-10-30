@@ -75,11 +75,13 @@ fn result(id: Value, result: Value) -> Value {
     json!({ "jsonrpc": "2.0", "id": id, "result": result })
 }
 
-/// The protocol version to answer `initialize` with.
+/// The protocol version to answer `initialize` with: the requested one when
+/// this server speaks it, otherwise the newest it speaks (MCP lifecycle,
+/// version negotiation); the client decides whether it can use that.
 pub fn negotiate(requested: Option<&str>) -> &'static str {
     requested
         .and_then(|r| PROTOCOL_VERSIONS.iter().find(|v| **v == r).copied())
-        .unwrap_or(PROTOCOL_VERSIONS[1])
+        .unwrap_or(PROTOCOL_VERSIONS[0])
 }
 
 /// Bounds a declared `clientInfo` field.
@@ -191,4 +193,19 @@ async fn handle_one(rt: &Arc<Runtime>, peer: &Peer, msg: Value) -> Option<Value>
         }
         other => error_response(id, METHOD_NOT_FOUND, &format!("method not found: {other}")),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_supported_version_is_echoed_and_any_other_gets_the_newest() {
+        for v in PROTOCOL_VERSIONS {
+            assert_eq!(negotiate(Some(v)), *v);
+        }
+        assert_eq!(negotiate(Some("2099-01-01")), PROTOCOL_VERSIONS[0]);
+        assert_eq!(negotiate(Some("2024-10-07")), PROTOCOL_VERSIONS[0]);
+        assert_eq!(negotiate(None), PROTOCOL_VERSIONS[0]);
+    }
 }

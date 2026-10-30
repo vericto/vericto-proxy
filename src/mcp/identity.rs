@@ -48,14 +48,16 @@ pub fn fingerprint(key: &str) -> String {
     sha256_hex(key.as_bytes())[..12].to_string()
 }
 
+/// Compares two hashes without an early exit. Both are 64 hex digits (the
+/// bundle and the tokens file are validated on load, the other side is the
+/// SHA-256 of the presented token), so the lengths never differ in practice;
+/// a difference is folded into the result rather than returned early.
 fn eq_ct(a: &str, b: &str) -> bool {
-    if a.len() != b.len() {
-        return false;
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    let mut diff = u8::from(a.len() != b.len());
+    for i in 0..a.len().max(b.len()) {
+        diff |= a.get(i).copied().unwrap_or(0) ^ b.get(i).copied().unwrap_or(0);
     }
-    let diff = a
-        .bytes()
-        .zip(b.bytes())
-        .fold(0u8, |acc, (x, y)| acc | (x ^ y));
     std::hint::black_box(diff) == 0
 }
 
@@ -198,9 +200,11 @@ pub fn authenticate<'a>(
     let hash = sha256_hex(token.as_bytes());
     let now = chrono::Utc::now();
     let mut found = None;
-    // Every entry is compared, so the time does not depend on which matched.
+    // Every entry is compared (no early exit on a match), so the time does
+    // not depend on which entry matched.
     for id in known {
-        if eq_ct(&id.sha256, &hash) && id.expires_at.is_none_or(|t| t > now) && found.is_none() {
+        let matched = eq_ct(&id.sha256, &hash);
+        if matched && found.is_none() && id.expires_at.is_none_or(|t| t > now) {
             found = Some(id.clone());
         }
     }
@@ -257,6 +261,18 @@ mod tests {
         assert!(authenticate("another-long-token-0123456789-abcdef", &ids).is_some());
         std::fs::write(&p, "short\n").unwrap();
         assert!(load_tokens_file(&p).is_err());
+    }
+
+    #[test]
+    fn hashes_are_compared_whole() {
+        let h = sha256_hex(b"x");
+        assert!(eq_ct(&h, &sha256_hex(b"x")));
+        assert!(!eq_ct(&h, &sha256_hex(b"y")));
+        assert!(!eq_ct(&h, &h[..63]));
+        assert!(!eq_ct(&h[..63], &h));
+        assert!(!eq_ct(&h, &format!("{h}0")));
+        assert!(!eq_ct("", &h));
+        assert!(eq_ct("", ""));
     }
 
     #[test]
