@@ -32,7 +32,6 @@ pub mod results;
 pub mod runtime;
 pub mod schema;
 pub mod server;
-pub mod stack;
 pub mod stdio;
 pub mod tools;
 

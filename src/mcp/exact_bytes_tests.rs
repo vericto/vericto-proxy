@@ -78,7 +78,7 @@ fn assert_only(fake: &FakePg, expected_parse: Option<&str>) {
 /// independent check of the bytes sent.
 fn evaluated_text(rt: &Arc<Runtime>, sql: &str) -> Option<String> {
     let (rt, sql) = (Arc::clone(rt), sql.to_string());
-    crate::mcp::stack::on_big_stack_sync(move || {
+    crate::stack::on_big_stack_sync(move || {
         let caller = fake_pg::caller(&rt);
         let e = rt.evaluate(
             &sql,
@@ -348,7 +348,7 @@ async fn the_smuggling_corpus_never_reaches_the_database_as_anything_but_one_eva
                     evaluated_text(&rt, sql).expect("ran, so the evaluator forwarded it");
                 assert_eq!(parses[0], expected.as_bytes(), "{sql:?}");
                 let owned = sql.clone();
-                let count = crate::mcp::stack::on_big_stack_sync(move || {
+                let count = crate::stack::on_big_stack_sync(move || {
                     crate::mcp::classify::statement_count(&owned)
                 })
                 .unwrap();

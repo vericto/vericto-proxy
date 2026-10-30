@@ -231,7 +231,7 @@ impl CurrentDatabase {
 /// database has sensitive-column tags; otherwise nothing changes. Each one is
 /// reported like the statement it stands for. Returns the block message of
 /// the first one blocked: the connection is then refused before it reaches
-/// the database. Runs on the blocking pool (it evaluates).
+/// the database. Runs where statements are evaluated (see `run_evaluation`).
 pub(crate) fn startup_settings_block(
     config: &PgProxyConfig,
     user: Option<&str>,
@@ -311,8 +311,8 @@ pub async fn intercept_client_to_server(
     client_read: &mut ClientRead,
     server_write: &mut crate::tcp::upstream::UpstreamWrite,
     client_write: &Arc<Mutex<ClientWrite>>,
-    // `Arc` rather than `&PgProxyConfig`: evaluation and telemetry run on the
-    // blocking pool, which needs an owned handle.
+    // `Arc` rather than `&PgProxyConfig`: evaluation and telemetry may run on
+    // another thread, which needs an owned handle.
     config: &Arc<PgProxyConfig>,
     // Who the session is and, on MySQL, its current database.
     start: SessionStart,
@@ -929,9 +929,10 @@ pub async fn intercept_client_to_server(
                 // Evaluation is CPU-bound and synchronous, and so is the sanitize
                 // pass inside `report_telemetry`. A statement of at most
                 // `VERICTO_INLINE_EVAL_MAX_BYTES` is evaluated on this task (4.19.0):
-                // tens of microseconds, less than the two thread hand-offs of the
-                // blocking pool cost. A larger one runs on the blocking pool, where
-                // its parse cannot stall the other connections of this worker.
+                // tens of microseconds, less than the two thread hand-offs of
+                // another thread cost. A larger one runs on a thread of its own
+                // with a stack sized for it (4.21.0; the blocking pool before),
+                // where its parse cannot stall the other connections of this worker.
                 upstream.flush_answerable().await?;
                 let eval_start = Instant::now();
                 // A trivial statement this session already sent, under the same
@@ -990,7 +991,7 @@ pub async fn intercept_client_to_server(
                         (decision, eval_us)
                     })
                     .await
-                    .expect("evaluation task panicked")
+                    .map_err(std::io::Error::other)?
                 };
                 let _ = eval_us;
                 if let Some((rules, policy)) = &snapshots {
@@ -1840,7 +1841,7 @@ async fn refresh_prepared(
         decision
     })
     .await
-    .map_err(|e| std::io::Error::other(format!("prepared evaluation task failed: {e}")))?;
+    .map_err(std::io::Error::other)?;
 
     if matches!(decision, TcpDecision::Forward { .. }) {
         let mut state = pg
@@ -1857,16 +1858,33 @@ async fn refresh_prepared(
     }
 }
 
+/// A statement that could not be evaluated: no evaluation thread could be
+/// started, or it ended without an answer. The statement is not forwarded;
+/// the caller ends the session.
+#[derive(Debug)]
+pub(crate) struct NotEvaluated;
+
+impl std::fmt::Display for NotEvaluated {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the statement could not be evaluated (no evaluation thread)")
+    }
+}
+
+impl std::error::Error for NotEvaluated {}
+
 /// Runs an evaluation (`work`) of a statement of `sql_len` bytes: on the calling
 /// task when the statement is at most `inline_eval_max_bytes`
-/// (`PgProxyConfig::inline_eval_max_bytes`), on the blocking pool otherwise
-/// (always with `VERICTO_INLINE_EVAL_MAX_BYTES=0`, the behaviour up to 4.18.0).
-/// `Err` only when the pool's task panicked.
+/// (`PgProxyConfig::inline_eval_max_bytes`, never above
+/// [`INLINE_EVAL_MAX_BYTES_CEILING`](crate::tcp::query_limit::INLINE_EVAL_MAX_BYTES_CEILING)),
+/// otherwise on a thread of its own whose stack is sized for the statement
+/// (`crate::stack`; always with `VERICTO_INLINE_EVAL_MAX_BYTES=0`). The
+/// parser recurses as deep as the statement nests, which for a large
+/// statement is deeper than a worker's or the blocking pool's stack holds.
 pub(crate) async fn run_evaluation<T, F>(
     inline_eval_max_bytes: usize,
     sql_len: usize,
     work: F,
-) -> Result<T, tokio::task::JoinError>
+) -> Result<T, NotEvaluated>
 where
     T: Send + 'static,
     F: FnOnce() -> T + Send + 'static,
@@ -1874,13 +1892,16 @@ where
     if evaluates_inline(inline_eval_max_bytes, sql_len) {
         Ok(work())
     } else {
-        tokio::task::spawn_blocking(work).await
+        crate::stack::on_stack_for_statement(sql_len, work)
+            .await
+            .ok_or(NotEvaluated)
     }
 }
 
 /// Whether a statement of `sql_len` bytes is evaluated on the session's own task.
 fn evaluates_inline(inline_eval_max_bytes: usize, sql_len: usize) -> bool {
-    sql_len <= inline_eval_max_bytes && inline_eval_max_bytes > 0
+    let max = inline_eval_max_bytes.min(crate::tcp::query_limit::INLINE_EVAL_MAX_BYTES_CEILING);
+    sql_len <= max && max > 0
 }
 
 fn stage_parse_action(

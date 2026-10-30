@@ -485,10 +485,8 @@ pub async fn call(
         "check_sql" => {
             // Parses agent text: on the large-stack thread (stack.rs).
             let (rt2, caller2, args2) = (Arc::clone(rt), caller.clone(), args.clone());
-            crate::mcp::stack::on_big_stack(move || {
-                crate::mcp::check::check_sql(&rt2, &caller2, &args2)
-            })
-            .await?
+            crate::stack::on_big_stack(move || crate::mcp::check::check_sql(&rt2, &caller2, &args2))
+                .await?
         }
         "whoami" => whoami(rt, caller),
         "list_rules" if rt.linked => list_rules(rt),

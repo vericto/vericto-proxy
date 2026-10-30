@@ -97,12 +97,22 @@ answers every statement exactly as in 4.20.0. See [docs/MCP.md](docs/MCP.md).
   with a large stack (reserved, committed as touched), at most 8 at a time, and
   statements are limited to 64 KiB by default (at most 1 MiB), so a deeply nested
   statement cannot exhaust a worker's stack.
+- **TCP proxy: evaluation of very large statements runs on threads with enough
+  stack.** A statement over `VERICTO_INLINE_EVAL_MAX_BYTES` is evaluated on a thread
+  of its own whose stack is sized from the statement's length (reserved address space,
+  committed only as a deep parse touches it), two per CPU at a time, at least 8,
+  instead of on the blocking pool's 2 MiB threads; the async runtime's threads get an
+  8 MiB stack. Verdicts are unchanged. A statement that could not be given a thread is
+  not forwarded and its session ends.
 
 ### Changed
 
 - `TelemetryEvent` gains optional MCP fields (omitted on every TCP event, so a TCP
   event's JSON is what 4.20.0 sent); the principal map, the rule sync and the telemetry
   reporter gain the hooks `mcp` mode uses, each a no-op on the TCP path.
+- `VERICTO_INLINE_EVAL_MAX_BYTES` is at most 4096: a larger value is used as 4096, with a
+  warning (a statement evaluated inline uses the worker's stack). The default (1024) is
+  unchanged.
 
 ### Dependencies
 

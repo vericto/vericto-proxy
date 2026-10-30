@@ -657,7 +657,7 @@ pub async fn execute_once(rt: &Arc<Runtime>, caller: &Caller, input: Input) -> T
     // agent text runs on a thread with a large stack (stack.rs).
     let analysed = {
         let sql = Arc::clone(&sql);
-        crate::mcp::stack::on_big_stack(move || {
+        crate::stack::on_big_stack(move || {
             (classify::statement_count(&sql), classify::classify(&sql))
         })
         .await
@@ -743,7 +743,7 @@ pub async fn execute_once(rt: &Arc<Runtime>, caller: &Caller, input: Input) -> T
         let caller2 = caller.clone();
         let sql2 = Arc::clone(&sql);
         let ticket = input.ticket.clone();
-        crate::mcp::stack::on_big_stack(move || {
+        crate::stack::on_big_stack(move || {
             let e = rt2.evaluate(
                 &sql2,
                 QueryKind::Prepared,

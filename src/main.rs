@@ -31,6 +31,7 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 mod config;
 mod mcp;
 mod runtime_sizing;
+mod stack;
 mod tcp;
 mod telemetry;
 
@@ -78,7 +79,10 @@ fn main() {
         }
     };
     let mut builder = tokio::runtime::Builder::new_multi_thread();
-    builder.enable_all().worker_threads(sizing.worker_threads);
+    builder
+        .enable_all()
+        .worker_threads(sizing.worker_threads)
+        .thread_stack_size(stack::WORKER_STACK_BYTES);
     let runtime = match builder.build() {
         Ok(rt) => rt,
         Err(e) => {

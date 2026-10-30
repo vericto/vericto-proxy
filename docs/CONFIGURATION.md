@@ -546,7 +546,7 @@ your monitoring, and never expose it to the internet.
 | `VERICTO_WORKER_THREADS` | from the CPU limit | 4.16.2+. Async worker threads (1–1024; anything else stops the proxy at startup). By default the CPU limit rounded up, at most the CPUs the process may run on: the cgroup CPU quota visible in the container, or the ECS task's `Limits.CPU` from the task metadata endpoint, whichever is lower; without a limit, one per CPU. `TOKIO_WORKER_THREADS` is still honoured when this is unset |
 
 | `VERICTO_TRIVIAL_FAST_PATH` | `on` | 4.19.0+. `on` or `off` (any case; anything else stops the proxy at startup). A session remembers the decision the full evaluation reached for a trivial statement (`BEGIN`, `COMMIT`, `ROLLBACK`, `END`, `START TRANSACTION`, `SELECT 1`, `SET autocommit=0/1`, `SET NAMES utf8mb4`) and answers the same bytes with it while the ruleset and its effective policy are the same; see [The trivial-statement fast path](#the-trivial-statement-fast-path) |
-| `VERICTO_INLINE_EVAL_MAX_BYTES` | `1024` | 4.19.0+. Statements up to this many bytes are evaluated on the connection's own async task; larger ones on the blocking pool, as every statement was up to 4.18.0. `0` sends every statement to the pool. A value that is not a non-negative integer falls back to the default, with a warning |
+| `VERICTO_INLINE_EVAL_MAX_BYTES` | `1024` | 4.19.0+. Statements up to this many bytes are evaluated on the connection's own async task; larger ones off that task, as every statement was up to 4.18.0 (since 4.21.0 on a thread of their own, the blocking pool before). `0` evaluates every statement off the task. At most `4096` (4.21.0+; a larger value is used as 4096, with a warning). A value that is not a non-negative integer falls back to the default, with a warning |
 
 The proxy logs its choice once at startup (`"Runtime sizing"`, with
 `worker_threads`, `source`, `cpu_limit` and `available_cpus`).
@@ -557,8 +557,14 @@ wake, about 4 of the 10 system calls a PostgreSQL statement costs the proxy, and
 two context switches. Evaluation takes 0.1 to 0.25 µs per byte of SQL, so the
 statements of an OLTP workload (50 to 500 bytes) take 10 to 80 µs, less than the
 hand-off; they now run on the connection's task. A statement over
-`VERICTO_INLINE_EVAL_MAX_BYTES` still goes to the pool, so one large statement
-cannot hold the other connections of its worker for long. Lower the value if a
+`VERICTO_INLINE_EVAL_MAX_BYTES` still goes to another thread, so one large statement
+cannot hold the other connections of its worker for long. Since 4.21.0 that thread is
+started for the statement with a stack sized from its length (the parser recurses as
+deep as a statement nests, deeper than the blocking pool's 2 MiB stack holds for a
+large one); the stack is reserved address space, committed only as a deep parse
+touches it. Two per CPU run at a time (at least 8); more wait for a slot. The runtime's
+own threads have an 8 MiB stack, and the inline threshold is at most 4096 bytes, so a
+statement evaluated inline always fits. Lower the value if a
 tail-latency budget is tighter than about 200 µs of evaluation per statement;
 `0` restores the 4.18.0 behaviour exactly.
 
