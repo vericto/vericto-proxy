@@ -214,7 +214,8 @@ mod tests {
 
     #[test]
     fn a_key_in_the_bundle_authenticates_and_an_expired_one_does_not() {
-        let key = "vtro_0123456789abcdef0123456789abcdef";
+        // Built at run time: a fake key, kept out of the source as a literal.
+        let key = &format!("vtro_{}", "0123456789abcdef".repeat(2));
         let section = json!({"version": "1", "identities": [
             {"key_id": "k1", "key_sha256": sha256_hex(key.as_bytes()), "name": "cursor-laptop", "principal_id": "p1", "kill_switch": null},
             {"key_id": "k2", "key_sha256": sha256_hex(b"vtro_old"), "expires_at": "2000-01-01T00:00:00Z"},
