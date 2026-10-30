@@ -223,7 +223,7 @@ impl ControlPlaneConfig {
 
     /// [`Self::from_env`] reading each variable through `env`, so tests can pass
     /// their own values without touching the process environment.
-    fn from_lookup(env: Lookup<'_>) -> Result<Option<Self>, String> {
+    pub(crate) fn from_lookup(env: Lookup<'_>) -> Result<Option<Self>, String> {
         let (Some(api_url), Some(api_key)) = (env("VERICTO_API_URL"), env("VERICTO_API_KEY"))
         else {
             return Ok(None);
@@ -378,7 +378,7 @@ pub fn same_origin_redirects() -> reqwest::redirect::Policy {
 
 /// Reads one configuration variable: the process environment in production, a
 /// fixed map in tests.
-type Lookup<'a> = &'a dyn Fn(&str) -> Option<String>;
+pub(crate) type Lookup<'a> = &'a dyn Fn(&str) -> Option<String>;
 
 fn env_flag(env: Lookup<'_>, key: &str) -> bool {
     env(key)

@@ -933,7 +933,7 @@ fn build_telemetry_event(
 /// size cut, because a cut statement no longer parses and would only ever be
 /// reported as redacted.
 #[allow(clippy::too_many_arguments)]
-fn build_event(
+pub(crate) fn build_event(
     database_id: &str,
     sql: &str,
     dialect: Dialect,
@@ -1154,6 +1154,7 @@ fn build_event(
         ticket_id: policy_field(identity, |p| &p.ticket_id),
         session_tenant: policy_field(identity, |p| &p.session_tenant),
         kill_switch_id: None,
+        ..Default::default()
     }
 }
 

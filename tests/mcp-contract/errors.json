@@ -1,0 +1,102 @@
+{
+  "description": "execute_sql error codes (docs/design/mcp-proxy-mode.md \u00a76.5). Every error is a tool result with isError true and an `error` object in structuredContent; protocol problems stay JSON-RPC or HTTP errors. `m1` lists what a read-tier Proxy mode answers; the others are reserved for later milestones and must not be renamed. `status` is the answer's status for the M1 codes; null for a reserved code (its milestone decides it).",
+  "codes": {
+    "INVALID_INPUT": {
+      "status": "ERROR",
+      "m1": true
+    },
+    "BLOCKED": {
+      "status": "BLOCKED",
+      "m1": true
+    },
+    "KILL_SWITCH": {
+      "status": "BLOCKED",
+      "m1": true
+    },
+    "TIER_NOT_ENABLED": {
+      "status": "BLOCKED",
+      "m1": true
+    },
+    "APPROVAL_REJECTED": {
+      "status": null,
+      "m1": false
+    },
+    "APPROVAL_EXPIRED": {
+      "status": null,
+      "m1": false
+    },
+    "APPROVAL_STALE": {
+      "status": null,
+      "m1": false
+    },
+    "IMPACT_MISMATCH": {
+      "status": null,
+      "m1": false
+    },
+    "CAP_EXCEEDED": {
+      "status": null,
+      "m1": false
+    },
+    "SECRET_DENIED_TAINTED": {
+      "status": null,
+      "m1": false
+    },
+    "TAINT_UNAVAILABLE": {
+      "status": null,
+      "m1": false
+    },
+    "DATABASE_ERROR": {
+      "status": "ERROR",
+      "m1": true
+    },
+    "TIMEOUT": {
+      "status": "ERROR",
+      "m1": true
+    },
+    "DATABASE_UNAVAILABLE": {
+      "status": "ERROR",
+      "m1": true
+    },
+    "NOT_READY": {
+      "status": "ERROR",
+      "m1": true
+    },
+    "RATE_LIMITED": {
+      "status": null,
+      "m1": false
+    },
+    "QUOTA_EXCEEDED": {
+      "status": null,
+      "m1": false
+    },
+    "GATEWAY_SUSPENDED": {
+      "status": null,
+      "m1": false
+    }
+  },
+  "is_error_statuses": [
+    "BLOCKED",
+    "ERROR"
+  ],
+  "not_error_statuses": [
+    "EXECUTED",
+    "PENDING_APPROVAL"
+  ],
+  "next_actions": [
+    "stop",
+    "request_access",
+    "do_not_run",
+    "apply_fix_and_recheck",
+    "fix_and_recheck",
+    "run_approved_query",
+    "mention_to_user",
+    "run_as_written",
+    "done",
+    "refine_query",
+    "request_write_access",
+    "await_approval",
+    "request_new_approval",
+    "fix_sql_error",
+    "retry_later"
+  ]
+}

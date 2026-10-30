@@ -1464,6 +1464,7 @@ mod tests {
             ticket_id: None,
             session_tenant: None,
             kill_switch_id: None,
+            ..Default::default()
         }
     }
 

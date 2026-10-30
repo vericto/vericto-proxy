@@ -281,7 +281,7 @@ pub(crate) fn startup_settings_block(
 /// else `"*"`, else none). A session whose user could not be read gets a
 /// deny-everything enforce policy as soon as any user has one: it might be
 /// one of them, and the proxy cannot show it is not.
-fn select_policy(map: &AccessPolicyMap, user: Option<&str>) -> Option<AccessPolicy> {
+pub(crate) fn select_policy(map: &AccessPolicyMap, user: Option<&str>) -> Option<AccessPolicy> {
     match user {
         Some(u) => map.for_user(u).cloned(),
         None if map.0.is_empty() => None,

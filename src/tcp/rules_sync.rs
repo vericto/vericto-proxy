@@ -24,6 +24,11 @@ use vericto_engine::{
     SensitiveColumn, Severity,
 };
 
+/// Sent by `vericto-proxy mcp` on every `GET /sync/rules` (4.21.0), so the
+/// control plane can tell an MCP server from a TCP proxy (and send the MCP
+/// sections). A control plane that does not know it ignores it.
+pub const PROXY_MODE_HEADER: &str = "X-Vericto-Proxy-Mode";
+
 /// Shared, hot-swappable ruleset.
 pub type SharedRuleset = Arc<ArcSwap<Vec<Rule>>>;
 
@@ -110,6 +115,92 @@ struct SyncResponse {
     /// the deny-all allowlist (VERICTO-087) that blocks that user too.
     #[serde(default)]
     kill_switch: Option<serde_json::Value>,
+    /// `vericto-proxy mcp` (4.21.0): the `mcp` section the control plane adds
+    /// for a proxy that sends `X-Vericto-Proxy-Mode: mcp` (contract
+    /// `tests/mcp-contract/sync-mcp.json`): the tiers and per-call limits of
+    /// this database, the proxy key's own kill-switch block, and, in a signed
+    /// body, the runtime keys allowed to call the MCP server (`identities`,
+    /// each with the SHA-256 of the key). Kept as raw JSON and read fail-safe
+    /// by `mcp`; absent from a control plane that does not send it.
+    #[serde(default)]
+    mcp: Option<serde_json::Value>,
+    /// Gate W (design §9.11): false until the open engine bypasses are closed.
+    /// Read by `mcp` mode only; a tier above read never runs in this release
+    /// whatever it says.
+    #[serde(default)]
+    mcp_write_tiers_allowed: Option<bool>,
+}
+
+/// What `vericto-proxy mcp` learns from the rule sync (4.21.0): whether a
+/// bundle is in force and where it came from, its version, and the MCP
+/// sections of it. Written by the syncer after a bundle is applied; read on
+/// every MCP call.
+#[derive(Debug, Default)]
+pub struct BundleWatch {
+    /// 0: none yet (the built-in ruleset), 1: the rules cache, 2: a live sync.
+    source: std::sync::atomic::AtomicU8,
+    version: arc_swap::ArcSwapOption<String>,
+    mcp: arc_swap::ArcSwapOption<serde_json::Value>,
+    write_tiers_allowed: std::sync::atomic::AtomicBool,
+}
+
+/// Where the bundle in force came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BundleOrigin {
+    None,
+    Cache,
+    Sync,
+}
+
+impl BundleWatch {
+    pub fn origin(&self) -> BundleOrigin {
+        match self.source.load(std::sync::atomic::Ordering::Acquire) {
+            1 => BundleOrigin::Cache,
+            2 => BundleOrigin::Sync,
+            _ => BundleOrigin::None,
+        }
+    }
+
+    /// The `version` of the bundle in force.
+    pub fn version(&self) -> Option<Arc<String>> {
+        self.version.load_full()
+    }
+
+    /// The `mcp` section of the bundle in force.
+    pub fn mcp(&self) -> Option<Arc<serde_json::Value>> {
+        self.mcp.load_full()
+    }
+
+    /// The bundle's `mcp_write_tiers_allowed` (false when absent).
+    pub fn write_tiers_allowed(&self) -> bool {
+        self.write_tiers_allowed
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    fn record(
+        &self,
+        source: BundleSource,
+        version: &str,
+        mcp: Option<serde_json::Value>,
+        write_tiers: bool,
+    ) {
+        self.version.store(Some(Arc::new(version.to_string())));
+        self.mcp.store(mcp.filter(|v| v.is_object()).map(Arc::new));
+        self.write_tiers_allowed
+            .store(write_tiers, std::sync::atomic::Ordering::Release);
+        let origin = match source {
+            BundleSource::Cache => 1,
+            BundleSource::Sync => 2,
+        };
+        self.source
+            .store(origin, std::sync::atomic::Ordering::Release);
+    }
+
+    /// For tests: a bundle in force, as a sync would record it.
+    #[cfg(test)]
+    pub fn record_for_tests(&self, version: &str, mcp: Option<serde_json::Value>) {
+        self.record(BundleSource::Sync, version, mcp, false);
+    }
 }
 
 /// What the rule sync does for business policy rules: with the mode on it
@@ -122,13 +213,25 @@ pub struct PolicyRulesSync {
     /// The bundle-signature check (4.16.0), used only with the mode on. `None`
     /// with the mode on trusts no key: every bundle is refused (fail safe).
     pub verifier: Option<Arc<BundleVerifier>>,
+    /// `vericto-proxy mcp` (4.21.0): every bundle must carry a valid signature,
+    /// whatever the policy-rules mode (design "MCP execution modes" §7.5), and
+    /// the syncer records what it applied in `watch`.
+    pub require_signature: bool,
+    pub watch: Option<Arc<BundleWatch>>,
 }
 
 impl PolicyRulesSync {
-    /// Whether a bundle may be applied: always with the mode off (nothing is read
-    /// or hashed), only with a signature that verifies with the mode on.
+    /// Whether bundles are verified: with policy rules on, and always in `mcp`
+    /// mode. The request then announces `cel/1` (the control plane signs only
+    /// the bundles of a proxy that does).
+    fn verifying(&self) -> bool {
+        self.mode.is_on() || self.require_signature
+    }
+
+    /// Whether a bundle may be applied: always when not verifying (nothing is
+    /// read or hashed), only with a signature that verifies otherwise.
     fn accepts(&self, body: &[u8], header: Option<&str>, source: BundleSource) -> bool {
-        if !self.mode.is_on() {
+        if !self.verifying() {
             return true;
         }
         match &self.verifier {
@@ -327,6 +430,7 @@ struct Applied {
 
 /// Swaps in the ruleset, policy and telemetry mode from one `/sync/rules` response.
 /// Shared by the live sync and the rules cache, so both enforce a response the same way.
+#[allow(clippy::too_many_arguments)]
 fn apply(
     body: SyncResponse,
     ruleset: &SharedRuleset,
@@ -335,8 +439,12 @@ fn apply(
     kill_switch: &SharedKillSwitch,
     telemetry_mode: &SharedTelemetryMode,
     policy_rules: &PolicyRulesSync,
+    source: BundleSource,
 ) -> Applied {
     let quota = body.quota_word();
+    let version = body.version.clone();
+    let mcp = body.mcp.clone();
+    let write_tiers = body.mcp_write_tiers_allowed == Some(true);
     let mode = TelemetryQueryMode::from_api(
         body.policy
             .as_ref()
@@ -369,6 +477,9 @@ fn apply(
     agent_access.store(Arc::new(access));
     kill_switch.store(blocks.map(Arc::new));
     telemetry_mode.store(Arc::new(mode));
+    if let Some(watch) = &policy_rules.watch {
+        watch.record(source, &version, mcp, write_tiers);
+    }
     Applied {
         count,
         monitor_mode,
@@ -531,6 +642,7 @@ pub async fn run_with_policy_rules(
                     &kill_switch,
                     &telemetry_mode,
                     &policy_rules,
+                    BundleSource::Cache,
                 );
                 if let Some(pc) = &applied.proxy_config {
                     apply_proxy_config(pc, &mut sync_interval, &mut ticker);
@@ -563,11 +675,14 @@ pub async fn run_with_policy_rules(
                 stats.header_value(),
             );
         }
-        if policy_rules.mode.is_on() {
+        if policy_rules.verifying() {
             req = req.header(
                 crate::tcp::policy_rules::POLICY_LANGUAGE_HEADER,
                 crate::tcp::policy_rules::POLICY_LANGUAGE_ANNOUNCEMENT,
             );
+        }
+        if policy_rules.watch.is_some() {
+            req = req.header(PROXY_MODE_HEADER, "mcp");
         }
         if let Some(tag) = &etag {
             req = req.header("If-None-Match", tag.clone());
@@ -586,8 +701,7 @@ pub async fn run_with_policy_rules(
                     .map(|s| s.to_string());
                 // The bundle signature (4.16.0), read only with policy rules on.
                 let signature = policy_rules
-                    .mode
-                    .is_on()
+                    .verifying()
                     .then(|| {
                         res.headers()
                             .get(SIGNATURE_HEADER)
@@ -599,7 +713,7 @@ pub async fn run_with_policy_rules(
                 // With policy rules on, as raw bytes that must be UTF-8 (JSON is),
                 // so the bytes verified are exactly the bytes received: `text()`
                 // decodes by the declared charset, lossily.
-                let received = if policy_rules.mode.is_on() {
+                let received = if policy_rules.verifying() {
                     res.bytes()
                         .await
                         .map_err(|e| e.to_string())
@@ -639,6 +753,7 @@ pub async fn run_with_policy_rules(
                             &kill_switch,
                             &telemetry_mode,
                             &policy_rules,
+                            BundleSource::Sync,
                         );
                         if let Some(pc) = &applied.proxy_config {
                             apply_proxy_config(pc, &mut sync_interval, &mut ticker);
@@ -1193,6 +1308,7 @@ mod tests {
             &SharedKillSwitch::default(),
             &mode,
             &PolicyRulesSync::default(),
+            BundleSource::Sync,
         );
         ((**policy.load()).clone(), (**access.load()).clone())
     }
@@ -1507,6 +1623,7 @@ mod tests {
             &kill,
             &Arc::new(ArcSwap::from_pointee(TelemetryQueryMode::Raw)),
             &PolicyRulesSync::default(),
+            BundleSource::Sync,
         );
         (kill.load_full(), (**access.load()).clone())
     }
@@ -1697,6 +1814,7 @@ mod tests {
                 verifier: Some(Arc::new(BundleVerifier::new(
                     crate::tcp::bundle_signature::test_support::ring_of(&[&signer]),
                 ))),
+                ..Default::default()
             };
             let ready = crate::tcp::healthz::Readiness::new();
             let sync = tokio::spawn(run_with_policy_rules(
@@ -1914,6 +2032,7 @@ mod tests {
                     mode,
                     bundle: Default::default(),
                     verifier: Some(Arc::clone(&verifier)),
+                    ..Default::default()
                 };
                 let ready = crate::tcp::healthz::Readiness::new();
                 let task = tokio::spawn(run_with_policy_rules(
@@ -2234,5 +2353,123 @@ mod tests {
             assert_eq!(proxy.codes(), vec!["ACME-001", "POL-014"]);
             assert!(proxy.verifier.stats.verified_in_effect());
         }
+    }
+    /// `vericto-proxy mcp` (4.21.0): the sync announces the mode and cel/1,
+    /// refuses an unsigned bundle whatever the policy-rules mode, and records
+    /// what it applied (origin, version, the `mcp` section) for the MCP server.
+    #[tokio::test]
+    async fn mcp_mode_syncs_only_signed_bundles_and_records_the_mcp_section() {
+        use crate::config::BufferMode;
+        use crate::tcp::bundle_signature::test_support::{TestSigner, ring_of};
+        use axum::{Router, http::HeaderMap, http::header, response::IntoResponse, routing::get};
+        use std::sync::Mutex;
+
+        let signer = TestSigner::new("k-test");
+        let body = serde_json::json!({
+            "version": "v-mcp-1",
+            "rules": [],
+            "mcp": { "version": "1", "mode": "proxy", "tiers": { "read": "enabled", "write": "off", "delete": "off", "ddl": "off" } },
+            "mcp_write_tiers_allowed": false
+        })
+        .to_string();
+        let signed = Arc::new(Mutex::new(false));
+        type Seen = Arc<Mutex<Vec<(Option<String>, Option<String>)>>>;
+        let seen: Seen = Arc::default();
+        let app = {
+            let (body, signed, seen) = (body.clone(), Arc::clone(&signed), Arc::clone(&seen));
+            let sig = signer.header(body.as_bytes());
+            Router::new().route(
+                "/api/v1/sync/rules",
+                get(move |h: HeaderMap| {
+                    let (body, signed, seen, sig) = (
+                        body.clone(),
+                        Arc::clone(&signed),
+                        Arc::clone(&seen),
+                        sig.clone(),
+                    );
+                    async move {
+                        let get = |k: &str| h.get(k).map(|v| v.to_str().unwrap().to_string());
+                        seen.lock().unwrap().push((
+                            get(PROXY_MODE_HEADER),
+                            get(crate::tcp::policy_rules::POLICY_LANGUAGE_HEADER),
+                        ));
+                        let mut out = HeaderMap::new();
+                        out.insert(header::ETAG, "\"v-mcp-1\"".parse().unwrap());
+                        if *signed.lock().unwrap() {
+                            out.insert(SIGNATURE_HEADER, sig.parse().unwrap());
+                        }
+                        (out, body).into_response()
+                    }
+                }),
+            )
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let cfg = ControlPlaneConfig {
+            api_url: format!("http://{addr}"),
+            api_key: "vk_test".into(),
+            database_id: Some("db-1".into()),
+            rules_sync_interval: Duration::from_millis(100),
+            rules_cache_path: None,
+            buffer_mode: BufferMode::Memory,
+            disk_spool_path: String::new(),
+            memory_capacity: 10,
+            batch_size: 10,
+            flush_interval: Duration::from_secs(5),
+            spool: crate::config::SpoolTuning::default(),
+            delivery: crate::config::DeliveryTuning::default(),
+        };
+        let watch = Arc::new(BundleWatch::default());
+        let sync = PolicyRulesSync {
+            // Off on purpose: in mcp mode the signature is required anyway.
+            mode: crate::tcp::policy_rules::PolicyRulesMode::Off,
+            bundle: Default::default(),
+            verifier: Some(Arc::new(BundleVerifier::new(ring_of(&[&signer])))),
+            require_signature: true,
+            watch: Some(Arc::clone(&watch)),
+        };
+        let task = tokio::spawn(run_with_policy_rules(
+            cfg,
+            Arc::new(ArcSwap::from_pointee(
+                crate::tcp::evaluator::default_ruleset(),
+            )),
+            Arc::new(ArcSwap::from_pointee(EnforcementPolicy::default())),
+            Arc::new(ArcSwap::from_pointee(AccessPolicyMap::default())),
+            SharedKillSwitch::default(),
+            Arc::new(ArcSwap::from_pointee(TelemetryQueryMode::default())),
+            sync,
+            crate::tcp::healthz::Readiness::new(),
+            None,
+        ));
+        for _ in 0..30 {
+            if seen.lock().unwrap().len() >= 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(
+            watch.origin(),
+            BundleOrigin::None,
+            "an unsigned bundle is never applied"
+        );
+        *signed.lock().unwrap() = true;
+        for _ in 0..60 {
+            if watch.origin() == BundleOrigin::Sync {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(watch.origin(), BundleOrigin::Sync);
+        assert_eq!(
+            watch.version().as_deref().map(String::as_str),
+            Some("v-mcp-1")
+        );
+        assert_eq!(watch.mcp().unwrap()["tiers"]["read"], "enabled");
+        assert!(!watch.write_tiers_allowed());
+        let (mode, lang) = seen.lock().unwrap()[0].clone();
+        assert_eq!(mode.as_deref(), Some("mcp"));
+        assert!(lang.unwrap().starts_with("cel/1"));
+        task.abort();
     }
 }

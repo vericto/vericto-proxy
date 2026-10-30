@@ -1,0 +1,59 @@
+{
+  "description": "What GET /api/v1/sync/rules adds for `vericto-proxy mcp` (docs/design/mcp-proxy-mode.md \u00a79.11, \u00a711.2, Q8). The proxy sends the request header on every sync and names its database (database_id). The section is absent for any other proxy, whose body and ETag do not change. `identities` is only in a signed body (a proxy that announces policy_language cel/1): each runtime key of the workspace with sql:read, not revoked or expired, with the lowercase hex SHA-256 of the full key. tiers.read is enabled when the proxy's own key holds sql:read; write, delete and ddl stay off and mcp_write_tiers_allowed false until Gate W.",
+  "request_header": {
+    "name": "X-Vericto-Proxy-Mode",
+    "value": "mcp"
+  },
+  "required_scopes": {
+    "proxy_key": [
+      "rules:read",
+      "telemetry:write",
+      "sql:read"
+    ],
+    "agent_key": [
+      "sql:read"
+    ]
+  },
+  "top_level": {
+    "mcp_write_tiers_allowed": false
+  },
+  "example": {
+    "version": "1",
+    "mode": "proxy",
+    "database_id": "{{database_id}}",
+    "tiers": {
+      "read": "enabled",
+      "write": "off",
+      "delete": "off",
+      "ddl": "off"
+    },
+    "limits": {
+      "max_rows": 200,
+      "max_rows_cap": 1000,
+      "max_result_bytes": 262144,
+      "max_cell_bytes": 8192,
+      "statement_timeout_ms": 15000,
+      "statement_timeout_cap_ms": 60000,
+      "lock_timeout_ms": 2000
+    },
+    "self": {
+      "key_id": "{{proxy_key_id}}",
+      "sql_read": true,
+      "kill_switch": null
+    },
+    "identities": [
+      {
+        "key_id": "{{agent_key_id}}",
+        "key_sha256": "{{sha256(agent_key)}}",
+        "name": "cursor-alice",
+        "principal_id": null,
+        "expires_at": null,
+        "kill_switch": null
+      }
+    ]
+  },
+  "kill_switch_entry": {
+    "block_id": "{{block_id}}",
+    "message": "Vericto blocked this query [VERICTO-105]: ..."
+  }
+}

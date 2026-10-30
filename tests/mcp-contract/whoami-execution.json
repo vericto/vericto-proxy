@@ -1,0 +1,134 @@
+{
+  "description": "whoami's `execution` block (docs/design/mcp-proxy-mode.md \u00a76.7). `proxy_stdio` and `proxy_http` are what `vericto-proxy mcp` answers locally (M1: labels and taint are null until M1.4, allowance is Gateway only); `advisory` is what /mcp and /mcp/account answer today for a workspace with one database named shop (postgres).",
+  "proxy_stdio": {
+    "mode": "proxy",
+    "databases": [
+      {
+        "name": "shop",
+        "dialect": "postgres",
+        "tiers": {
+          "read": "enabled",
+          "write": "off",
+          "delete": "off",
+          "ddl": "off"
+        },
+        "limits": {
+          "max_rows": 200,
+          "max_rows_cap": 1000,
+          "max_result_bytes": 262144,
+          "max_cell_bytes": 8192,
+          "statement_timeout_ms": 15000,
+          "statement_timeout_cap_ms": 60000,
+          "lock_timeout_ms": 2000
+        },
+        "allowance": null,
+        "labels": null
+      }
+    ],
+    "session": {
+      "id_kind": "stdio",
+      "taint": null
+    },
+    "warnings": [
+      "agent_environment_has_db_credentials"
+    ]
+  },
+  "proxy_http": {
+    "mode": "proxy",
+    "databases": [
+      {
+        "name": "shop",
+        "dialect": "postgres",
+        "tiers": {
+          "read": "enabled",
+          "write": "off",
+          "delete": "off",
+          "ddl": "off"
+        },
+        "limits": {
+          "max_rows": 100,
+          "max_rows_cap": 1000,
+          "max_result_bytes": 131072,
+          "max_cell_bytes": 8192,
+          "statement_timeout_ms": 10000,
+          "statement_timeout_cap_ms": 60000,
+          "lock_timeout_ms": 2000
+        },
+        "allowance": null,
+        "labels": null
+      }
+    ],
+    "session": {
+      "id_kind": "http_session",
+      "taint": null
+    },
+    "warnings": []
+  },
+  "proxy_unlinked": {
+    "mode": "proxy",
+    "databases": [
+      {
+        "name": "shop",
+        "dialect": "postgres",
+        "tiers": {
+          "read": "enabled",
+          "write": "off",
+          "delete": "off",
+          "ddl": "off"
+        },
+        "limits": {
+          "max_rows": 200,
+          "max_rows_cap": 1000,
+          "max_result_bytes": 262144,
+          "max_cell_bytes": 8192,
+          "statement_timeout_ms": 15000,
+          "statement_timeout_cap_ms": 60000,
+          "lock_timeout_ms": 2000
+        },
+        "allowance": null,
+        "labels": null
+      }
+    ],
+    "session": {
+      "id_kind": "stdio",
+      "taint": null
+    },
+    "warnings": [
+      "no_control_plane"
+    ]
+  },
+  "advisory_input": [
+    {
+      "name": "shop",
+      "dialect": "postgres"
+    }
+  ],
+  "advisory": {
+    "mode": "advisory",
+    "databases": [
+      {
+        "name": "shop",
+        "dialect": "postgres",
+        "tiers": {
+          "read": "off",
+          "write": "off",
+          "delete": "off",
+          "ddl": "off"
+        },
+        "limits": null,
+        "allowance": null,
+        "labels": null
+      }
+    ],
+    "session": {
+      "id_kind": "per_call",
+      "taint": null
+    },
+    "warnings": []
+  },
+  "known_warnings": [
+    "agent_environment_has_db_credentials",
+    "no_control_plane",
+    "rules_from_cache"
+  ]
+}

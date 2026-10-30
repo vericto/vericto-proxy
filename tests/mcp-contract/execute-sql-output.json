@@ -1,0 +1,321 @@
+{
+  "description": "execute_sql structuredContent examples (docs/design/mcp-proxy-mode.md \u00a76.3). Each must pass the open output schema; is_error is the result's isError (true for BLOCKED and ERROR). next_steps are those of execute-sql-next-steps.json for the same outcome. Row values are examples: hints never come from them (\u00a715, T1).",
+  "examples": [
+    {
+      "name": "executed_masked",
+      "is_error": false,
+      "structured_content": {
+        "verdict": {
+          "status": "FLAGGED",
+          "rule_code": "VERICTO-085",
+          "severity": "medium",
+          "suggested_fix": null,
+          "sensitive_columns": [
+            {
+              "schema": "public",
+              "table": "users",
+              "column": "email",
+              "policy": "mask"
+            }
+          ],
+          "access_denied": []
+        },
+        "executed_sql": "SELECT id, CASE WHEN email IS NULL THEN NULL ELSE '***' END AS email FROM users WHERE id = $1",
+        "rewritten": true,
+        "statement_sha256": "9f2c4b0e8d7a6c5b4a3f2e1d0c9b8a7f6e5d4c3b2a1f0e9d8c7b6a5f4e3d2c1b",
+        "columns": [
+          {
+            "name": "id",
+            "type": "int8"
+          },
+          {
+            "name": "email",
+            "type": "text",
+            "masked": "email"
+          }
+        ],
+        "rows": [
+          [
+            "1",
+            "***"
+          ]
+        ],
+        "row_count": 1,
+        "truncated": false,
+        "truncation": null,
+        "cells_truncated": 0,
+        "command_tag": "SELECT 1",
+        "rows_affected": null,
+        "duration_ms": 3.2,
+        "tier": "read",
+        "enabled_tiers": [
+          "read"
+        ],
+        "ruleset_version": "v1.0.0-3f2a9c1b7d4e",
+        "event_id": "0b8e6a52-5f43-4b1e-9d3c-2a7f1e6c4d90",
+        "status": "EXECUTED",
+        "taint": null,
+        "next_action": "mention_to_user",
+        "next_steps": [
+          {
+            "action": "mention_to_user",
+            "lines": [
+              1
+            ],
+            "rule_code": "VERICTO-085",
+            "tool": null,
+            "message": "ran the approved rewrite (public.users.email masked); the values you see are masked by policy, do not try to read them another way."
+          }
+        ]
+      }
+    },
+    {
+      "name": "executed_truncated",
+      "is_error": false,
+      "structured_content": {
+        "verdict": {
+          "status": "ALLOWED",
+          "rule_code": null,
+          "severity": null,
+          "suggested_fix": null
+        },
+        "executed_sql": "SELECT id FROM orders ORDER BY id",
+        "rewritten": false,
+        "statement_sha256": "1c2b3a4f5e6d7c8b9a0f1e2d3c4b5a6f7e8d9c0b1a2f3e4d5c6b7a8f9e0d1c2b",
+        "columns": [
+          {
+            "name": "id",
+            "type": "int8"
+          }
+        ],
+        "rows": [
+          [
+            "1"
+          ],
+          [
+            "2"
+          ]
+        ],
+        "row_count": 200,
+        "truncated": true,
+        "truncation": {
+          "reason": "max_rows",
+          "limit": 200
+        },
+        "cells_truncated": 0,
+        "command_tag": "SELECT 200",
+        "rows_affected": null,
+        "duration_ms": 11.0,
+        "tier": "read",
+        "enabled_tiers": [
+          "read"
+        ],
+        "ruleset_version": "v1.0.0-3f2a9c1b7d4e",
+        "event_id": "0b8e6a52-5f43-4b1e-9d3c-2a7f1e6c4d90",
+        "status": "EXECUTED",
+        "next_action": "refine_query",
+        "next_steps": [
+          {
+            "action": "refine_query",
+            "lines": [
+              1
+            ],
+            "rule_code": null,
+            "tool": null,
+            "message": "showing 200 rows, cut at the 200-row limit; add a WHERE, select fewer columns, or page with ORDER BY and a WHERE on the last key you saw. Do not raise max_rows to read everything."
+          }
+        ]
+      }
+    },
+    {
+      "name": "blocked",
+      "is_error": true,
+      "structured_content": {
+        "verdict": {
+          "status": "BLOCKED",
+          "rule_code": "VERICTO-010",
+          "severity": "critical",
+          "suggested_fix": null
+        },
+        "executed_sql": null,
+        "rewritten": false,
+        "statement_sha256": null,
+        "columns": [],
+        "rows": [],
+        "row_count": 0,
+        "truncated": false,
+        "truncation": null,
+        "cells_truncated": 0,
+        "command_tag": null,
+        "rows_affected": null,
+        "duration_ms": null,
+        "tier": "ddl",
+        "enabled_tiers": [
+          "read"
+        ],
+        "ruleset_version": "v1.0.0-3f2a9c1b7d4e",
+        "event_id": "0b8e6a52-5f43-4b1e-9d3c-2a7f1e6c4d90",
+        "status": "BLOCKED",
+        "error": {
+          "code": "BLOCKED",
+          "message": "Blocked by VERICTO-010 (DROP TABLE)."
+        },
+        "next_action": "do_not_run",
+        "next_steps": [
+          {
+            "action": "do_not_run",
+            "lines": [
+              1
+            ],
+            "rule_code": "VERICTO-010",
+            "tool": "show_rule",
+            "message": "not run: do not rephrase it to get past VERICTO-010; call show_rule VERICTO-010 to see what the rule allows, or ask the user."
+          }
+        ]
+      }
+    },
+    {
+      "name": "tier_not_enabled",
+      "is_error": true,
+      "structured_content": {
+        "verdict": {
+          "status": "ALLOWED",
+          "rule_code": null,
+          "severity": null,
+          "suggested_fix": null
+        },
+        "executed_sql": null,
+        "rewritten": false,
+        "statement_sha256": null,
+        "columns": [],
+        "rows": [],
+        "row_count": 0,
+        "truncated": false,
+        "truncation": null,
+        "cells_truncated": 0,
+        "command_tag": null,
+        "rows_affected": null,
+        "duration_ms": null,
+        "tier": "delete",
+        "enabled_tiers": [
+          "read"
+        ],
+        "ruleset_version": "v1.0.0-3f2a9c1b7d4e",
+        "event_id": "0b8e6a52-5f43-4b1e-9d3c-2a7f1e6c4d90",
+        "status": "BLOCKED",
+        "error": {
+          "code": "TIER_NOT_ENABLED",
+          "message": "The delete tier is not enabled for this database.",
+          "tier": "delete",
+          "enabled_tiers": [
+            "read"
+          ],
+          "layer": "database"
+        },
+        "next_action": "request_write_access",
+        "next_steps": [
+          {
+            "action": "request_write_access",
+            "lines": [
+              1
+            ],
+            "rule_code": null,
+            "tool": null,
+            "message": "not run: this is a DELETE and only read is enabled for you on shop. Each tier (write, delete, DDL) needs a person to enable it, and each statement needs approval; ask the user. Rephrasing will not help."
+          }
+        ]
+      }
+    },
+    {
+      "name": "database_error",
+      "is_error": true,
+      "structured_content": {
+        "verdict": {
+          "status": "ALLOWED",
+          "rule_code": null,
+          "severity": null,
+          "suggested_fix": null
+        },
+        "executed_sql": "SELECT * FROM userz LIMIT 10",
+        "rewritten": false,
+        "statement_sha256": "aa11bb22cc33dd44ee55ff66aa11bb22cc33dd44ee55ff66aa11bb22cc33dd44",
+        "columns": [],
+        "rows": [],
+        "row_count": 0,
+        "truncated": false,
+        "truncation": null,
+        "cells_truncated": 0,
+        "command_tag": null,
+        "rows_affected": null,
+        "duration_ms": 0.8,
+        "tier": "read",
+        "enabled_tiers": [
+          "read"
+        ],
+        "ruleset_version": "v1.0.0-3f2a9c1b7d4e",
+        "event_id": "0b8e6a52-5f43-4b1e-9d3c-2a7f1e6c4d90",
+        "status": "ERROR",
+        "error": {
+          "code": "DATABASE_ERROR",
+          "message": "relation \"userz\" does not exist",
+          "sqlstate": "42P01"
+        },
+        "next_action": "fix_sql_error",
+        "next_steps": [
+          {
+            "action": "fix_sql_error",
+            "lines": [
+              1
+            ],
+            "rule_code": null,
+            "tool": "describe_schema",
+            "message": "the database refused it (42P01 undefined_table); call describe_schema to see the tables and columns."
+          }
+        ]
+      }
+    },
+    {
+      "name": "invalid_input",
+      "is_error": true,
+      "structured_content": {
+        "verdict": null,
+        "executed_sql": null,
+        "rewritten": false,
+        "statement_sha256": null,
+        "columns": [],
+        "rows": [],
+        "row_count": 0,
+        "truncated": false,
+        "truncation": null,
+        "cells_truncated": 0,
+        "command_tag": null,
+        "rows_affected": null,
+        "duration_ms": null,
+        "tier": null,
+        "enabled_tiers": [
+          "read"
+        ],
+        "ruleset_version": null,
+        "event_id": "0b8e6a52-5f43-4b1e-9d3c-2a7f1e6c4d90",
+        "status": "ERROR",
+        "error": {
+          "code": "INVALID_INPUT",
+          "message": "Send one statement per call.",
+          "field": "sql"
+        },
+        "next_action": "fix_and_recheck",
+        "next_steps": [
+          {
+            "action": "fix_and_recheck",
+            "lines": [
+              1
+            ],
+            "rule_code": null,
+            "tool": "execute_sql",
+            "message": "not run: send one statement per call, then call execute_sql again."
+          }
+        ]
+      }
+    }
+  ]
+}

@@ -67,6 +67,10 @@ pub struct Reporter {
 struct Shared {
     /// Still compressing request bodies (see the module docs).
     gzip: AtomicBool,
+    /// `vericto-proxy mcp` (4.21.0): the API refused `source: mcp_proxy` and
+    /// accepted the same events as `source: mcp`, so this process sends `mcp`
+    /// from then on (a control plane older than the MCP ingest).
+    legacy_mcp_source: AtomicBool,
     delivered: AtomicU64,
     requests: AtomicU64,
     retries: AtomicU64,
@@ -150,6 +154,7 @@ impl Reporter {
             .expect("failed to build telemetry HTTP client");
         let shared = Arc::new(Shared {
             gzip: AtomicBool::new(cfg.delivery.gzip),
+            legacy_mcp_source: AtomicBool::new(false),
             delivered: AtomicU64::new(0),
             requests: AtomicU64::new(0),
             retries: AtomicU64::new(0),
@@ -380,6 +385,32 @@ impl Reporter {
     /// One POST. A compressed body refused with 400/415 is sent again uncompressed;
     /// if that is accepted, compression stays off for the rest of the process.
     async fn post(&self, url: &str, events: &[TelemetryEvent]) -> Result<(), DeliveryError> {
+        let mcp = events
+            .iter()
+            .any(|e| e.source.as_deref() == Some(crate::telemetry::MCP_PROXY_SOURCE));
+        if !mcp {
+            return self.post_as_is(url, events).await;
+        }
+        if self.shared.legacy_mcp_source.load(Ordering::Relaxed) {
+            return self.post_as_is(url, &legacy_source(events)).await;
+        }
+        match self.post_as_is(url, events).await {
+            Err(DeliveryError::Permanent { status: 400 }) => {
+                let legacy = self.post_as_is(url, &legacy_source(events)).await;
+                if legacy.is_ok() && !self.shared.legacy_mcp_source.swap(true, Ordering::Relaxed) {
+                    tracing::warn!(
+                        "The Vericto API does not accept the telemetry source mcp_proxy yet and accepted \
+                         the events as source mcp; sending mcp from now on (the events keep their \
+                         MCP fields)"
+                    );
+                }
+                legacy
+            }
+            other => other,
+        }
+    }
+
+    async fn post_as_is(&self, url: &str, events: &[TelemetryEvent]) -> Result<(), DeliveryError> {
         let gzip = self.shared.gzip.load(Ordering::Relaxed);
         let first = self.send(url, events, gzip).await;
         match first {
@@ -696,6 +727,25 @@ impl Disposition {
     fn is_permanent(&self) -> bool {
         matches!(self, Disposition::Permanent)
     }
+}
+
+/// `events` with `source: mcp_proxy` sent as `mcp`, and `INVALID` as
+/// `BLOCKED`: the values an older ingest schema knows.
+fn legacy_source(events: &[TelemetryEvent]) -> Vec<TelemetryEvent> {
+    events
+        .iter()
+        .map(|e| {
+            let mut e = e.clone();
+            if e.source.as_deref() == Some(crate::telemetry::MCP_PROXY_SOURCE) {
+                e.source = Some(crate::telemetry::LEGACY_MCP_SOURCE.to_string());
+                // An older ingest has no INVALID status either.
+                if e.status == "INVALID" {
+                    e.status = "BLOCKED".to_string();
+                }
+            }
+            e
+        })
+        .collect()
 }
 
 /// Decide whether an HTTP status makes a batch permanently undeliverable.
@@ -1474,5 +1524,89 @@ mod tests {
                 "{status} should be retryable"
             );
         }
+    }
+    /// `vericto-proxy mcp` (4.21.0): an ingest that does not know the source
+    /// `mcp_proxy` (or the status INVALID) refuses the batch with 400; the
+    /// reporter sends the same events as source `mcp` (INVALID as BLOCKED)
+    /// and keeps doing so, so no MCP event is lost to an older control plane.
+    #[tokio::test]
+    async fn mcp_events_fall_back_to_the_source_an_older_ingest_knows() {
+        use axum::{
+            Router, body::Bytes, http::HeaderMap, http::StatusCode as S, response::IntoResponse,
+            routing::post,
+        };
+        let stored: Arc<Mutex<Vec<serde_json::Value>>> = Arc::default();
+        let requests = Arc::new(AtomicUsize::new(0));
+        let app = {
+            let (stored, requests) = (stored.clone(), requests.clone());
+            Router::new().route(
+                "/api/v1/ingest/events",
+                post(move |headers: HeaderMap, body: Bytes| {
+                    let (stored, requests) = (stored.clone(), requests.clone());
+                    async move {
+                        requests.fetch_add(1, Ordering::SeqCst);
+                        let raw = if headers.get("content-encoding").is_some_and(|v| v == "gzip") {
+                            let mut out = Vec::new();
+                            std::io::Read::read_to_end(
+                                &mut flate2::read::GzDecoder::new(&body[..]),
+                                &mut out,
+                            )
+                            .unwrap();
+                            out
+                        } else {
+                            body.to_vec()
+                        };
+                        let json: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+                        let events = json["events"].as_array().unwrap().clone();
+                        if events
+                            .iter()
+                            .any(|e| e["source"] == "mcp_proxy" || e["status"] == "INVALID")
+                        {
+                            return S::BAD_REQUEST.into_response();
+                        }
+                        stored.lock().unwrap().extend(events);
+                        S::ACCEPTED.into_response()
+                    }
+                }),
+            )
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let dir = tempfile::tempdir().unwrap();
+        let mut c = cfg(&format!("http://{addr}"), dir.path());
+        c.buffer_mode = crate::config::BufferMode::Memory;
+        let queue: Arc<dyn EventQueue> = Arc::new(crate::telemetry::queue::MemoryQueue::new(100));
+        let reporter = Reporter::new(c, queue.clone());
+        let mut a = event("e-mcp-1".into());
+        a.source = Some(crate::telemetry::MCP_PROXY_SOURCE.into());
+        a.execution_status = Some("executed".into());
+        let mut b = event("e-mcp-2".into());
+        b.source = Some(crate::telemetry::MCP_PROXY_SOURCE.into());
+        b.status = "INVALID".into();
+        queue.push(a);
+        queue.push(b);
+        reporter.deliver_pending().await;
+        {
+            let got = stored.lock().unwrap();
+            assert_eq!(got.len(), 2, "{got:?}");
+            assert!(got.iter().all(|e| e["source"] == "mcp"));
+            assert_eq!(got[1]["status"], "BLOCKED");
+            assert_eq!(
+                got[0]["execution_status"], "executed",
+                "the MCP fields are kept"
+            );
+        }
+        let before = requests.load(Ordering::SeqCst);
+        let mut c3 = event("e-mcp-3".into());
+        c3.source = Some(crate::telemetry::MCP_PROXY_SOURCE.into());
+        queue.push(c3);
+        reporter.deliver_pending().await;
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            before + 1,
+            "the fallback is remembered"
+        );
+        assert_eq!(stored.lock().unwrap().len(), 3);
     }
 }

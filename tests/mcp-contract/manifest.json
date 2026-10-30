@@ -1,0 +1,18 @@
+{
+  "contract": "mcp-execute-sql",
+  "contract_version": "1",
+  "design": "docs/design/mcp-proxy-mode.md (vericto-fmw), revision 3.1, §6.9",
+  "scope": "Milestone M1, read tier: Proxy mode (`vericto-proxy mcp`) and the control plane it links to. Tiers above read, approvals, impact verification, taint and the Gateway reserve their names here and are not exercised.",
+  "home": "vericto-proxy tests/mcp-contract/ is the home of these files once it vendors them (§6.9); vericto-fmw keeps a copy in backend/tests/fixtures/mcp-contract/, updated by tag. A changed message or field is a fixture change in both repositories.",
+  "files": {
+    "execute-sql-input.json": "execute_sql arguments the input schema accepts and refuses (§6.2)",
+    "execute-sql-output.json": "structuredContent examples the open output schema accepts, with isError (§6.3)",
+    "execute-sql-next-steps.json": "every M1 outcome and its status, error code, query-event execution_status and next steps (§6.4, §6.5, §14.2)",
+    "errors.json": "every error code, which M1 can answer, and the answer status each one has (§6.5)",
+    "whoami-execution.json": "whoami's execution block: Proxy mode (local whoami) and Advisory (/mcp, /mcp/account) (§6.7)",
+    "ingest-events.json": "query events the proxy reports with source mcp_proxy, and what the control plane stores (§14.1, §14.2)",
+    "sync-mcp.json": "what GET /api/v1/sync/rules adds for a proxy in mcp mode (§9.11, §11.2, Q8)",
+    "check-sql-next-steps.json": "check_sql's next steps in Proxy mode and on /mcp (the #536 verdictStep vocabulary, with the execute_sql hints of §6.7); added by vericto-proxy 4.21.0",
+    "tools.json": "the tools vericto-proxy mcp lists (names, required inputs, annotations); added by vericto-proxy 4.21.0"
+  }
+}

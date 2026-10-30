@@ -1,0 +1,227 @@
+{
+  "description": "execute_sql arguments (docs/design/mcp-proxy-mode.md \u00a76.2). `valid` must pass the input schema, `invalid` must be refused by it. One-statement, NUL-byte, size and params-count checks are not schema checks: they are INVALID_INPUT outcomes (execute-sql-next-steps.json).",
+  "limits": {
+    "max_params": 100,
+    "max_rows_cap": 1000,
+    "statement_timeout_cap_ms": 60000
+  },
+  "valid": [
+    {
+      "sql": "SELECT 1"
+    },
+    {
+      "sql": "SELECT id, email FROM users WHERE created_at > $1 ORDER BY id LIMIT 50",
+      "params": [
+        "2026-10-01"
+      ],
+      "max_rows": 50,
+      "timeout_ms": 5000
+    },
+    {
+      "sql": "SELECT * FROM orders WHERE id = $1 AND paid = $2 AND note IS NOT DISTINCT FROM $3",
+      "params": [
+        42,
+        true,
+        null
+      ],
+      "tier": "read",
+      "ticket": "OPS-123"
+    },
+    {
+      "sql": "SELECT 1",
+      "database": "shop",
+      "max_rows": 1000,
+      "timeout_ms": 60000
+    },
+    {
+      "sql": "UPDATE orders SET status = 'paid' WHERE id = 1",
+      "tier": "write",
+      "idempotency_key": "b7c1e0f2"
+    }
+  ],
+  "invalid": [
+    {
+      "why": "sql is required",
+      "input": {}
+    },
+    {
+      "why": "sql must not be empty",
+      "input": {
+        "sql": ""
+      }
+    },
+    {
+      "why": "params are JSON scalars or null",
+      "input": {
+        "sql": "SELECT $1",
+        "params": [
+          {
+            "a": 1
+          }
+        ]
+      }
+    },
+    {
+      "why": "params are JSON scalars or null",
+      "input": {
+        "sql": "SELECT $1",
+        "params": [
+          [
+            1
+          ]
+        ]
+      }
+    },
+    {
+      "why": "max_rows is at least 1",
+      "input": {
+        "sql": "SELECT 1",
+        "max_rows": 0
+      }
+    },
+    {
+      "why": "at most 100 params",
+      "input": {
+        "sql": "SELECT 1",
+        "params": [
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1
+        ]
+      }
+    },
+    {
+      "why": "max_rows is at most the cap",
+      "input": {
+        "sql": "SELECT 1",
+        "max_rows": 1001
+      }
+    },
+    {
+      "why": "max_rows is an integer",
+      "input": {
+        "sql": "SELECT 1",
+        "max_rows": 1.5
+      }
+    },
+    {
+      "why": "timeout_ms is at most the cap",
+      "input": {
+        "sql": "SELECT 1",
+        "timeout_ms": 60001
+      }
+    },
+    {
+      "why": "tier is one of read, write, delete, ddl",
+      "input": {
+        "sql": "SELECT 1",
+        "tier": "admin"
+      }
+    },
+    {
+      "why": "ticket is at most 128 characters",
+      "input": {
+        "sql": "SELECT 1",
+        "ticket": "TICKET-XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"
+      }
+    }
+  ]
+}
