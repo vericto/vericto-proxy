@@ -19,6 +19,7 @@ All variables are **dialect-agnostic** — the same names apply to every engine.
 - [CPU sizing](#cpu-sizing)
 - [Engine-specific notes](#engine-specific-notes)
   - [MySQL details](#mysql-details)
+- [MCP Proxy mode (`vericto-proxy mcp`)](#mcp-proxy-mode-vericto-proxy-mcp)
 
 ## Control-plane link (telemetry + rule sync)
 
@@ -722,3 +723,14 @@ a `debug` log line when it first appears) with no comparison: the MySQL parser
   compression (`--compress`, a list that includes `uncompressed`, mysql2
   `compress: true`) runs uncompressed; one that allows only `zlib` or `zstd` is
   refused at connect with `ERROR 2066`.
+
+## MCP Proxy mode (`vericto-proxy mcp`)
+
+Since 4.21.0 the same binary runs as an MCP server that executes read-only SQL for an
+AI agent (`vericto-proxy mcp`, Proxy mode). It has its own settings, all prefixed
+`VERICTO_MCP_` (each also a flag of the subcommand), and changes four defaults of the
+shared ones in that mode: `UPSTREAM_SSLMODE` is `verify-full` for any host that is not
+loopback, `VERICTO_RULES_SYNC_INTERVAL_SECS` is 30, `VERICTO_MAX_QUERY_BYTES` is 64 KiB
+(at most 1 MiB) and `VERICTO_POLICY_RULES` is `enforce`; every sync bundle must be signed.
+`VERICTO_API_URL` defaults to `https://api.vericto.com` when `VERICTO_API_KEY` is set.
+The TCP listener is off in that mode. See [MCP.md](MCP.md#configuration-reference).
