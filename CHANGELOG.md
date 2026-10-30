@@ -7,6 +7,112 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [4.21.0] - 2026-10-30
+
+**MCP Proxy mode: an agent runs SQL through Vericto, and what is checked is what
+runs.** `vericto-proxy mcp` is an MCP server in the same binary and image. An AI agent
+(Claude Code, Cursor, Codex, any MCP client) gets `execute_sql` and no database
+credential: every statement is evaluated against the workspace's rules, masks,
+allowlists and business policies, and the server runs exactly the bytes it evaluated
+(or the policy's own rewrite) on PostgreSQL, read-only, with row, size and time caps.
+This is milestone M1 of the design "MCP execution modes" (vericto-fmw
+`docs/design/mcp-proxy-mode.md`, revision 3.1), the read tier only. The TCP proxy
+answers every statement exactly as in 4.20.0. See [docs/MCP.md](docs/MCP.md).
+
+### Added
+
+- **`vericto-proxy mcp`** (`src/mcp/`), over stdio (the default; stdout carries
+  JSON-RPC only and every log line goes to stderr; the process exits when stdin
+  closes) or stateless Streamable HTTP (`--transport http`, `POST /mcp`, `127.0.0.1:8808`
+  by default). One PostgreSQL database per process; the TCP listener is off in this
+  mode. Every `VERICTO_MCP_*` setting is also a flag (`vericto-proxy mcp --help`).
+- **`execute_sql`, the exact-text guarantee** (design §7). One statement per call (a
+  second one, a NUL byte, an empty or oversized statement, or `params` that do not match
+  `$1…$n` is `INVALID_INPUT` before evaluation); evaluation under one snapshot with the
+  MCP identity as the principal; the evaluator's bytes, or its mask / `LIMIT` rewrite,
+  sent as one unnamed `Parse` with the values in `Bind`, inside
+  `BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY` with `SET LOCAL`
+  timeouts and pinned settings, ending in `ROLLBACK` every time. The PostgreSQL client is
+  the low-level `postgres-protocol` crate on the proxy's own `connect_upstream` (TLS
+  `verify-full` by default for any host that is not loopback; SCRAM-SHA-256; MD5 only with
+  `VERICTO_MCP_ALLOW_MD5`; no driver-issued catalog lookups). The only SQL of its own is
+  in `src/mcp/control.rs`, with a test that fails if SQL appears anywhere else.
+- **The read tier, enforced twice** (§8.4, §9.1): the statement class from the parse
+  tree (reads only; a data-modifying `WITH` anywhere raises the tier; a statement the
+  parser cannot read is refused whatever the parse-error policy), a denylist of
+  side-effect functions found anywhere in the tree (`pg_terminate_backend`,
+  `set_config`, `dblink*`, `lo_*`, `query_to_xml*`, `table_to_xml*`, `nextval` …), and the
+  `READ ONLY` transaction. Above read: `TIER_NOT_ENABLED`; never-run statements (`SET`,
+  `COPY`, `DO` …): `INVALID_INPUT`.
+- **Bounded results** (§8): rows (200, cap 1000; fetched with `Execute{max_rows+1}`),
+  serialized bytes (256 KiB, cap 1 MiB), bytes per value (8 KiB, cap 64 KiB), statement
+  time (15 s, cap 60 s), lock wait (2 s), each cut said in `truncated`, the text and a
+  `refine_query` next step; values converted by type (`int8`/`numeric` as exact strings,
+  JSON as JSON, arrays as arrays, `bytea` as base64 with its length). A connection that
+  broke or is not idle after a call is never reused (`VERICTO_MCP_POOL_SIZE`, default 4).
+- **Database errors sanitized** (`VERICTO_MCP_RESULT_DETAIL=sanitized`, §15 T5):
+  `DETAIL`, `HINT`, `WHERE`, `CONTEXT` dropped and quoted values redacted for SQLSTATE
+  classes 21, 22, 23 and P0, so a cast cannot print a masked value.
+- **`describe_schema`** (tables, columns, keys from fixed catalog queries; masked and
+  blocked columns marked; filtered by an enforced allowlist), a **local `check_sql`**
+  (the hosted tool's answer, evaluated here, no CI checks spent, events
+  `execution_status: dry_run`), **`whoami`** with the `execution` block, and, with the
+  control-plane link, **`list_rules`/`show_rule`** from the signed bundle.
+- **The contract shared with the control plane** in `tests/mcp-contract/` (vendored from
+  vericto-fmw PR #543; this repository is its home from now on, design §6.9): input,
+  output, the 42 outcomes and their exact next steps, error codes, `whoami.execution`,
+  ingest events and the sync section, all asserted by `src/mcp/protocol_tests.rs`.
+- **Signed rule sync in mcp mode** (§7.5, §11.2): every bundle must carry a valid
+  signature whatever `VERICTO_POLICY_RULES` says (it defaults to `enforce` there; `off` is
+  refused); the sync sends `X-Vericto-Proxy-Mode: mcp` and polls every 30 s by default;
+  `execute_sql` answers `NOT_READY` until a signed bundle (or the verified rules cache)
+  is in force (`VERICTO_MCP_REQUIRE_CONTROL_PLANE`). The bundle's `mcp` section (tiers,
+  limits that can only lower this process's, the key's own kill-switch block, and the
+  agent keys by SHA-256) is read fail-safe.
+- **HTTP authentication and guards** (§5.4): `Host`/`Origin` validated before
+  authentication (`VERICTO_MCP_ALLOWED_HOSTS`, `VERICTO_MCP_ALLOWED_ORIGINS`), a bearer
+  token mandatory also on loopback (the bundle's agent keys, or
+  `VERICTO_MCP_AUTH_TOKENS_FILE`), TLS (`PROXY_TLS_MODE=require`) or
+  `VERICTO_MCP_ALLOW_PLAINTEXT_HTTP` for a non-loopback listener, a bounded body and a
+  header read timeout. The kill switch applies by key, by database user and to the
+  workspace, and cancels a statement already running.
+- **Credentials** (§12.1): `VERICTO_MCP_DATABASE_URL_FILE` (preferred),
+  `VERICTO_MCP_DATABASE_URL` (warned about) or `UPSTREAM_*`; `--database-url` is refused;
+  the password never prints. At startup, and in `whoami`, the server warns
+  (`agent_environment_has_db_credentials`) when its environment also exposes a database
+  credential (`DATABASE_URL*`, `PGPASSWORD`, `POSTGRES_URL*`, `SUPABASE_DB_*`, `NEON_*`,
+  `~/.pgpass`, a secret file other users can read).
+- **Telemetry** (§14): one event per call, refused ones included, `source: mcp_proxy`,
+  with `execution_status`, `tier`, `rows_returned`, `bytes_returned`, `truncated`,
+  `sqlstate`, `execution_ms`, `mcp_client_name`/`version`, `statement_sha256` and, over
+  HTTP, `api_key_id`; counts and hashes only, never a result value. Input refused before
+  evaluation is `status: INVALID` with its hash. An ingest that refuses the new source is
+  sent the same events as `source: mcp` (once detected, for the life of the process).
+- **A principal signal `mcp_credential`** (strong) in the `principals` section, matched by
+  the key an MCP call presents; a TCP session never has one.
+
+### Security
+
+- **Parsing on a large stack.** In `mcp` mode every parse of agent text runs on a thread
+  with a large stack (reserved, committed as touched), at most 8 at a time, and
+  statements are limited to 64 KiB by default (at most 1 MiB), so a deeply nested
+  statement cannot exhaust a worker's stack.
+
+### Changed
+
+- `TelemetryEvent` gains optional MCP fields (omitted on every TCP event, so a TCP
+  event's JSON is what 4.20.0 sent); the principal map, the rule sync and the telemetry
+  reporter gain the hooks `mcp` mode uses, each a no-op on the TCP path.
+
+### Dependencies
+
+- `postgres-protocol` 0.6 (MIT OR Apache-2.0; already in the tree as a dependency of the
+  `tokio-postgres` dev-dependency), and the server half of `hyper` 1 with `hyper-util`
+  and `http-body-util` (MIT; already compiled in as reqwest's client). Newly shipped
+  transitive crates are MIT, Apache-2.0 or Unicode-3.0 licensed (cargo-deny passes; the
+  image's THIRD_PARTY_LICENSES lists them). `proptest` 1 (MIT OR Apache-2.0) as a
+  dev-dependency.
+
 ## [4.20.0] - 2026-10-27
 
 **The proxy says when the database is a newer PostgreSQL than its parser.** The
