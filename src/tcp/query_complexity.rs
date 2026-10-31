@@ -62,13 +62,24 @@ pub fn check_binary_operator_chains(
     dialect: Dialect,
     limit: usize,
 ) -> Result<(), TooManyBinaryOperators> {
+    // Every operator consumes at least one byte. A statement no longer than the
+    // threshold cannot possibly exceed it, so ordinary traffic pays one length
+    // comparison and no lexical pass.
+    if sql.len() <= limit {
+        return Ok(());
+    }
     match dialect {
         Dialect::Mysql => {
             // The server can change NO_BACKSLASH_ESCAPES per session, while the
             // proxy cannot observe every way it is set. Neither reading may
-            // hide a chain from the guard.
+            // hide a chain from the guard. Without a backslash the readings are
+            // identical, so scanning twice would only charge normal traffic.
             scan(sql, dialect, limit, true)?;
-            scan(sql, dialect, limit, false)
+            if sql.as_bytes().contains(&b'\\') {
+                scan(sql, dialect, limit, false)
+            } else {
+                Ok(())
+            }
         }
         _ => scan(sql, dialect, limit, false),
     }
