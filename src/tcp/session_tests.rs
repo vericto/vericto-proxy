@@ -371,6 +371,88 @@ async fn pg_operator_chain_fail_closed_blocks_parse_until_sync() {
     assert_eq!(first_query_reaching_db(&mut w).await, "SELECT 1");
 }
 
+/// A realistic adversarial chain at the default limits: 1 MiB (the TCP
+/// default of `VERICTO_MAX_QUERY_BYTES`, accepted) of `1+1+…`, far over the
+/// default operator limit, under fail-closed. Simple and extended protocol are
+/// both blocked (the extended sequence swallowed until Sync), the block is
+/// logged and reported by the statement's size alone, nothing reaches the
+/// database, and the session goes on. The log line runs on this test's own
+/// thread, whose stack is smaller than a worker's: the refused text must never
+/// reach a parser there.
+#[tokio::test]
+async fn pg_a_one_mib_operator_chain_fail_closed_is_blocked_and_the_session_goes_on() {
+    let max = crate::tcp::query_limit::DEFAULT_MAX_QUERY_BYTES;
+    let chain = deep_statement(max);
+    assert_eq!(chain.len(), max);
+    let mut w = session_operator_limited(
+        Box::new(PostgresProtocol),
+        crate::tcp::query_complexity::DEFAULT_MAX_BINARY_OPERATORS,
+        true,
+    );
+    w.client.write_all(&pg_query(&chain)).await.unwrap();
+    let msg = pg_expect_block(&mut w, "VERICTO-PARSE-ERROR").await;
+    assert!(msg.contains("VERICTO_MAX_BINARY_OPERATORS"), "{msg}");
+    for m in [
+        pg_parse("chain", &chain, &[]),
+        pg_bind("chain"),
+        pg_execute(),
+        pg_sync(),
+    ] {
+        w.client.write_all(&m).await.unwrap();
+    }
+    pg_expect_block(&mut w, "VERICTO-PARSE-ERROR").await;
+    assert_eq!(first_query_reaching_db(&mut w).await, "SELECT 1");
+
+    let ev = events(&w.queue);
+    assert_eq!(ev.len(), 3, "{ev:?}");
+    let marker = crate::tcp::query_complexity::refusal_marker(max);
+    for e in &ev[..2] {
+        assert_eq!(e["status"], "PARSE_ERROR", "{e}");
+        assert_eq!(e["enforcement_action"], "block", "{e}");
+        assert_eq!(e["query_text"], marker.as_str(), "{e}");
+    }
+}
+
+/// A statement deeper than a worker's stack holds in libpg_query that is not a
+/// lexical refusal (the guard is off here; the engine's own depth guard reports
+/// it as a parse error) is blocked under fail-closed. Its sanitized event is
+/// built on the event builder's thread, whose stack is the platform default,
+/// and normalizes it on a stack sized for it; the session goes on.
+#[tokio::test]
+async fn pg_a_deep_statement_fail_closed_is_sanitized_on_a_sized_stack() {
+    use crate::telemetry::EventQueue;
+    use crate::telemetry::builder::DeferredQueue;
+    // About 13 MiB of stack in libpg_query on a release build, more than a
+    // worker's 8 MiB; several times that on a debug build.
+    let deep = deep_statement(64 * 1024);
+    let policy = EnforcementPolicy {
+        parse_error: ParseErrorAction::Block,
+        ..EnforcementPolicy::default()
+    };
+    let (cfg, queue) = proxy_config(policy, None);
+    let mut cfg = Arc::into_inner(cfg).expect("unshared config");
+    cfg.max_binary_operators = usize::MAX;
+    cfg.telemetry_mode
+        .store(Arc::new(TelemetryQueryMode::Sanitized));
+    let builder = Arc::new(DeferredQueue::new(queue.clone() as Arc<dyn EventQueue>, 16).unwrap());
+    let sink = cfg.telemetry.as_mut().unwrap();
+    sink.queue = builder.clone();
+    sink.deferred = Some(builder.clone());
+    let mut w = wire_with(Box::new(PostgresProtocol), Arc::new(cfg), queue);
+
+    w.client.write_all(&pg_query(&deep)).await.unwrap();
+    pg_expect_block(&mut w, "VERICTO-PARSE-ERROR").await;
+    assert_eq!(first_query_reaching_db(&mut w).await, "SELECT 1");
+
+    assert!(builder.flush(std::time::Duration::from_secs(30)));
+    let ev = events(&w.queue);
+    assert_eq!(ev.len(), 2, "{ev:?}");
+    assert_eq!(ev[0]["status"], "PARSE_ERROR", "{}", ev[0]);
+    let text = ev[0]["query_text"].as_str().unwrap();
+    assert!(text.starts_with("SELECT $1+$2+$3"), "{}", &text[..80]);
+}
+
+// ── MySQL: the daily path ────────────────────────────────────────────────────
 // ── MySQL: the daily path ────────────────────────────────────────────────────
 
 /// COM_QUERY: allowed SQL reaches the database; dangerous SQL gets an ERR_Packet

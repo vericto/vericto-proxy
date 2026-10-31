@@ -865,9 +865,20 @@ pub(crate) fn log_block(sql: &str, dialect: Dialect, rule_code: &str, ast_node_p
     tracing::info!(
         rule_code,
         ast_node_path,
-        query_preview = %log_preview(sql, dialect),
+        query_preview = %block_preview(sql, dialect, rule_code, ast_node_path),
         "Query BLOCKED at TCP proxy"
     );
+}
+
+/// The `query_preview` of a block. A statement the lexical complexity guard
+/// refused is never handed to a parser, the sanitizer's included: the log names
+/// only its size, as telemetry does.
+fn block_preview(sql: &str, dialect: Dialect, rule_code: &str, ast_node_path: &str) -> String {
+    if crate::tcp::evaluator::is_lexical_refusal_block(rule_code, ast_node_path) {
+        crate::tcp::query_complexity::refusal_marker(sql.len())
+    } else {
+        log_preview(sql, dialect)
+    }
 }
 
 /// The start of a statement for a log line, with its literals replaced as in
@@ -1472,8 +1483,60 @@ fn sanitize_for(sql: &str, dialect: Dialect) -> String {
 fn normalize_for(sql: &str, dialect: Dialect) -> Option<String> {
     match dialect {
         Dialect::Mysql => normalize_mysql(sql),
-        _ => pg_query::normalize(sql).ok(),
+        _ => normalize_postgres(sql),
     }
+}
+
+/// The longest statement [`normalize_postgres`] normalizes on the calling
+/// thread. Its callers run on the async workers
+/// ([`crate::stack::WORKER_STACK_BYTES`]) and on the telemetry builder thread,
+/// whose stack is Rust's default of 2 MiB. libpg_query needs about 210 bytes of
+/// stack per byte of the deepest statement (a `1+1+…` chain) on a release
+/// build and about 520 on a debug build, so the deepest statement of 1 KiB
+/// needs at most about 0.5 MiB: it fits the smallest of those stacks four
+/// times over. Statements of OLTP traffic are shorter and never pay for a
+/// thread.
+const INLINE_NORMALIZE_MAX_BYTES: usize = 1024;
+
+/// `pg_query::normalize` on a stack that holds the statement. libpg_query
+/// builds and walks the statement's tree by recursion, so the stack a statement
+/// needs grows with its depth, which grows with its length: a long
+/// left-associative expression is a tree as deep as it has operators, deeper
+/// than any worker's stack can hold. Up to [`INLINE_NORMALIZE_MAX_BYTES`] it
+/// runs here; a longer statement runs on a thread of its own with the stack the
+/// evaluation of that length gets ([`crate::stack::statement_stack_bytes`]:
+/// 512 bytes per byte of SQL on a release build, 4096 on a debug one, more than
+/// twice what libpg_query needs; reserved, committed only as touched), and this
+/// thread waits for it. Normal
+/// traffic pays one length comparison; a long statement, which already had a
+/// thread of its own for its evaluation, pays one more spawn on a path (a block
+/// log line, a sanitized event) that runs the whole normalization anyway.
+///
+/// `None` when the statement does not parse, or the thread could not be started
+/// or did not return: the caller then reports the fixed redaction marker, never
+/// the text.
+fn normalize_postgres(sql: &str) -> Option<String> {
+    if sql.len() <= INLINE_NORMALIZE_MAX_BYTES {
+        return pg_query::normalize(sql).ok();
+    }
+    normalize_postgres_on_stack(sql, crate::stack::statement_stack_bytes(sql.len()))
+}
+
+/// [`normalize_postgres`]'s own thread, with `stack_bytes` of stack.
+fn normalize_postgres_on_stack(sql: &str, stack_bytes: usize) -> Option<String> {
+    std::thread::scope(|scope| {
+        let spawned = std::thread::Builder::new()
+            .name("vericto-sanitize".into())
+            .stack_size(stack_bytes)
+            .spawn_scoped(scope, || pg_query::normalize(sql).ok());
+        match spawned {
+            Ok(handle) => handle.join().ok().flatten(),
+            Err(e) => {
+                tracing::error!(error = %e, stack_bytes, "Could not start a sanitize thread");
+                None
+            }
+        }
+    })
 }
 
 /// MySQL text with every literal (string, number, hex/bit, national) replaced
@@ -1521,10 +1584,7 @@ fn normalize_mysql(sql: &str) -> Option<String> {
 /// cannot be parsed (e.g. malformed SQL), nothing is leaked — a fixed redaction
 /// marker is returned instead of the raw text.
 fn sanitize_query(sql: &str) -> String {
-    match pg_query::normalize(sql) {
-        Ok(normalized) => normalized,
-        Err(_) => "<unparseable query redacted>".to_string(),
-    }
+    normalize_postgres(sql).unwrap_or_else(|| "<unparseable query redacted>".to_string())
 }
 
 #[cfg(test)]
@@ -2172,6 +2232,204 @@ mod tests {
                 .count()
                 <= 80
         );
+    }
+
+    /// Runs `f` on a thread with the async workers' stack, where the proxy logs
+    /// a block.
+    fn on_worker_stack<R: Send + 'static>(f: impl FnOnce() -> R + Send + 'static) -> R {
+        std::thread::Builder::new()
+            .stack_size(crate::stack::WORKER_STACK_BYTES)
+            .spawn(f)
+            .unwrap()
+            .join()
+            .unwrap()
+    }
+
+    /// The deepest PostgreSQL statement of about `bytes`: a left-associative
+    /// chain, a tree as deep as it has operators.
+    fn chain(bytes: usize) -> String {
+        format!("SELECT {}1", "1+".repeat(bytes.saturating_sub(8) / 2))
+    }
+
+    /// A block by the lexical complexity guard is logged by its size alone: the
+    /// refused text never reaches the sanitizer's parser. A 1 MiB chain, more
+    /// than a worker's stack holds in libpg_query, refused under fail-closed and
+    /// logged on a thread with a worker's stack.
+    #[test]
+    fn a_lexical_refusal_is_logged_by_size_without_parsing() {
+        let sql = chain(crate::tcp::query_limit::DEFAULT_MAX_QUERY_BYTES);
+        let policy = vericto_engine::EnforcementPolicy {
+            parse_error: vericto_engine::ParseErrorAction::Block,
+            ..Default::default()
+        };
+        let decision = crate::tcp::evaluator::evaluate_message_guarded(
+            &sql,
+            Dialect::Postgres,
+            crate::tcp::protocol::QueryKind::Simple,
+            &crate::tcp::evaluator::default_ruleset(),
+            &policy,
+            crate::tcp::query_complexity::DEFAULT_MAX_BINARY_OPERATORS,
+        );
+        assert!(decision.is_lexical_complexity_refusal());
+        let TcpDecision::Block {
+            rule_code,
+            ast_node_path,
+            ..
+        } = decision
+        else {
+            panic!("fail-closed must block the refusal");
+        };
+        let len = sql.len();
+        let preview = on_worker_stack(move || {
+            log_block(&sql, Dialect::Postgres, &rule_code, &ast_node_path);
+            block_preview(&sql, Dialect::Postgres, &rule_code, &ast_node_path)
+        });
+        assert_eq!(preview, crate::tcp::query_complexity::refusal_marker(len));
+    }
+
+    /// Any other preview of a statement deeper than a worker's stack holds is
+    /// sanitized on a stack sized for the statement, with its literals replaced
+    /// as for any statement; so is its sanitized telemetry, built on a thread
+    /// with the platform's default stack, as the event builder's is.
+    #[test]
+    fn a_deep_statement_is_sanitized_on_a_stack_sized_for_it() {
+        let sql = chain(256 * 1024);
+        assert!(sql.len() > INLINE_NORMALIZE_MAX_BYTES);
+        let block = TcpDecision::Block {
+            rule_code: "VERICTO-PARSE-ERROR".to_string(),
+            ast_node_path: "PARSE_ERROR: VERICTO-AST-TOO-DEEP: too deep".to_string(),
+            suggested_safe_query: None,
+            severity: Severity::Medium,
+            violations: Vec::new(),
+            sensitive_columns: Vec::new(),
+            access_denied: Vec::new(),
+        };
+        assert!(!block.is_lexical_complexity_refusal());
+        let text = sql.clone();
+        let preview = on_worker_stack(move || {
+            log_block(
+                &text,
+                Dialect::Postgres,
+                "VERICTO-PARSE-ERROR",
+                "PARSE_ERROR: VERICTO-AST-TOO-DEEP: too deep",
+            );
+            log_preview(&text, Dialect::Postgres)
+        });
+        assert!(preview.starts_with("SELECT $1+$2+$3"), "{preview}");
+        assert!(preview.chars().count() <= 80);
+
+        let ev = std::thread::Builder::new()
+            .stack_size(2 << 20)
+            .spawn(move || {
+                build_event(
+                    "db",
+                    &sql,
+                    Dialect::Postgres,
+                    &block,
+                    1,
+                    crate::tcp::rules_sync::TelemetryQueryMode::Sanitized,
+                    &EventIdentity::default(),
+                    chrono::Utc::now(),
+                )
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+        assert!(
+            ev.query_text.starts_with("SELECT $1+$2"),
+            "{}",
+            ev.query_text
+        );
+        assert!(!ev.query_text.contains("1+1"), "no literal is reported");
+    }
+
+    /// Text that does not parse is still redacted on the sized-stack path.
+    #[test]
+    fn a_long_statement_that_does_not_parse_is_redacted() {
+        let sql = format!("{} 'secret", chain(64 * 1024));
+        let out = on_worker_stack(move || sanitize_query(&sql));
+        assert_eq!(out, "<unparseable query redacted>");
+    }
+
+    /// The deepest statement normalized on the calling thread fits half the
+    /// smallest stack that calls it (the event builder's 2 MiB).
+    #[test]
+    fn the_inline_normalize_bound_fits_a_small_stack() {
+        let sql = chain(INLINE_NORMALIZE_MAX_BYTES);
+        assert!(sql.len() <= INLINE_NORMALIZE_MAX_BYTES);
+        let ok = std::thread::Builder::new()
+            .stack_size(1 << 20)
+            .spawn(move || normalize_postgres(&sql).is_some())
+            .unwrap()
+            .join()
+            .unwrap();
+        assert!(ok);
+    }
+
+    /// The MySQL sanitizer is a tokenizer, iterative and linear: a 1 MiB chain
+    /// is sanitized on a worker's stack without a parser.
+    #[test]
+    fn the_mysql_sanitizer_does_not_need_a_large_stack() {
+        let sql = chain(crate::tcp::query_limit::DEFAULT_MAX_QUERY_BYTES);
+        let preview = on_worker_stack(move || log_preview(&sql, Dialect::Mysql));
+        assert!(preview.starts_with("SELECT ?+?+?"), "{preview}");
+    }
+
+    /// A parse error whose message quotes the guard's wording is reported as
+    /// the parse error it is: its text in telemetry (raw and sanitized), and a
+    /// sanitized preview in the block log, not the size-only marker.
+    #[test]
+    fn a_parse_error_quoting_the_guard_is_reported_normally() {
+        use crate::tcp::rules_sync::TelemetryQueryMode::{Raw, Sanitized};
+        let sql = "SELECT * FROM t t2 'lexical complexity guard: more than 1 binary operators'";
+        let closed = vericto_engine::EnforcementPolicy {
+            parse_error: vericto_engine::ParseErrorAction::Block,
+            ..Default::default()
+        };
+        let decision = crate::tcp::evaluator::evaluate_message_guarded(
+            sql,
+            Dialect::Postgres,
+            crate::tcp::protocol::QueryKind::Simple,
+            &crate::tcp::evaluator::default_ruleset(),
+            &closed,
+            crate::tcp::query_complexity::DEFAULT_MAX_BINARY_OPERATORS,
+        );
+        let TcpDecision::Block {
+            rule_code,
+            ast_node_path,
+            ..
+        } = &decision
+        else {
+            panic!("fail-closed blocks a parse error");
+        };
+        assert!(
+            ast_node_path.contains("lexical complexity guard:"),
+            "{ast_node_path}"
+        );
+        let marker = crate::tcp::query_complexity::refusal_marker(sql.len());
+        let preview = block_preview(sql, Dialect::Postgres, rule_code, ast_node_path);
+        assert_ne!(preview, marker);
+        assert!(
+            !preview.contains("lexical"),
+            "no literal in the log: {preview}"
+        );
+
+        let event = |mode| {
+            build_event(
+                "db",
+                sql,
+                Dialect::Postgres,
+                &decision,
+                1,
+                mode,
+                &EventIdentity::default(),
+                chrono::Utc::now(),
+            )
+        };
+        let raw = event(Raw);
+        assert_eq!(raw.status, "PARSE_ERROR");
+        assert_eq!(raw.query_text, sql);
+        assert_eq!(event(Sanitized).query_text, "<unparseable query redacted>");
     }
 
     /// Sanitized events go to the builder; raw ones are built on the query path
