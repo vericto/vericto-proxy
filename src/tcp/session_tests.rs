@@ -383,8 +383,9 @@ async fn mysql_query_size_limit_refuses_one_byte_over() {
 
 // ── Where a statement is evaluated (4.19.0) ──────────────────────────────────
 
-/// Up to the threshold the evaluation runs on the calling thread; above it, and
-/// for every statement with the threshold at 0, on the blocking pool.
+/// Up to the threshold (never above its ceiling) the evaluation runs on the
+/// calling thread; above it, and for every statement with the threshold at 0,
+/// on a thread of its own.
 #[tokio::test]
 async fn run_evaluation_is_inline_up_to_the_threshold_and_on_the_pool_above() {
     use crate::tcp::session::run_evaluation;
@@ -399,6 +400,70 @@ async fn run_evaluation_is_inline_up_to_the_threshold_and_on_the_pool_above() {
     assert_ne!(on(1024, 1025).await, here, "one byte over: the pool");
     assert_ne!(on(0, 0).await, here, "0: always the pool");
     assert_ne!(on(0, 10).await, here);
+    let ceiling = crate::tcp::query_limit::INLINE_EVAL_MAX_BYTES_CEILING;
+    assert_eq!(on(usize::MAX, ceiling).await, here);
+    assert_ne!(
+        on(usize::MAX, ceiling + 1).await,
+        here,
+        "never inline above the ceiling"
+    );
+}
+
+// ── Statements that nest deeply (4.21.0) ─────────────────────────────────────
+
+/// A large statement, `bytes` long, whose tree is deep. Generated here.
+fn deep_statement(bytes: usize) -> String {
+    format!("SELECT {}1", "1+".repeat(bytes.saturating_sub(8) / 2))
+}
+
+/// Such a statement is evaluated on a thread with enough stack: it gets the
+/// verdict of a statement the engine cannot analyse (under the default
+/// policy: forwarded, reported as a parse error), and the session goes on.
+/// Simple and extended protocol.
+/// The two deep statements reported as parse errors (the engine's depth
+/// guard), then the `SELECT 1` that shows the session went on.
+fn assert_deep_then_allowed(ev: &[serde_json::Value]) {
+    assert_eq!(ev.len(), 3, "{ev:?}");
+    for e in &ev[..2] {
+        assert_eq!(e["status"], "PARSE_ERROR", "{e}");
+        assert!(e["parse_error_message"].is_string(), "{e}");
+    }
+    assert!(ev[2]["parse_error_message"].is_null(), "{}", ev[2]);
+}
+
+#[tokio::test]
+async fn pg_a_deeply_nested_statement_gets_a_verdict() {
+    let deep = deep_statement(64 * 1024);
+    let mut w = session(Box::new(PostgresProtocol));
+    w.client.write_all(&pg_query(&deep)).await.unwrap();
+    let q = read_pg(&mut w.db).await;
+    assert_eq!(q.tag, b'Q');
+    assert_eq!(&q.body[..q.body.len() - 1], deep.as_bytes());
+
+    w.client
+        .write_all(&[pg_parse("", &deep, &[]), pg_sync()].concat())
+        .await
+        .unwrap();
+    let p = read_pg(&mut w.db).await;
+    assert_eq!(p.tag, b'P');
+    assert_eq!(read_pg(&mut w.db).await.tag, b'S');
+
+    assert_eq!(first_query_reaching_db(&mut w).await, "SELECT 1");
+    assert_deep_then_allowed(&events(&w.queue));
+}
+
+#[tokio::test]
+async fn mysql_a_deeply_nested_statement_gets_a_verdict() {
+    let deep = deep_statement(256 * 1024);
+    let mut w = session(Box::new(MysqlProtocol));
+    for cmd in [COM_QUERY, COM_STMT_PREPARE] {
+        w.client.write_all(&my_cmd(cmd, &deep)).await.unwrap();
+        let p = read_my(&mut w.db).await;
+        assert_eq!(p.payload[0], cmd);
+        assert_eq!(my_sql(&p), deep);
+    }
+    assert_eq!(my_first_query_reaching_db(&mut w).await, "SELECT 1");
+    assert_deep_then_allowed(&events(&w.queue));
 }
 
 /// The same statements, evaluated inline or on the pool, give the same verdicts,

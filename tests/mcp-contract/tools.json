@@ -1,0 +1,63 @@
+{
+  "description": "The tools `vericto-proxy mcp` lists (design 'MCP execution modes' \u00a76.1, \u00a76.8): name, required inputs, readOnlyHint, and the fields an answer always carries. Unlinked (no control plane) the server has the first four; linked, also list_rules and show_rule, answered from the signed bundle. Added by vericto-proxy 4.21.0.",
+  "tools": [
+    {
+      "name": "execute_sql",
+      "required": [
+        "sql"
+      ],
+      "read_only": true,
+      "output_required": [
+        "status",
+        "verdict",
+        "executed_sql",
+        "rewritten",
+        "statement_sha256",
+        "columns",
+        "rows",
+        "row_count",
+        "truncated",
+        "truncation",
+        "cells_truncated",
+        "command_tag",
+        "rows_affected",
+        "duration_ms",
+        "tier",
+        "enabled_tiers",
+        "ruleset_version",
+        "event_id",
+        "next_action",
+        "next_steps"
+      ]
+    },
+    {
+      "name": "describe_schema",
+      "required": [],
+      "read_only": true
+    },
+    {
+      "name": "check_sql",
+      "required": [],
+      "read_only": true
+    },
+    {
+      "name": "whoami",
+      "required": [],
+      "read_only": true
+    }
+  ],
+  "linked_only": [
+    {
+      "name": "list_rules",
+      "required": [],
+      "read_only": true
+    },
+    {
+      "name": "show_rule",
+      "required": [
+        "code"
+      ],
+      "read_only": true
+    }
+  ]
+}

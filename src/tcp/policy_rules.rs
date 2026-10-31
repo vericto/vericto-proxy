@@ -314,6 +314,10 @@ pub struct Identify {
     pub application_name: Option<String>,
     /// weak, exact.
     pub listener: Option<String>,
+    /// strong, exact: the id of the runtime key an MCP client presented to
+    /// `vericto-proxy mcp` (4.21.0; design "MCP execution modes" §11.4). A TCP
+    /// session has none, so such an entry never matches one.
+    pub mcp_credential: Option<String>,
 }
 
 /// Signals that must ALSO match (all present keys); they never raise trust.
@@ -392,6 +396,7 @@ impl PrincipalMap {
                         && identify.db_user_pattern.is_none()
                         && identify.application_name.is_none()
                         && identify.listener.is_none()
+                        && identify.mcp_credential.is_none()
                     {
                         tracing::debug!(principal = %e.id, "Principal with no proxy signal; skipped");
                         continue;
@@ -477,6 +482,11 @@ impl PrincipalEntry {
     /// The strongest identify signal of this entry the session matches.
     fn identified_by(&self, s: &SessionSignals<'_>) -> Option<(Trust, &'static str)> {
         let id = &self.identify;
+        if let (Some(want), Some(key)) = (id.mcp_credential.as_deref(), s.mcp_credential)
+            && want == key
+        {
+            return Some((Trust::Strong, "mcp_credential"));
+        }
         if let (Some(want), Some(user)) = (id.db_user.as_deref(), s.db_user)
             && want == user
         {
@@ -523,6 +533,8 @@ pub struct SessionSignals<'a> {
     pub db_user: Option<&'a str>,
     pub application_name: Option<&'a str>,
     pub listener: &'a str,
+    /// The MCP credential (key id) of an MCP call; `None` on the TCP path.
+    pub mcp_credential: Option<&'a str>,
 }
 
 /// `*` (any run, also empty) and `?` (one character); everything else literal,
@@ -892,6 +904,7 @@ impl SessionPolicy {
             db_user: user,
             application_name: self.declared.application_name.as_deref(),
             listener: &runtime.listener,
+            mcp_credential: None,
         });
         let telemetry = Arc::new(PolicyTelemetry {
             principal_id: Some(principal.id.clone()),
@@ -1110,6 +1123,7 @@ mod tests {
             db_user: user,
             application_name: app,
             listener: "0.0.0.0:5433",
+            mcp_credential: None,
         }
     }
 

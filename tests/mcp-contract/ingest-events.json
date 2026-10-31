@@ -1,0 +1,312 @@
+{
+  "description": "Query events `vericto-proxy mcp` reports to POST /api/v1/ingest/events with source mcp_proxy, one per execute_sql call, blocked and refused ones included (docs/design/mcp-proxy-mode.md \u00a714.1, \u00a714.2). Counts and hashes only: no event carries a result value. Placeholders in {{double braces}} are filled by the test. `stored` lists query_events columns after ingest; `api_key` says which key is recorded as the identity: `reporting` (the proxy's own key, stdio) or `agent` (the HTTP agent key). Every event counts as one runtime query in the monthly quota (Q5).",
+  "batch": {
+    "source": "mcp_proxy"
+  },
+  "cases": [
+    {
+      "name": "executed_allowed",
+      "event": {
+        "event_id": "{{event_id}}",
+        "database_id": "{{database_id}}",
+        "dialect": "postgres",
+        "latency_ms": 0.6,
+        "occurred_at": "2026-10-30T12:00:00Z",
+        "source": "mcp_proxy",
+        "mcp_client_name": "claude-code",
+        "mcp_client_version": "2.1.4",
+        "query_text": "SELECT id, status FROM orders WHERE id = $1",
+        "status": "ALLOWED",
+        "execution_status": "executed",
+        "tier": "read",
+        "rows_returned": 1,
+        "bytes_returned": 48,
+        "truncated": false,
+        "execution_ms": 2.4,
+        "statement_sha256": "3a7bd3e2360a3d29eea436fcfb7e44c735d117c42d1c1835420b6b9942dd4f1b"
+      },
+      "stored": {
+        "source": "mcp_proxy",
+        "status": "ALLOWED",
+        "execution_status": "executed",
+        "tier": "read",
+        "rows_returned": 1,
+        "bytes_returned": 48,
+        "truncated": false,
+        "sqlstate": null,
+        "execution_ms": "2.400",
+        "mcp_client_name": "claude-code",
+        "mcp_client_version": "2.1.4",
+        "statement_sha256": "3a7bd3e2360a3d29eea436fcfb7e44c735d117c42d1c1835420b6b9942dd4f1b",
+        "api_key": "reporting"
+      }
+    },
+    {
+      "name": "executed_masked_truncated",
+      "event": {
+        "event_id": "{{event_id}}",
+        "database_id": "{{database_id}}",
+        "dialect": "postgres",
+        "latency_ms": 0.6,
+        "occurred_at": "2026-10-30T12:00:00Z",
+        "source": "mcp_proxy",
+        "mcp_client_name": "claude-code",
+        "mcp_client_version": "2.1.4",
+        "query_text": "SELECT id, email FROM users",
+        "rewritten_query": "SELECT id, '***' AS email FROM users",
+        "status": "FLAGGED",
+        "rule_code": "VERICTO-085",
+        "severity": "medium",
+        "enforcement_action": "flag",
+        "sensitive_columns": [
+          {
+            "schema": "public",
+            "table": "users",
+            "column": "email",
+            "policy": "mask"
+          }
+        ],
+        "execution_status": "executed",
+        "tier": "read",
+        "rows_returned": 200,
+        "bytes_returned": 9120,
+        "truncated": true,
+        "execution_ms": 8.1,
+        "statement_sha256": "b5bb9d8014a0f9b1d61e21e796d78dccdf1352f23cd32812f4850b878ae4944c"
+      },
+      "stored": {
+        "source": "mcp_proxy",
+        "status": "FLAGGED",
+        "execution_status": "executed",
+        "tier": "read",
+        "rows_returned": 200,
+        "bytes_returned": 9120,
+        "truncated": true,
+        "execution_ms": "8.100",
+        "rule_code": "VERICTO-085",
+        "rewritten": true,
+        "api_key": "reporting"
+      }
+    },
+    {
+      "name": "blocked",
+      "event": {
+        "event_id": "{{event_id}}",
+        "database_id": "{{database_id}}",
+        "dialect": "postgres",
+        "latency_ms": 0.6,
+        "occurred_at": "2026-10-30T12:00:00Z",
+        "source": "mcp_proxy",
+        "mcp_client_name": "claude-code",
+        "mcp_client_version": "2.1.4",
+        "query_text": "DROP TABLE users",
+        "status": "BLOCKED",
+        "rule_code": "VERICTO-010",
+        "severity": "critical",
+        "enforcement_action": "block",
+        "execution_status": "blocked",
+        "tier": "ddl",
+        "rows_returned": 0,
+        "bytes_returned": 0,
+        "truncated": false
+      },
+      "stored": {
+        "source": "mcp_proxy",
+        "status": "BLOCKED",
+        "execution_status": "blocked",
+        "tier": "ddl",
+        "rows_returned": 0,
+        "rule_code": "VERICTO-010",
+        "api_key": "reporting"
+      }
+    },
+    {
+      "name": "tier_refused",
+      "event": {
+        "event_id": "{{event_id}}",
+        "database_id": "{{database_id}}",
+        "dialect": "postgres",
+        "latency_ms": 0.6,
+        "occurred_at": "2026-10-30T12:00:00Z",
+        "source": "mcp_proxy",
+        "mcp_client_name": "claude-code",
+        "mcp_client_version": "2.1.4",
+        "query_text": "DELETE FROM sessions WHERE expires_at < now()",
+        "status": "ALLOWED",
+        "execution_status": "tier_refused",
+        "tier": "delete"
+      },
+      "stored": {
+        "source": "mcp_proxy",
+        "status": "ALLOWED",
+        "execution_status": "tier_refused",
+        "tier": "delete",
+        "rows_returned": null,
+        "api_key": "reporting"
+      }
+    },
+    {
+      "name": "invalid_input",
+      "note": "Refused before evaluation: no query text, only the hash of what was sent (\u00a714.1). Reported as status INVALID, stored as BLOCKED with execution_status invalid.",
+      "event": {
+        "event_id": "{{event_id}}",
+        "database_id": "{{database_id}}",
+        "dialect": "postgres",
+        "latency_ms": 0.6,
+        "occurred_at": "2026-10-30T12:00:00Z",
+        "source": "mcp_proxy",
+        "mcp_client_name": "claude-code",
+        "mcp_client_version": "2.1.4",
+        "query_text": "",
+        "status": "INVALID",
+        "statement_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "stored": {
+        "source": "mcp_proxy",
+        "status": "BLOCKED",
+        "execution_status": "invalid",
+        "tier": null,
+        "statement_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "api_key": "reporting"
+      }
+    },
+    {
+      "name": "db_error",
+      "event": {
+        "event_id": "{{event_id}}",
+        "database_id": "{{database_id}}",
+        "dialect": "postgres",
+        "latency_ms": 0.6,
+        "occurred_at": "2026-10-30T12:00:00Z",
+        "source": "mcp_proxy",
+        "mcp_client_name": "claude-code",
+        "mcp_client_version": "2.1.4",
+        "query_text": "SELECT * FROM userz LIMIT 10",
+        "status": "ALLOWED",
+        "execution_status": "db_error",
+        "tier": "read",
+        "sqlstate": "42P01",
+        "execution_ms": 0.7
+      },
+      "stored": {
+        "source": "mcp_proxy",
+        "status": "ALLOWED",
+        "execution_status": "db_error",
+        "sqlstate": "42P01",
+        "execution_ms": "0.700",
+        "api_key": "reporting"
+      }
+    },
+    {
+      "name": "timeout",
+      "event": {
+        "event_id": "{{event_id}}",
+        "database_id": "{{database_id}}",
+        "dialect": "postgres",
+        "latency_ms": 0.6,
+        "occurred_at": "2026-10-30T12:00:00Z",
+        "source": "mcp_proxy",
+        "mcp_client_name": "claude-code",
+        "mcp_client_version": "2.1.4",
+        "query_text": "SELECT count(*) FROM events",
+        "status": "ALLOWED",
+        "execution_status": "timeout",
+        "tier": "read",
+        "execution_ms": 15000.0
+      },
+      "stored": {
+        "source": "mcp_proxy",
+        "status": "ALLOWED",
+        "execution_status": "timeout",
+        "execution_ms": "15000.000",
+        "api_key": "reporting"
+      }
+    },
+    {
+      "name": "http_agent_key",
+      "note": "Streamable HTTP: the agent key the proxy authenticated (a key of the same workspace) is the identity.",
+      "event": {
+        "event_id": "{{event_id}}",
+        "database_id": "{{database_id}}",
+        "dialect": "postgres",
+        "latency_ms": 0.6,
+        "occurred_at": "2026-10-30T12:00:00Z",
+        "source": "mcp_proxy",
+        "mcp_client_name": "claude-code",
+        "mcp_client_version": "2.1.4",
+        "query_text": "SELECT 1",
+        "status": "ALLOWED",
+        "execution_status": "executed",
+        "tier": "read",
+        "rows_returned": 1,
+        "api_key_id": "{{agent_api_key_id}}"
+      },
+      "stored": {
+        "source": "mcp_proxy",
+        "execution_status": "executed",
+        "api_key": "agent"
+      }
+    },
+    {
+      "name": "foreign_agent_key",
+      "note": "A reported key of another workspace is never attributed: the reporting key is the identity.",
+      "event": {
+        "event_id": "{{event_id}}",
+        "database_id": "{{database_id}}",
+        "dialect": "postgres",
+        "latency_ms": 0.6,
+        "occurred_at": "2026-10-30T12:00:00Z",
+        "source": "mcp_proxy",
+        "mcp_client_name": "claude-code",
+        "mcp_client_version": "2.1.4",
+        "query_text": "SELECT 2",
+        "status": "ALLOWED",
+        "execution_status": "executed",
+        "tier": "read",
+        "api_key_id": "{{foreign_api_key_id}}"
+      },
+      "stored": {
+        "source": "mcp_proxy",
+        "execution_status": "executed",
+        "api_key": "reporting"
+      }
+    },
+    {
+      "name": "unknown_values_dropped",
+      "note": "Values ingest does not know are stored as NULL; the batch is never rejected for them.",
+      "event": {
+        "event_id": "{{event_id}}",
+        "database_id": "{{database_id}}",
+        "dialect": "postgres",
+        "latency_ms": 0.6,
+        "occurred_at": "2026-10-30T12:00:00Z",
+        "source": "mcp_proxy",
+        "mcp_client_name": "c\u0000lient",
+        "mcp_client_version": "2.1.4",
+        "query_text": "SELECT 3",
+        "status": "ALLOWED",
+        "execution_status": "teleported",
+        "tier": "admin",
+        "rows_returned": -1,
+        "bytes_returned": "12",
+        "truncated": "yes",
+        "sqlstate": "bad",
+        "execution_ms": -5,
+        "statement_sha256": "XYZ"
+      },
+      "stored": {
+        "source": "mcp_proxy",
+        "execution_status": null,
+        "tier": null,
+        "rows_returned": null,
+        "bytes_returned": null,
+        "truncated": null,
+        "sqlstate": null,
+        "execution_ms": null,
+        "statement_sha256": null,
+        "mcp_client_name": "client",
+        "api_key": "reporting"
+      }
+    }
+  ]
+}

@@ -68,8 +68,9 @@ pub struct PgProxyConfig {
     /// protocol can deliver. Resolved once at startup — see `tcp::query_limit`.
     pub max_query_bytes: usize,
     /// Statements of at most this many bytes are evaluated on the session's own
-    /// task, larger ones on the blocking pool; 0 sends every statement to the pool
-    /// (`VERICTO_INLINE_EVAL_MAX_BYTES`, since 4.19.0; see `tcp::query_limit`).
+    /// task, larger ones on a thread of their own (`crate::stack`); 0 sends every
+    /// statement there (`VERICTO_INLINE_EVAL_MAX_BYTES`, since 4.19.0, at most
+    /// `INLINE_EVAL_MAX_BYTES_CEILING`; see `tcp::query_limit`).
     pub inline_eval_max_bytes: usize,
     /// A session remembers the decisions of trivial statements
     /// (`VERICTO_TRIVIAL_FAST_PATH`, since 4.19.0, default on; see `tcp::fast_path`).
@@ -182,7 +183,7 @@ async fn run_session(client: TcpStream, config: Arc<PgProxyConfig>) -> std::io::
             crate::tcp::session::startup_settings_block(&config, user.as_deref(), &settings)
         })
         .await
-        .expect("startup evaluation task panicked")
+        .map_err(std::io::Error::other)?
     };
     if let Some(message) = refused {
         client_write
@@ -933,7 +934,7 @@ fn build_telemetry_event(
 /// size cut, because a cut statement no longer parses and would only ever be
 /// reported as redacted.
 #[allow(clippy::too_many_arguments)]
-fn build_event(
+pub(crate) fn build_event(
     database_id: &str,
     sql: &str,
     dialect: Dialect,
@@ -1154,6 +1155,7 @@ fn build_event(
         ticket_id: policy_field(identity, |p| &p.ticket_id),
         session_tenant: policy_field(identity, |p| &p.session_tenant),
         kill_switch_id: None,
+        ..Default::default()
     }
 }
 

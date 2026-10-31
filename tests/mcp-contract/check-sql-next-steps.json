@@ -1,0 +1,503 @@
+{
+  "_comment": "The next-steps contract of the Vericto MCP tools (design 'MCP execution modes' §6.4, §6.9). Asserted by vericto-proxy (src/mcp/next_steps.rs) and copied by tag into vericto-fmw backend/tests/fixtures/mcp-contract/, where backend/src/services/mcp-tools/next-steps.ts asserts the same cases. A changed message is a fixture change in both repositories. 'tools' are the tools the caller can call; 'execute_available' is true where execute_sql exists for the database (Proxy mode, Gateway).",
+  "version": 1,
+  "verdict_step": [
+    {
+      "name": "allowed, ruleset known",
+      "facts": {
+        "status": "ALLOWED"
+      },
+      "tools": [
+        "check_sql",
+        "list_rules",
+        "show_rule",
+        "list_reports",
+        "show_report",
+        "whoami"
+      ],
+      "dialect": "postgres",
+      "ruleset_version": "rs1",
+      "execute_available": false,
+      "expected": {
+        "action": "run_as_written",
+        "tool": null,
+        "message": "safe to run as written under ruleset rs1; no need to call check_sql again while ruleset_version stays rs1."
+      }
+    },
+    {
+      "name": "allowed, no ruleset",
+      "facts": {
+        "status": "ALLOWED"
+      },
+      "tools": [
+        "check_sql",
+        "list_rules",
+        "show_rule",
+        "list_reports",
+        "show_report",
+        "whoami"
+      ],
+      "dialect": "postgres",
+      "ruleset_version": null,
+      "execute_available": false,
+      "expected": {
+        "action": "run_as_written",
+        "tool": null,
+        "message": "allowed as written; nothing to fix."
+      }
+    },
+    {
+      "name": "flagged with severity",
+      "facts": {
+        "status": "FLAGGED",
+        "rule_code": "VERICTO-050",
+        "severity": "low"
+      },
+      "tools": [
+        "check_sql",
+        "list_rules",
+        "show_rule",
+        "list_reports",
+        "show_report",
+        "whoami"
+      ],
+      "dialect": "postgres",
+      "ruleset_version": "rs1",
+      "execute_available": false,
+      "expected": {
+        "action": "mention_to_user",
+        "tool": null,
+        "message": "allowed; mention VERICTO-050 (low) to the user when you run it."
+      }
+    },
+    {
+      "name": "monitored without severity",
+      "facts": {
+        "status": "MONITORED",
+        "rule_code": "VERICTO-060"
+      },
+      "tools": [
+        "check_sql",
+        "list_rules",
+        "show_rule",
+        "list_reports",
+        "show_report",
+        "whoami"
+      ],
+      "dialect": "postgres",
+      "ruleset_version": "rs1",
+      "execute_available": false,
+      "expected": {
+        "action": "mention_to_user",
+        "tool": null,
+        "message": "allowed; mention VERICTO-060 to the user when you run it."
+      }
+    },
+    {
+      "name": "blocked with a fix",
+      "facts": {
+        "status": "BLOCKED",
+        "rule_code": "VERICTO-001",
+        "severity": "critical",
+        "suggested_fix": "DELETE FROM users WHERE id = $1"
+      },
+      "tools": [
+        "check_sql",
+        "list_rules",
+        "show_rule",
+        "list_reports",
+        "show_report",
+        "whoami"
+      ],
+      "dialect": "postgres",
+      "ruleset_version": "rs1",
+      "execute_available": false,
+      "expected": {
+        "action": "apply_fix_and_recheck",
+        "tool": "check_sql",
+        "message": "do not run it as written; apply the suggested fix, then call check_sql again with the corrected SQL."
+      }
+    },
+    {
+      "name": "blocked, no fix, show_rule available",
+      "facts": {
+        "status": "BLOCKED",
+        "rule_code": "VERICTO-010"
+      },
+      "tools": [
+        "check_sql",
+        "list_rules",
+        "show_rule",
+        "list_reports",
+        "show_report",
+        "whoami"
+      ],
+      "dialect": "postgres",
+      "ruleset_version": "rs1",
+      "execute_available": false,
+      "expected": {
+        "action": "do_not_run",
+        "tool": "show_rule",
+        "message": "do not run it, and do not rephrase it to get past VERICTO-010; call show_rule VERICTO-010 to see what the rule allows, or ask the user."
+      }
+    },
+    {
+      "name": "blocked, no fix, proxy mode (no show_rule)",
+      "facts": {
+        "status": "BLOCKED",
+        "rule_code": "VERICTO-010"
+      },
+      "tools": [
+        "execute_sql",
+        "describe_schema",
+        "check_sql",
+        "whoami"
+      ],
+      "dialect": "postgres",
+      "ruleset_version": "rs1",
+      "execute_available": true,
+      "expected": {
+        "action": "do_not_run",
+        "tool": null,
+        "message": "do not run it, and do not rephrase it to get past VERICTO-010; ask the user how to proceed."
+      }
+    },
+    {
+      "name": "blocked by agent access",
+      "facts": {
+        "status": "BLOCKED",
+        "rule_code": "VERICTO-087",
+        "access_denied": [
+          {
+            "schema": "public",
+            "table": "users",
+            "column": "ssn",
+            "needed": "read"
+          }
+        ]
+      },
+      "tools": [
+        "check_sql",
+        "list_rules",
+        "show_rule",
+        "list_reports",
+        "show_report",
+        "whoami"
+      ],
+      "dialect": "postgres",
+      "ruleset_version": "rs1",
+      "execute_available": false,
+      "expected": {
+        "action": "request_access",
+        "tool": null,
+        "message": "do not run it: the agent access policy does not allow public.users.ssn (read). Rephrasing will not help; ask the user to extend the policy."
+      }
+    },
+    {
+      "name": "agent access, more than three references",
+      "facts": {
+        "status": "BLOCKED",
+        "rule_code": "VERICTO-087",
+        "access_denied": [
+          {
+            "table": "a"
+          },
+          {
+            "table": "b"
+          },
+          {
+            "table": "c"
+          },
+          {
+            "table": "d"
+          },
+          {
+            "table": "e"
+          }
+        ]
+      },
+      "tools": [
+        "check_sql",
+        "list_rules",
+        "show_rule",
+        "list_reports",
+        "show_report",
+        "whoami"
+      ],
+      "dialect": "postgres",
+      "ruleset_version": "rs1",
+      "execute_available": false,
+      "expected": {
+        "action": "request_access",
+        "tool": null,
+        "message": "do not run it: the agent access policy does not allow a, b, c and 2 more. Rephrasing will not help; ask the user to extend the policy."
+      }
+    },
+    {
+      "name": "agent access, whole-table reference",
+      "facts": {
+        "status": "BLOCKED",
+        "rule_code": "VERICTO-087",
+        "access_denied": [
+          {
+            "table": "t",
+            "column": "*"
+          }
+        ]
+      },
+      "tools": [
+        "check_sql",
+        "list_rules",
+        "show_rule",
+        "list_reports",
+        "show_report",
+        "whoami"
+      ],
+      "dialect": "postgres",
+      "ruleset_version": "rs1",
+      "execute_available": false,
+      "expected": {
+        "action": "request_access",
+        "tool": null,
+        "message": "do not run it: the agent access policy does not allow t. Rephrasing will not help; ask the user to extend the policy."
+      }
+    },
+    {
+      "name": "parse error, fail-open",
+      "facts": {
+        "status": "PARSE_ERROR",
+        "rule_code": "VERICTO-PARSE-ERROR"
+      },
+      "tools": [
+        "check_sql",
+        "list_rules",
+        "show_rule",
+        "list_reports",
+        "show_report",
+        "whoami"
+      ],
+      "dialect": "postgres",
+      "ruleset_version": "rs1",
+      "execute_available": false,
+      "expected": {
+        "action": "fix_and_recheck",
+        "tool": "check_sql",
+        "message": "could not be parsed as postgres, so it was not evaluated; fix the syntax or pass the database's dialect (whoami lists it), then call check_sql again. Do not run it unchecked."
+      }
+    },
+    {
+      "name": "parse error, fail-closed",
+      "facts": {
+        "status": "BLOCKED",
+        "rule_code": "VERICTO-PARSE-ERROR"
+      },
+      "tools": [
+        "check_sql",
+        "list_rules",
+        "show_rule",
+        "list_reports",
+        "show_report",
+        "whoami"
+      ],
+      "dialect": "postgres",
+      "ruleset_version": "rs1",
+      "execute_available": false,
+      "expected": {
+        "action": "fix_and_recheck",
+        "tool": "check_sql",
+        "message": "could not be parsed as postgres, so it is blocked and was not evaluated; fix the syntax or pass the database's dialect (whoami lists it), then call check_sql again. Do not run it unchecked."
+      }
+    },
+    {
+      "name": "too complex",
+      "facts": {
+        "status": "PARSE_ERROR",
+        "rule_code": "VERICTO-PARSE-ERROR",
+        "parse_error_kind": "too_complex"
+      },
+      "tools": [
+        "check_sql",
+        "list_rules",
+        "show_rule",
+        "list_reports",
+        "show_report",
+        "whoami"
+      ],
+      "dialect": "postgres",
+      "ruleset_version": "rs1",
+      "execute_available": false,
+      "expected": {
+        "action": "fix_and_recheck",
+        "tool": "check_sql",
+        "message": "too complex to evaluate, so it was not evaluated; split it into simpler statements, then call check_sql again."
+      }
+    },
+    {
+      "name": "parse error, no tools",
+      "facts": {
+        "status": "PARSE_ERROR"
+      },
+      "tools": [],
+      "dialect": "mysql",
+      "ruleset_version": "rs1",
+      "execute_available": false,
+      "expected": {
+        "action": "fix_and_recheck",
+        "tool": "check_sql",
+        "message": "could not be parsed as mysql, so it was not evaluated; fix the syntax or pass the database's dialect (ask the user which), then check it again. Do not run it unchecked."
+      }
+    },
+    {
+      "name": "approved query, advisory",
+      "facts": {
+        "status": "FLAGGED",
+        "rule_code": "VERICTO-085",
+        "approved_query": "SELECT '[redacted]' AS ssn FROM people"
+      },
+      "tools": [
+        "check_sql",
+        "list_rules",
+        "show_rule",
+        "list_reports",
+        "show_report",
+        "whoami"
+      ],
+      "dialect": "postgres",
+      "ruleset_version": "rs1",
+      "execute_available": false,
+      "expected": {
+        "action": "run_approved_query",
+        "tool": null,
+        "message": "run the approved_query instead of the original; never run the original."
+      }
+    },
+    {
+      "name": "approved query, Proxy mode (execute_sql exists)",
+      "facts": {
+        "status": "FLAGGED",
+        "rule_code": "VERICTO-085",
+        "approved_query": "SELECT '[redacted]' AS ssn FROM people"
+      },
+      "tools": [
+        "execute_sql",
+        "describe_schema",
+        "check_sql",
+        "whoami"
+      ],
+      "dialect": "postgres",
+      "ruleset_version": "rs1",
+      "execute_available": true,
+      "expected": {
+        "action": "run_approved_query",
+        "tool": "execute_sql",
+        "message": "call execute_sql with your original sql; the approved rewrite is applied for you."
+      }
+    },
+    {
+      "name": "allowed, Proxy mode (execute_sql exists)",
+      "facts": {
+        "status": "ALLOWED"
+      },
+      "tools": [
+        "execute_sql",
+        "describe_schema",
+        "check_sql",
+        "whoami"
+      ],
+      "dialect": "postgres",
+      "ruleset_version": "rs1",
+      "execute_available": true,
+      "expected": {
+        "action": "run_as_written",
+        "tool": "execute_sql",
+        "message": "call execute_sql with the same sql."
+      }
+    }
+  ],
+  "kill_switch_step": [
+    {
+      "block_id": "ks-1",
+      "expected": {
+        "action": "stop",
+        "message": "stop: do not run any SQL and do not call check_sql again; tell the user. A person must lift the kill-switch block ks-1."
+      }
+    }
+  ],
+  "next_steps_text": [
+    {
+      "name": "one step for every line",
+      "all_lines": true,
+      "steps": [
+        {
+          "action": "run_as_written",
+          "lines": [
+            1,
+            2
+          ],
+          "rule_code": null,
+          "message": "m"
+        }
+      ],
+      "expected": [
+        "Next: m"
+      ]
+    },
+    {
+      "name": "two steps",
+      "all_lines": false,
+      "steps": [
+        {
+          "action": "stop",
+          "lines": [
+            1
+          ],
+          "rule_code": null,
+          "message": "a"
+        },
+        {
+          "action": "mention_to_user",
+          "lines": [
+            2,
+            3
+          ],
+          "rule_code": "VERICTO-050",
+          "message": "b"
+        }
+      ],
+      "expected": [
+        "Next:",
+        "- line 1: a",
+        "- lines 2, 3 (VERICTO-050): b"
+      ]
+    },
+    {
+      "name": "many lines",
+      "all_lines": false,
+      "steps": [
+        {
+          "action": "mention_to_user",
+          "lines": [
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10,
+            11,
+            12
+          ],
+          "rule_code": null,
+          "message": "m"
+        }
+      ],
+      "expected": [
+        "Next:",
+        "- lines 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 and 2 more: m"
+      ]
+    }
+  ]
+}

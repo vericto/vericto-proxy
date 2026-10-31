@@ -1,0 +1,1419 @@
+{
+  "description": "execute_sql outcomes and what both MCP fronts answer for them (docs/design/mcp-proxy-mode.md §6.3 to §6.5, §14.2). context.linked: the proxy is linked to the control plane (show_rule and the other proxied tools exist); unlinked it has execute_sql, describe_schema, check_sql and whoami only. Lines are always [1]: execute_sql takes one statement.",
+  "cases": [
+    {
+      "name": "executed_allowed",
+      "context": {
+        "linked": true,
+        "dialect": "postgres",
+        "ruleset_version": "v1.0.0-3f2a9c1b7d4e"
+      },
+      "outcome": {
+        "kind": "executed",
+        "verdict": {
+          "status": "ALLOWED",
+          "rule_code": null,
+          "severity": null,
+          "suggested_fix": null,
+          "approved_query": null,
+          "access_denied": []
+        },
+        "row_count": 3
+      },
+      "expected": {
+        "status": "EXECUTED",
+        "error_code": null,
+        "execution_status": "executed",
+        "next_action": "done",
+        "next_steps": [
+          {
+            "action": "done",
+            "lines": [
+              1
+            ],
+            "rule_code": null,
+            "tool": null,
+            "message": "ran under ruleset v1.0.0-3f2a9c1b7d4e; nothing else to do."
+          }
+        ]
+      }
+    },
+    {
+      "name": "executed_allowed_no_ruleset",
+      "context": {
+        "linked": true,
+        "dialect": "postgres",
+        "ruleset_version": null
+      },
+      "outcome": {
+        "kind": "executed",
+        "verdict": {
+          "status": "ALLOWED",
+          "rule_code": null,
+          "severity": null,
+          "suggested_fix": null,
+          "approved_query": null,
+          "access_denied": []
+        },
+        "row_count": 3
+      },
+      "expected": {
+        "status": "EXECUTED",
+        "error_code": null,
+        "execution_status": "executed",
+        "next_action": "done",
+        "next_steps": [
+          {
+            "action": "done",
+            "lines": [
+              1
+            ],
+            "rule_code": null,
+            "tool": null,
+            "message": "ran as written; nothing else to do."
+          }
+        ]
+      }
+    },
+    {
+      "name": "executed_flagged",
+      "context": {
+        "linked": true,
+        "dialect": "postgres",
+        "ruleset_version": "v1.0.0-3f2a9c1b7d4e"
+      },
+      "outcome": {
+        "kind": "executed",
+        "verdict": {
+          "status": "FLAGGED",
+          "rule_code": "VERICTO-050",
+          "severity": "low",
+          "suggested_fix": null,
+          "approved_query": null,
+          "access_denied": []
+        },
+        "row_count": 10
+      },
+      "expected": {
+        "status": "EXECUTED",
+        "error_code": null,
+        "execution_status": "executed",
+        "next_action": "mention_to_user",
+        "next_steps": [
+          {
+            "action": "mention_to_user",
+            "lines": [
+              1
+            ],
+            "rule_code": "VERICTO-050",
+            "tool": null,
+            "message": "ran; mention VERICTO-050 (low) to the user."
+          }
+        ]
+      }
+    },
+    {
+      "name": "executed_monitored",
+      "context": {
+        "linked": true,
+        "dialect": "postgres",
+        "ruleset_version": "v1.0.0-3f2a9c1b7d4e"
+      },
+      "outcome": {
+        "kind": "executed",
+        "verdict": {
+          "status": "MONITORED",
+          "rule_code": "VERICTO-051",
+          "severity": "medium",
+          "suggested_fix": null,
+          "approved_query": null,
+          "access_denied": []
+        },
+        "row_count": 10
+      },
+      "expected": {
+        "status": "EXECUTED",
+        "error_code": null,
+        "execution_status": "executed",
+        "next_action": "mention_to_user",
+        "next_steps": [
+          {
+            "action": "mention_to_user",
+            "lines": [
+              1
+            ],
+            "rule_code": "VERICTO-051",
+            "tool": null,
+            "message": "ran; mention VERICTO-051 (medium) to the user."
+          }
+        ]
+      }
+    },
+    {
+      "name": "executed_masked",
+      "context": {
+        "linked": true,
+        "dialect": "postgres",
+        "ruleset_version": "v1.0.0-3f2a9c1b7d4e"
+      },
+      "outcome": {
+        "kind": "executed",
+        "verdict": {
+          "status": "FLAGGED",
+          "rule_code": "VERICTO-085",
+          "severity": "medium",
+          "suggested_fix": null,
+          "approved_query": null,
+          "access_denied": []
+        },
+        "masked_columns": [
+          "public.users.email"
+        ],
+        "row_count": 1
+      },
+      "expected": {
+        "status": "EXECUTED",
+        "error_code": null,
+        "execution_status": "executed",
+        "next_action": "mention_to_user",
+        "next_steps": [
+          {
+            "action": "mention_to_user",
+            "lines": [
+              1
+            ],
+            "rule_code": "VERICTO-085",
+            "tool": null,
+            "message": "ran the approved rewrite (public.users.email masked); the values you see are masked by policy, do not try to read them another way."
+          }
+        ]
+      }
+    },
+    {
+      "name": "executed_masked_many",
+      "context": {
+        "linked": true,
+        "dialect": "postgres",
+        "ruleset_version": "v1.0.0-3f2a9c1b7d4e"
+      },
+      "outcome": {
+        "kind": "executed",
+        "verdict": {
+          "status": "FLAGGED",
+          "rule_code": "VERICTO-085",
+          "severity": "medium",
+          "suggested_fix": null,
+          "approved_query": null,
+          "access_denied": []
+        },
+        "masked_columns": [
+          "users.email",
+          "users.phone",
+          "users.ssn",
+          "users.iban",
+          "users.dob"
+        ],
+        "row_count": 1
+      },
+      "expected": {
+        "status": "EXECUTED",
+        "error_code": null,
+        "execution_status": "executed",
+        "next_action": "mention_to_user",
+        "next_steps": [
+          {
+            "action": "mention_to_user",
+            "lines": [
+              1
+            ],
+            "rule_code": "VERICTO-085",
+            "tool": null,
+            "message": "ran the approved rewrite (users.email, users.phone, users.ssn and 2 more masked); the values you see are masked by policy, do not try to read them another way."
+          }
+        ]
+      }
+    },
+    {
+      "name": "executed_limit_bound",
+      "context": {
+        "linked": true,
+        "dialect": "postgres",
+        "ruleset_version": "v1.0.0-3f2a9c1b7d4e"
+      },
+      "outcome": {
+        "kind": "executed",
+        "verdict": {
+          "status": "FLAGGED",
+          "rule_code": "POLICY-ORDERS-LIMIT",
+          "severity": "low",
+          "suggested_fix": null,
+          "approved_query": null,
+          "access_denied": []
+        },
+        "limit_bound": true,
+        "row_count": 100
+      },
+      "expected": {
+        "status": "EXECUTED",
+        "error_code": null,
+        "execution_status": "executed",
+        "next_action": "mention_to_user",
+        "next_steps": [
+          {
+            "action": "mention_to_user",
+            "lines": [
+              1
+            ],
+            "rule_code": "POLICY-ORDERS-LIMIT",
+            "tool": null,
+            "message": "ran the approved rewrite (rows bounded by policy); the policy bounds the rows, do not try to read past it another way."
+          }
+        ]
+      }
+    },
+    {
+      "name": "executed_truncated_rows",
+      "context": {
+        "linked": true,
+        "dialect": "postgres",
+        "ruleset_version": "v1.0.0-3f2a9c1b7d4e"
+      },
+      "outcome": {
+        "kind": "executed",
+        "verdict": {
+          "status": "ALLOWED",
+          "rule_code": null,
+          "severity": null,
+          "suggested_fix": null,
+          "approved_query": null,
+          "access_denied": []
+        },
+        "truncation": {
+          "reason": "max_rows",
+          "limit": 200
+        },
+        "row_count": 200
+      },
+      "expected": {
+        "status": "EXECUTED",
+        "error_code": null,
+        "execution_status": "executed",
+        "next_action": "refine_query",
+        "next_steps": [
+          {
+            "action": "refine_query",
+            "lines": [
+              1
+            ],
+            "rule_code": null,
+            "tool": null,
+            "message": "showing 200 rows, cut at the 200-row limit; add a WHERE, select fewer columns, or page with ORDER BY and a WHERE on the last key you saw. Do not raise max_rows to read everything."
+          }
+        ]
+      }
+    },
+    {
+      "name": "executed_truncated_bytes",
+      "context": {
+        "linked": true,
+        "dialect": "postgres",
+        "ruleset_version": "v1.0.0-3f2a9c1b7d4e"
+      },
+      "outcome": {
+        "kind": "executed",
+        "verdict": {
+          "status": "ALLOWED",
+          "rule_code": null,
+          "severity": null,
+          "suggested_fix": null,
+          "approved_query": null,
+          "access_denied": []
+        },
+        "truncation": {
+          "reason": "max_bytes",
+          "limit": 262144
+        },
+        "row_count": 1250
+      },
+      "expected": {
+        "status": "EXECUTED",
+        "error_code": null,
+        "execution_status": "executed",
+        "next_action": "refine_query",
+        "next_steps": [
+          {
+            "action": "refine_query",
+            "lines": [
+              1
+            ],
+            "rule_code": null,
+            "tool": null,
+            "message": "showing 1250 rows, cut at the 256 KiB result limit; add a WHERE, select fewer columns, or page with ORDER BY and a WHERE on the last key you saw. Do not raise max_rows to read everything."
+          }
+        ]
+      }
+    },
+    {
+      "name": "executed_masked_and_truncated",
+      "context": {
+        "linked": true,
+        "dialect": "postgres",
+        "ruleset_version": "v1.0.0-3f2a9c1b7d4e"
+      },
+      "outcome": {
+        "kind": "executed",
+        "verdict": {
+          "status": "FLAGGED",
+          "rule_code": "VERICTO-085",
+          "severity": "medium",
+          "suggested_fix": null,
+          "approved_query": null,
+          "access_denied": []
+        },
+        "masked_columns": [
+          "users.email"
+        ],
+        "truncation": {
+          "reason": "max_rows",
+          "limit": 50
+        },
+        "row_count": 50
+      },
+      "expected": {
+        "status": "EXECUTED",
+        "error_code": null,
+        "execution_status": "executed",
+        "next_action": "mention_to_user",
+        "next_steps": [
+          {
+            "action": "mention_to_user",
+            "lines": [
+              1
+            ],
+            "rule_code": "VERICTO-085",
+            "tool": null,
+            "message": "ran the approved rewrite (users.email masked); the values you see are masked by policy, do not try to read them another way."
+          },
+          {
+            "action": "refine_query",
+            "lines": [
+              1
+            ],
+            "rule_code": "VERICTO-085",
+            "tool": null,
+            "message": "showing 50 rows, cut at the 50-row limit; add a WHERE, select fewer columns, or page with ORDER BY and a WHERE on the last key you saw. Do not raise max_rows to read everything."
+          }
+        ]
+      }
+    },
+    {
+      "name": "blocked_with_fix",
+      "context": {
+        "linked": true,
+        "dialect": "postgres",
+        "ruleset_version": "v1.0.0-3f2a9c1b7d4e"
+      },
+      "outcome": {
+        "kind": "blocked",
+        "verdict": {
+          "status": "BLOCKED",
+          "rule_code": "VERICTO-053",
+          "severity": "high",
+          "suggested_fix": "SELECT id FROM users LIMIT 100",
+          "approved_query": null,
+          "access_denied": []
+        }
+      },
+      "expected": {
+        "status": "BLOCKED",
+        "error_code": "BLOCKED",
+        "execution_status": "blocked",
+        "next_action": "apply_fix_and_recheck",
+        "next_steps": [
+          {
+            "action": "apply_fix_and_recheck",
+            "lines": [
+              1
+            ],
+            "rule_code": "VERICTO-053",
+            "tool": "execute_sql",
+            "message": "not run; apply the suggested fix and call execute_sql again with the corrected SQL."
+          }
+        ]
+      }
+    },
+    {
+      "name": "blocked_no_fix",
+      "context": {
+        "linked": true,
+        "dialect": "postgres",
+        "ruleset_version": "v1.0.0-3f2a9c1b7d4e"
+      },
+      "outcome": {
+        "kind": "blocked",
+        "verdict": {
+          "status": "BLOCKED",
+          "rule_code": "VERICTO-010",
+          "severity": "critical",
+          "suggested_fix": null,
+          "approved_query": null,
+          "access_denied": []
+        }
+      },
+      "expected": {
+        "status": "BLOCKED",
+        "error_code": "BLOCKED",
+        "execution_status": "blocked",
+        "next_action": "do_not_run",
+        "next_steps": [
+          {
+            "action": "do_not_run",
+            "lines": [
+              1
+            ],
+            "rule_code": "VERICTO-010",
+            "tool": "show_rule",
+            "message": "not run: do not rephrase it to get past VERICTO-010; call show_rule VERICTO-010 to see what the rule allows, or ask the user."
+          }
+        ]
+      }
+    },
+    {
+      "name": "blocked_no_fix_unlinked",
+      "context": {
+        "linked": false,
+        "dialect": "postgres",
+        "ruleset_version": "v1.0.0-3f2a9c1b7d4e"
+      },
+      "outcome": {
+        "kind": "blocked",
+        "verdict": {
+          "status": "BLOCKED",
+          "rule_code": "VERICTO-010",
+          "severity": "critical",
+          "suggested_fix": null,
+          "approved_query": null,
+          "access_denied": []
+        }
+      },
+      "expected": {
+        "status": "BLOCKED",
+        "error_code": "BLOCKED",
+        "execution_status": "blocked",
+        "next_action": "do_not_run",
+        "next_steps": [
+          {
+            "action": "do_not_run",
+            "lines": [
+              1
+            ],
+            "rule_code": "VERICTO-010",
+            "tool": null,
+            "message": "not run: do not rephrase it to get past VERICTO-010; ask the user how to proceed."
+          }
+        ]
+      }
+    },
+    {
+      "name": "blocked_access_denied",
+      "context": {
+        "linked": true,
+        "dialect": "postgres",
+        "ruleset_version": "v1.0.0-3f2a9c1b7d4e"
+      },
+      "outcome": {
+        "kind": "blocked",
+        "verdict": {
+          "status": "BLOCKED",
+          "rule_code": "VERICTO-087",
+          "severity": "high",
+          "suggested_fix": null,
+          "approved_query": null,
+          "access_denied": [
+            {
+              "schema": "billing",
+              "table": "invoices",
+              "column": "*",
+              "needed": "select"
+            }
+          ]
+        }
+      },
+      "expected": {
+        "status": "BLOCKED",
+        "error_code": "BLOCKED",
+        "execution_status": "blocked",
+        "next_action": "request_access",
+        "next_steps": [
+          {
+            "action": "request_access",
+            "lines": [
+              1
+            ],
+            "rule_code": "VERICTO-087",
+            "tool": null,
+            "message": "not run: the agent access policy does not allow billing.invoices (select). Rephrasing will not help; ask the user to extend the policy."
+          }
+        ]
+      }
+    },
+    {
+      "name": "parse_error",
+      "context": {
+        "linked": true,
+        "dialect": "postgres",
+        "ruleset_version": "v1.0.0-3f2a9c1b7d4e"
+      },
+      "outcome": {
+        "kind": "blocked",
+        "verdict": {
+          "status": "PARSE_ERROR",
+          "rule_code": "VERICTO-PARSE-ERROR",
+          "severity": null,
+          "suggested_fix": null,
+          "approved_query": null,
+          "access_denied": []
+        }
+      },
+      "expected": {
+        "status": "BLOCKED",
+        "error_code": "BLOCKED",
+        "execution_status": "blocked",
+        "next_action": "fix_and_recheck",
+        "next_steps": [
+          {
+            "action": "fix_and_recheck",
+            "lines": [
+              1
+            ],
+            "rule_code": "VERICTO-PARSE-ERROR",
+            "tool": "execute_sql",
+            "message": "not run: it could not be parsed as postgres; fix the syntax, then call execute_sql again. Do not run it another way."
+          }
+        ]
+      }
+    },
+    {
+      "name": "parse_error_too_complex",
+      "context": {
+        "linked": true,
+        "dialect": "postgres",
+        "ruleset_version": "v1.0.0-3f2a9c1b7d4e"
+      },
+      "outcome": {
+        "kind": "blocked",
+        "verdict": {
+          "status": "PARSE_ERROR",
+          "rule_code": "VERICTO-PARSE-ERROR",
+          "severity": null,
+          "suggested_fix": null,
+          "approved_query": null,
+          "access_denied": [],
+          "parse_error_kind": "too_complex"
+        }
+      },
+      "expected": {
+        "status": "BLOCKED",
+        "error_code": "BLOCKED",
+        "execution_status": "blocked",
+        "next_action": "fix_and_recheck",
+        "next_steps": [
+          {
+            "action": "fix_and_recheck",
+            "lines": [
+              1
+            ],
+            "rule_code": "VERICTO-PARSE-ERROR",
+            "tool": "execute_sql",
+            "message": "not run: too complex to evaluate; split it into simpler statements, then call execute_sql again."
+          }
+        ]
+      }
+    },
+    {
+      "name": "kill_switch",
+      "context": {
+        "linked": true,
+        "dialect": "postgres",
+        "ruleset_version": "v1.0.0-3f2a9c1b7d4e"
+      },
+      "outcome": {
+        "kind": "kill_switch",
+        "block_id": "6f1c2a3b-4d5e-4f60-8a7b-9c0d1e2f3a4b"
+      },
+      "expected": {
+        "status": "BLOCKED",
+        "error_code": "KILL_SWITCH",
+        "execution_status": "blocked",
+        "next_action": "stop",
+        "next_steps": [
+          {
+            "action": "stop",
+            "lines": [
+              1
+            ],
+            "rule_code": null,
+            "tool": null,
+            "message": "stop: do not run any SQL and do not call execute_sql again; tell the user. A person must lift the kill-switch block 6f1c2a3b-4d5e-4f60-8a7b-9c0d1e2f3a4b."
+          }
+        ]
+      }
+    },
+    {
+      "name": "tier_not_enabled_delete",
+      "context": {
+        "linked": true,
+        "dialect": "postgres",
+        "ruleset_version": "v1.0.0-3f2a9c1b7d4e"
+      },
+      "outcome": {
+        "kind": "tier_not_enabled",
+        "tier": "delete",
+        "command": "DELETE",
+        "enabled_tiers": [
+          "read"
+        ],
+        "database": "shop",
+        "layer": "database"
+      },
+      "expected": {
+        "status": "BLOCKED",
+        "error_code": "TIER_NOT_ENABLED",
+        "execution_status": "tier_refused",
+        "next_action": "request_write_access",
+        "next_steps": [
+          {
+            "action": "request_write_access",
+            "lines": [
+              1
+            ],
+            "rule_code": null,
+            "tool": null,
+            "message": "not run: this is a DELETE and only read is enabled for you on shop. Each tier (write, delete, DDL) needs a person to enable it, and each statement needs approval; ask the user. Rephrasing will not help."
+          }
+        ]
+      }
+    },
+    {
+      "name": "tier_not_enabled_update",
+      "context": {
+        "linked": true,
+        "dialect": "postgres",
+        "ruleset_version": "v1.0.0-3f2a9c1b7d4e"
+      },
+      "outcome": {
+        "kind": "tier_not_enabled",
+        "tier": "write",
+        "command": "UPDATE",
+        "enabled_tiers": [
+          "read"
+        ],
+        "database": "shop",
+        "layer": "database"
+      },
+      "expected": {
+        "status": "BLOCKED",
+        "error_code": "TIER_NOT_ENABLED",
+        "execution_status": "tier_refused",
+        "next_action": "request_write_access",
+        "next_steps": [
+          {
+            "action": "request_write_access",
+            "lines": [
+              1
+            ],
+            "rule_code": null,
+            "tool": null,
+            "message": "not run: this is an UPDATE and only read is enabled for you on shop. Each tier (write, delete, DDL) needs a person to enable it, and each statement needs approval; ask the user. Rephrasing will not help."
+          }
+        ]
+      }
+    },
+    {
+      "name": "tier_not_enabled_no_scope",
+      "context": {
+        "linked": true,
+        "dialect": "postgres",
+        "ruleset_version": "v1.0.0-3f2a9c1b7d4e"
+      },
+      "outcome": {
+        "kind": "tier_not_enabled",
+        "tier": "read",
+        "command": "SELECT",
+        "enabled_tiers": [],
+        "database": "shop",
+        "layer": "scope"
+      },
+      "expected": {
+        "status": "BLOCKED",
+        "error_code": "TIER_NOT_ENABLED",
+        "execution_status": "tier_refused",
+        "next_action": "request_write_access",
+        "next_steps": [
+          {
+            "action": "request_write_access",
+            "lines": [
+              1
+            ],
+            "rule_code": null,
+            "tool": null,
+            "message": "not run: reading is not enabled for you on shop (the key needs the sql:read scope); ask the user. Rephrasing will not help."
+          }
+        ]
+      }
+    },
+    {
+      "name": "tier_mismatch_update_as_read",
+      "context": {
+        "linked": true,
+        "dialect": "postgres",
+        "ruleset_version": "v1.0.0-3f2a9c1b7d4e"
+      },
+      "outcome": {
+        "kind": "tier_mismatch",
+        "declared": "read",
+        "tier": "write",
+        "command": "UPDATE"
+      },
+      "expected": {
+        "status": "ERROR",
+        "error_code": "INVALID_INPUT",
+        "execution_status": "invalid",
+        "next_action": "fix_and_recheck",
+        "next_steps": [
+          {
+            "action": "fix_and_recheck",
+            "lines": [
+              1
+            ],
+            "rule_code": null,
+            "tool": "execute_sql",
+            "message": "this statement is an UPDATE (tier write); call execute_sql again with tier: write."
+          }
+        ]
+      }
+    },
+    {
+      "name": "tier_mismatch_insert_as_read",
+      "context": {
+        "linked": true,
+        "dialect": "postgres",
+        "ruleset_version": "v1.0.0-3f2a9c1b7d4e"
+      },
+      "outcome": {
+        "kind": "tier_mismatch",
+        "declared": "read",
+        "tier": "write",
+        "command": "INSERT"
+      },
+      "expected": {
+        "status": "ERROR",
+        "error_code": "INVALID_INPUT",
+        "execution_status": "invalid",
+        "next_action": "fix_and_recheck",
+        "next_steps": [
+          {
+            "action": "fix_and_recheck",
+            "lines": [
+              1
+            ],
+            "rule_code": null,
+            "tool": "execute_sql",
+            "message": "this statement is an INSERT (tier write); call execute_sql again with tier: write."
+          }
+        ]
+      }
+    },
+    {
+      "name": "invalid_multiple_statements",
+      "context": {
+        "linked": true,
+        "dialect": "postgres",
+        "ruleset_version": "v1.0.0-3f2a9c1b7d4e"
+      },
+      "outcome": {
+        "kind": "invalid_input",
+        "reason": "multiple_statements"
+      },
+      "expected": {
+        "status": "ERROR",
+        "error_code": "INVALID_INPUT",
+        "execution_status": "invalid",
+        "next_action": "fix_and_recheck",
+        "next_steps": [
+          {
+            "action": "fix_and_recheck",
+            "lines": [
+              1
+            ],
+            "rule_code": null,
+            "tool": "execute_sql",
+            "message": "not run: send one statement per call, then call execute_sql again."
+          }
+        ]
+      }
+    },
+    {
+      "name": "invalid_nul_byte",
+      "context": {
+        "linked": true,
+        "dialect": "postgres",
+        "ruleset_version": "v1.0.0-3f2a9c1b7d4e"
+      },
+      "outcome": {
+        "kind": "invalid_input",
+        "reason": "nul_byte"
+      },
+      "expected": {
+        "status": "ERROR",
+        "error_code": "INVALID_INPUT",
+        "execution_status": "invalid",
+        "next_action": "fix_and_recheck",
+        "next_steps": [
+          {
+            "action": "fix_and_recheck",
+            "lines": [
+              1
+            ],
+            "rule_code": null,
+            "tool": "execute_sql",
+            "message": "not run: the SQL contains a NUL byte; remove it, then call execute_sql again."
+          }
+        ]
+      }
+    },
+    {
+      "name": "invalid_too_large",
+      "context": {
+        "linked": true,
+        "dialect": "postgres",
+        "ruleset_version": "v1.0.0-3f2a9c1b7d4e"
+      },
+      "outcome": {
+        "kind": "invalid_input",
+        "reason": "too_large",
+        "max_bytes": 65536
+      },
+      "expected": {
+        "status": "ERROR",
+        "error_code": "INVALID_INPUT",
+        "execution_status": "invalid",
+        "next_action": "fix_and_recheck",
+        "next_steps": [
+          {
+            "action": "fix_and_recheck",
+            "lines": [
+              1
+            ],
+            "rule_code": null,
+            "tool": "execute_sql",
+            "message": "not run: the SQL is larger than 65536 bytes; send a smaller statement, then call execute_sql again."
+          }
+        ]
+      }
+    },
+    {
+      "name": "invalid_params_mismatch",
+      "context": {
+        "linked": true,
+        "dialect": "postgres",
+        "ruleset_version": "v1.0.0-3f2a9c1b7d4e"
+      },
+      "outcome": {
+        "kind": "invalid_input",
+        "reason": "params_mismatch",
+        "placeholders": 2,
+        "params": 1
+      },
+      "expected": {
+        "status": "ERROR",
+        "error_code": "INVALID_INPUT",
+        "execution_status": "invalid",
+        "next_action": "fix_and_recheck",
+        "next_steps": [
+          {
+            "action": "fix_and_recheck",
+            "lines": [
+              1
+            ],
+            "rule_code": null,
+            "tool": "execute_sql",
+            "message": "not run: the statement has 2 placeholders and 1 param was sent; send one param per placeholder, then call execute_sql again."
+          }
+        ]
+      }
+    },
+    {
+      "name": "invalid_empty",
+      "context": {
+        "linked": true,
+        "dialect": "postgres",
+        "ruleset_version": "v1.0.0-3f2a9c1b7d4e"
+      },
+      "outcome": {
+        "kind": "invalid_input",
+        "reason": "empty"
+      },
+      "expected": {
+        "status": "ERROR",
+        "error_code": "INVALID_INPUT",
+        "execution_status": "invalid",
+        "next_action": "fix_and_recheck",
+        "next_steps": [
+          {
+            "action": "fix_and_recheck",
+            "lines": [
+              1
+            ],
+            "rule_code": null,
+            "tool": "execute_sql",
+            "message": "not run: the SQL is empty; send one statement, then call execute_sql again."
+          }
+        ]
+      }
+    },
+    {
+      "name": "db_error_undefined_table",
+      "context": {
+        "linked": true,
+        "dialect": "postgres",
+        "ruleset_version": "v1.0.0-3f2a9c1b7d4e"
+      },
+      "outcome": {
+        "kind": "database_error",
+        "sqlstate": "42P01"
+      },
+      "expected": {
+        "status": "ERROR",
+        "error_code": "DATABASE_ERROR",
+        "execution_status": "db_error",
+        "next_action": "fix_sql_error",
+        "next_steps": [
+          {
+            "action": "fix_sql_error",
+            "lines": [
+              1
+            ],
+            "rule_code": null,
+            "tool": "describe_schema",
+            "message": "the database refused it (42P01 undefined_table); call describe_schema to see the tables and columns."
+          }
+        ]
+      }
+    },
+    {
+      "name": "db_error_undefined_column",
+      "context": {
+        "linked": true,
+        "dialect": "postgres",
+        "ruleset_version": "v1.0.0-3f2a9c1b7d4e"
+      },
+      "outcome": {
+        "kind": "database_error",
+        "sqlstate": "42703"
+      },
+      "expected": {
+        "status": "ERROR",
+        "error_code": "DATABASE_ERROR",
+        "execution_status": "db_error",
+        "next_action": "fix_sql_error",
+        "next_steps": [
+          {
+            "action": "fix_sql_error",
+            "lines": [
+              1
+            ],
+            "rule_code": null,
+            "tool": "describe_schema",
+            "message": "the database refused it (42703 undefined_column); call describe_schema to see the tables and columns."
+          }
+        ]
+      }
+    },
+    {
+      "name": "db_error_syntax",
+      "context": {
+        "linked": true,
+        "dialect": "postgres",
+        "ruleset_version": "v1.0.0-3f2a9c1b7d4e"
+      },
+      "outcome": {
+        "kind": "database_error",
+        "sqlstate": "42601"
+      },
+      "expected": {
+        "status": "ERROR",
+        "error_code": "DATABASE_ERROR",
+        "execution_status": "db_error",
+        "next_action": "fix_sql_error",
+        "next_steps": [
+          {
+            "action": "fix_sql_error",
+            "lines": [
+              1
+            ],
+            "rule_code": null,
+            "tool": "execute_sql",
+            "message": "the database refused it (42601 syntax_error); fix the statement, then call execute_sql again."
+          }
+        ]
+      }
+    },
+    {
+      "name": "db_error_insufficient_privilege",
+      "context": {
+        "linked": true,
+        "dialect": "postgres",
+        "ruleset_version": "v1.0.0-3f2a9c1b7d4e"
+      },
+      "outcome": {
+        "kind": "database_error",
+        "sqlstate": "42501"
+      },
+      "expected": {
+        "status": "ERROR",
+        "error_code": "DATABASE_ERROR",
+        "execution_status": "db_error",
+        "next_action": "fix_sql_error",
+        "next_steps": [
+          {
+            "action": "fix_sql_error",
+            "lines": [
+              1
+            ],
+            "rule_code": null,
+            "tool": null,
+            "message": "the database refused it (42501 insufficient_privilege): the database role does not allow it; do not look for another way, ask the user."
+          }
+        ]
+      }
+    },
+    {
+      "name": "db_error_read_only_transaction",
+      "context": {
+        "linked": true,
+        "dialect": "postgres",
+        "ruleset_version": "v1.0.0-3f2a9c1b7d4e"
+      },
+      "outcome": {
+        "kind": "database_error",
+        "sqlstate": "25006"
+      },
+      "expected": {
+        "status": "ERROR",
+        "error_code": "DATABASE_ERROR",
+        "execution_status": "db_error",
+        "next_action": "fix_sql_error",
+        "next_steps": [
+          {
+            "action": "fix_sql_error",
+            "lines": [
+              1
+            ],
+            "rule_code": null,
+            "tool": null,
+            "message": "the database refused it (25006 read_only_sql_transaction): the database role does not allow it; do not look for another way, ask the user."
+          }
+        ]
+      }
+    },
+    {
+      "name": "db_error_data_exception",
+      "context": {
+        "linked": true,
+        "dialect": "postgres",
+        "ruleset_version": "v1.0.0-3f2a9c1b7d4e"
+      },
+      "outcome": {
+        "kind": "database_error",
+        "sqlstate": "22P02"
+      },
+      "expected": {
+        "status": "ERROR",
+        "error_code": "DATABASE_ERROR",
+        "execution_status": "db_error",
+        "next_action": "fix_sql_error",
+        "next_steps": [
+          {
+            "action": "fix_sql_error",
+            "lines": [
+              1
+            ],
+            "rule_code": null,
+            "tool": "execute_sql",
+            "message": "the database refused it (22P02 invalid_text_representation); check the values and casts, then call execute_sql again."
+          }
+        ]
+      }
+    },
+    {
+      "name": "db_error_other",
+      "context": {
+        "linked": true,
+        "dialect": "postgres",
+        "ruleset_version": "v1.0.0-3f2a9c1b7d4e"
+      },
+      "outcome": {
+        "kind": "database_error",
+        "sqlstate": "XX000"
+      },
+      "expected": {
+        "status": "ERROR",
+        "error_code": "DATABASE_ERROR",
+        "execution_status": "db_error",
+        "next_action": "fix_sql_error",
+        "next_steps": [
+          {
+            "action": "fix_sql_error",
+            "lines": [
+              1
+            ],
+            "rule_code": null,
+            "tool": "execute_sql",
+            "message": "the database refused it (XX000); fix the statement, then call execute_sql again."
+          }
+        ]
+      }
+    },
+    {
+      "name": "timeout",
+      "context": {
+        "linked": true,
+        "dialect": "postgres",
+        "ruleset_version": "v1.0.0-3f2a9c1b7d4e"
+      },
+      "outcome": {
+        "kind": "timeout",
+        "timeout_ms": 15000
+      },
+      "expected": {
+        "status": "ERROR",
+        "error_code": "TIMEOUT",
+        "execution_status": "timeout",
+        "next_action": "refine_query",
+        "next_steps": [
+          {
+            "action": "refine_query",
+            "lines": [
+              1
+            ],
+            "rule_code": null,
+            "tool": null,
+            "message": "cancelled after 15 s; narrow it (WHERE on an indexed column, LIMIT). Do not retry it unchanged."
+          }
+        ]
+      }
+    },
+    {
+      "name": "timeout_fraction",
+      "context": {
+        "linked": true,
+        "dialect": "postgres",
+        "ruleset_version": "v1.0.0-3f2a9c1b7d4e"
+      },
+      "outcome": {
+        "kind": "timeout",
+        "timeout_ms": 2500
+      },
+      "expected": {
+        "status": "ERROR",
+        "error_code": "TIMEOUT",
+        "execution_status": "timeout",
+        "next_action": "refine_query",
+        "next_steps": [
+          {
+            "action": "refine_query",
+            "lines": [
+              1
+            ],
+            "rule_code": null,
+            "tool": null,
+            "message": "cancelled after 2.5 s; narrow it (WHERE on an indexed column, LIMIT). Do not retry it unchanged."
+          }
+        ]
+      }
+    },
+    {
+      "name": "unavailable_connect",
+      "context": {
+        "linked": true,
+        "dialect": "postgres",
+        "ruleset_version": "v1.0.0-3f2a9c1b7d4e"
+      },
+      "outcome": {
+        "kind": "unavailable",
+        "reason": "connect",
+        "sqlstate": "08006",
+        "retry_after_s": 5
+      },
+      "expected": {
+        "status": "ERROR",
+        "error_code": "DATABASE_UNAVAILABLE",
+        "execution_status": "db_error",
+        "next_action": "retry_later",
+        "next_steps": [
+          {
+            "action": "retry_later",
+            "lines": [
+              1
+            ],
+            "rule_code": null,
+            "tool": "execute_sql",
+            "message": "the database is unavailable right now (cannot connect); retry in 5 s."
+          }
+        ]
+      }
+    },
+    {
+      "name": "unavailable_too_many_connections",
+      "context": {
+        "linked": true,
+        "dialect": "postgres",
+        "ruleset_version": "v1.0.0-3f2a9c1b7d4e"
+      },
+      "outcome": {
+        "kind": "unavailable",
+        "reason": "connect",
+        "sqlstate": "53300",
+        "retry_after_s": 10
+      },
+      "expected": {
+        "status": "ERROR",
+        "error_code": "DATABASE_UNAVAILABLE",
+        "execution_status": "db_error",
+        "next_action": "retry_later",
+        "next_steps": [
+          {
+            "action": "retry_later",
+            "lines": [
+              1
+            ],
+            "rule_code": null,
+            "tool": "execute_sql",
+            "message": "the database is unavailable right now (cannot connect); retry in 10 s."
+          }
+        ]
+      }
+    },
+    {
+      "name": "unavailable_pool_busy",
+      "context": {
+        "linked": true,
+        "dialect": "postgres",
+        "ruleset_version": "v1.0.0-3f2a9c1b7d4e"
+      },
+      "outcome": {
+        "kind": "unavailable",
+        "reason": "pool_busy",
+        "retry_after_s": 1
+      },
+      "expected": {
+        "status": "ERROR",
+        "error_code": "DATABASE_UNAVAILABLE",
+        "execution_status": "db_error",
+        "next_action": "retry_later",
+        "next_steps": [
+          {
+            "action": "retry_later",
+            "lines": [
+              1
+            ],
+            "rule_code": null,
+            "tool": "execute_sql",
+            "message": "the database is unavailable right now (every connection is busy); retry in 1 s."
+          }
+        ]
+      }
+    },
+    {
+      "name": "unavailable_tls",
+      "context": {
+        "linked": true,
+        "dialect": "postgres",
+        "ruleset_version": "v1.0.0-3f2a9c1b7d4e"
+      },
+      "outcome": {
+        "kind": "unavailable",
+        "reason": "tls",
+        "retry_after_s": 30
+      },
+      "expected": {
+        "status": "ERROR",
+        "error_code": "DATABASE_UNAVAILABLE",
+        "execution_status": "db_error",
+        "next_action": "stop",
+        "next_steps": [
+          {
+            "action": "stop",
+            "lines": [
+              1
+            ],
+            "rule_code": null,
+            "tool": null,
+            "message": "stop: the TLS check of the database connection failed; do not retry, ask the user to check the proxy's database TLS settings."
+          }
+        ]
+      }
+    },
+    {
+      "name": "unavailable_auth",
+      "context": {
+        "linked": true,
+        "dialect": "postgres",
+        "ruleset_version": "v1.0.0-3f2a9c1b7d4e"
+      },
+      "outcome": {
+        "kind": "unavailable",
+        "reason": "auth",
+        "sqlstate": "28P01",
+        "retry_after_s": 0
+      },
+      "expected": {
+        "status": "ERROR",
+        "error_code": "DATABASE_UNAVAILABLE",
+        "execution_status": "db_error",
+        "next_action": "stop",
+        "next_steps": [
+          {
+            "action": "stop",
+            "lines": [
+              1
+            ],
+            "rule_code": null,
+            "tool": null,
+            "message": "stop: Vericto could not log in to the database; do not retry, ask the user to check the proxy's database credentials."
+          }
+        ]
+      }
+    },
+    {
+      "name": "not_ready",
+      "context": {
+        "linked": true,
+        "dialect": "postgres",
+        "ruleset_version": "v1.0.0-3f2a9c1b7d4e"
+      },
+      "outcome": {
+        "kind": "not_ready",
+        "retry_after_s": 2
+      },
+      "expected": {
+        "status": "ERROR",
+        "error_code": "NOT_READY",
+        "execution_status": "blocked",
+        "next_action": "retry_later",
+        "next_steps": [
+          {
+            "action": "retry_later",
+            "lines": [
+              1
+            ],
+            "rule_code": null,
+            "tool": "execute_sql",
+            "message": "not run: Vericto has not loaded this workspace's rules yet; retry in 2 s."
+          }
+        ]
+      }
+    }
+  ]
+}

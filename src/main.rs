@@ -29,7 +29,9 @@
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 mod config;
+mod mcp;
 mod runtime_sizing;
+mod stack;
 mod tcp;
 mod telemetry;
 
@@ -55,7 +57,16 @@ fn main() {
         }));
     }
 
-    init_tracing();
+    // `vericto-proxy mcp …` (4.21.0): the MCP server of Proxy mode. Its logs go
+    // to stderr, never stdout: in stdio mode stdout carries the protocol, and
+    // the first log line there would corrupt the session.
+    let mcp_args: Option<Vec<String>> = (std::env::args().nth(1).as_deref() == Some("mcp"))
+        .then(|| std::env::args().skip(2).collect());
+    if mcp_args.is_some() {
+        init_tracing_stderr();
+    } else {
+        init_tracing();
+    }
 
     // 4.16.2: as many async workers as the CPU time the proxy may use, not one per
     // CPU it may run on (runtime_sizing). A 0.5 vCPU Fargate task saw 2 CPUs and
@@ -68,7 +79,10 @@ fn main() {
         }
     };
     let mut builder = tokio::runtime::Builder::new_multi_thread();
-    builder.enable_all().worker_threads(sizing.worker_threads);
+    builder
+        .enable_all()
+        .worker_threads(sizing.worker_threads)
+        .thread_stack_size(stack::WORKER_STACK_BYTES);
     let runtime = match builder.build() {
         Ok(rt) => rt,
         Err(e) => {
@@ -83,7 +97,10 @@ fn main() {
         available_cpus = sizing.available_cpus,
         "Runtime sizing"
     );
-    runtime.block_on(run());
+    match mcp_args {
+        Some(args) => runtime.block_on(mcp::run(args)),
+        None => runtime.block_on(run()),
+    }
 }
 
 async fn run() {
@@ -350,6 +367,7 @@ async fn run() {
                 mode: tcp_opts.policy_rules,
                 bundle: policy_rules.clone(),
                 verifier: bundle_verifier.clone(),
+                ..Default::default()
             };
             tokio::spawn(async move {
                 crate::tcp::rules_sync::run_with_policy_rules(
@@ -499,13 +517,13 @@ async fn run() {
 }
 
 /// What the proxy does with buffered telemetry when it is asked to stop.
-struct ShutdownFlush {
-    queue: Arc<dyn telemetry::EventQueue>,
-    reporter: telemetry::Reporter,
-    timeout: std::time::Duration,
+pub(crate) struct ShutdownFlush {
+    pub(crate) queue: Arc<dyn telemetry::EventQueue>,
+    pub(crate) reporter: telemetry::Reporter,
+    pub(crate) timeout: std::time::Duration,
     /// This proxy's spool directory on a shared volume: its lease is released
     /// after the flush, so another proxy adopts what is left at its next scan.
-    layout: Option<Arc<telemetry::spool_dir::SpoolLayout>>,
+    pub(crate) layout: Option<Arc<telemetry::spool_dir::SpoolLayout>>,
 }
 
 impl ShutdownFlush {
@@ -513,7 +531,7 @@ impl ShutdownFlush {
     /// mode), then deliver what can be delivered. What is not delivered stays
     /// on disk for the next process (disk mode) or is lost (memory mode, as on
     /// any restart).
-    async fn run(self) {
+    pub(crate) async fn run(self) {
         let started = std::time::Instant::now();
         let queue = self.queue.clone();
         let timeout = self.timeout;
@@ -542,7 +560,7 @@ impl ShutdownFlush {
 }
 
 /// Resolves on SIGTERM (what ECS, Kubernetes and `docker stop` send) or SIGINT.
-async fn shutdown_signal() -> &'static str {
+pub(crate) async fn shutdown_signal() -> &'static str {
     #[cfg(unix)]
     {
         use tokio::signal::unix::{SignalKind, signal};
@@ -571,4 +589,15 @@ fn init_tracing() {
     // Dockerfile. `RUST_LOG=info,vericto_proxy=debug` turns the debug lines back on.
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     fmt().with_env_filter(filter).json().init();
+}
+
+/// [`init_tracing`] to stderr (`vericto-proxy mcp`).
+fn init_tracing_stderr() {
+    use tracing_subscriber::{EnvFilter, fmt};
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    fmt()
+        .with_env_filter(filter)
+        .json()
+        .with_writer(std::io::stderr)
+        .init();
 }

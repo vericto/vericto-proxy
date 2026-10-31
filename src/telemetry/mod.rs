@@ -23,7 +23,7 @@ use serde::{Deserialize, Serialize};
 
 /// A single evaluation result reported to the API. Mirrors the API's ingest
 /// schema (apps/api/src/routes/telemetry.ts).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TelemetryEvent {
     pub event_id: String,
     pub database_id: String,
@@ -154,7 +154,59 @@ pub struct TelemetryEvent {
     /// the time. Omitted on every other event.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kill_switch_id: Option<String>,
+    // ── vericto-proxy mcp (4.21.0, design "MCP execution modes" §14.2) ──────
+    // Every one is omitted on a TCP event, which is exactly what 4.20.0 sent.
+    // Counts, names, hashes and codes: never a result value.
+    /// `mcp_proxy` on every event of `vericto-proxy mcp` (the ingest `source`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    /// executed | blocked | tier_refused | db_error | timeout | cancelled |
+    /// invalid | dry_run (`check_sql`) | unavailable | not_ready.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_status: Option<String>,
+    /// The statement's computed tier: read | write | delete | ddl.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tier: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rows_returned: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bytes_returned: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub truncated: Option<bool>,
+    /// On `db_error` (and `timeout`, 57014).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sqlstate: Option<String>,
+    /// Database time (`latency_ms` stays the evaluation latency).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_ms: Option<f64>,
+    /// The MCP client's `clientInfo`, as declared (not verified).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp_client_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp_client_version: Option<String>,
+    /// SHA-256 (hex) of the exact bytes sent to the database.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub statement_sha256: Option<String>,
+    /// stdio | http | per_call.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id_hash: Option<String>,
+    /// `statement` (execute_sql), `catalog` (describe_schema), `check`
+    /// (check_sql's local dry run).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event_kind: Option<String>,
+    /// Streamable HTTP: the agent key (by id) the MCP client presented, as the
+    /// bundle's `mcp.identities` names it. The API keeps it when it is a key of
+    /// the reporting key's workspace, else records the reporting key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key_id: Option<String>,
 }
+
+/// The ingest `source` of every `vericto-proxy mcp` event.
+pub const MCP_PROXY_SOURCE: &str = "mcp_proxy";
+/// What a control plane that does not know [`MCP_PROXY_SOURCE`] yet accepts.
+pub const LEGACY_MCP_SOURCE: &str = "mcp";
 
 /// One reference an agent-access allowlist denied, shaped for the ingest schema:
 /// `{schema, table, column, needed}`; `schema` / `column` null when absent.
@@ -498,6 +550,7 @@ mod tests {
             ticket_id: None,
             session_tenant: None,
             kill_switch_id: None,
+            ..Default::default()
         }
     }
 

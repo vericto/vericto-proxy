@@ -114,10 +114,10 @@ pub fn effective_max_query_bytes(configured: usize, dialect: Dialect) -> usize {
 }
 
 /// Default of `VERICTO_INLINE_EVAL_MAX_BYTES` (since 4.19.0): statements up to
-/// this size are evaluated on the session's own task rather than on the blocking
-/// pool.
+/// this size are evaluated on the session's own task rather than on a thread of
+/// their own (the blocking pool up to 4.20.0, see `crate::stack`).
 ///
-/// The pool costs two thread hand-offs per statement (a futex wake to the pool
+/// The hand-off costs two thread switches per statement (a futex wake to the pool
 /// thread, an eventfd write and an epoll wake back to the worker), about 4 of the
 /// 10 system calls a PostgreSQL statement costs the proxy, plus two context
 /// switches. Below this size the evaluation is shorter than that: measured at
@@ -126,6 +126,13 @@ pub fn effective_max_query_bytes(configured: usize, dialect: Dialect) -> usize {
 /// pool keeps one large statement from stalling the other connections a worker
 /// serves, as before.
 pub const DEFAULT_INLINE_EVAL_MAX_BYTES: usize = 1024;
+
+/// The most `VERICTO_INLINE_EVAL_MAX_BYTES` can be (4.21.0): a statement
+/// evaluated on the session's task uses the worker's stack, so only a statement
+/// whose deepest possible parse fits there with a wide margin is evaluated
+/// inline. Measured on a release build, the deepest statement of 4 KiB needs
+/// less than 1 MiB of stack; workers have [`crate::stack::WORKER_STACK_BYTES`].
+pub const INLINE_EVAL_MAX_BYTES_CEILING: usize = 4096;
 
 /// Read `VERICTO_INLINE_EVAL_MAX_BYTES`, falling back to
 /// [`DEFAULT_INLINE_EVAL_MAX_BYTES`]. `0` evaluates every statement on the
@@ -143,6 +150,14 @@ fn inline_eval_max_bytes_from(raw: Option<&str>) -> usize {
     match raw {
         None => DEFAULT_INLINE_EVAL_MAX_BYTES,
         Some(raw) => match raw.trim().parse::<usize>() {
+            Ok(v) if v > INLINE_EVAL_MAX_BYTES_CEILING => {
+                tracing::warn!(
+                    value = v,
+                    ceiling = INLINE_EVAL_MAX_BYTES_CEILING,
+                    "VERICTO_INLINE_EVAL_MAX_BYTES is above the most a statement evaluated inline may be; using the ceiling"
+                );
+                INLINE_EVAL_MAX_BYTES_CEILING
+            }
             Ok(v) => v,
             Err(_) => {
                 tracing::warn!(
@@ -243,6 +258,13 @@ mod tests {
         );
         assert_eq!(inline_eval_max_bytes_from(Some(" 4096 ")), 4096);
         assert_eq!(inline_eval_max_bytes_from(Some("0")), 0);
+        for above in ["4097", "65536", "18446744073709551615"] {
+            assert_eq!(
+                inline_eval_max_bytes_from(Some(above)),
+                INLINE_EVAL_MAX_BYTES_CEILING,
+                "{above}"
+            );
+        }
         for bad in ["", "-1", "1k", "abc"] {
             assert_eq!(
                 inline_eval_max_bytes_from(Some(bad)),

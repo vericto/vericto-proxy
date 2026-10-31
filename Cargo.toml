@@ -1,6 +1,6 @@
 [package]
 name = "vericto-proxy"
-version = "4.20.0"
+version = "4.21.0"
 edition = "2024"
 rust-version = "1.88"
 description = "Vericto — Deterministic SQL firewall — TCP wire-protocol proxy for customer infrastructure"
@@ -74,6 +74,20 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 uuid = { version = "1.10", features = ["v4"] }
 chrono = { version = "0.4", features = ["serde"] }
 
+# MCP Proxy mode (`vericto-proxy mcp`, 4.21.0): the proxy is the PostgreSQL
+# client itself. Only the message encoders and the SCRAM-SHA-256 client of this
+# crate are used (the low-level protocol crate, not tokio-postgres, which sends
+# catalog lookups of its own that would bypass the evaluator: design
+# "MCP execution modes" §5.3). Already in the tree through tokio-postgres (dev).
+postgres-protocol = "0.6"
+bytes = "1"
+# The Streamable HTTP transport of `vericto-proxy mcp --transport http`: hyper's
+# HTTP/1.1 server, already compiled in as reqwest's client (same crates, the
+# server half enabled).
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", default-features = false, features = ["tokio"] }
+http-body-util = "0.1"
+
 # Global allocator (4.19.0, the default `mimalloc` feature): fewer instructions
 # per statement than glibc's malloc on every workload of the performance gate
 # (docs/PERFORMANCE.md, "Allocator"). MIT, C sources compiled by `cc`, no system
@@ -102,6 +116,8 @@ mysql_async = { version = "0.37", default-features = false, features = ["default
 # another name, mutual TLS on the MySQL path. Generated per test run, so no
 # private key is ever committed. ring only, already in the tree.
 rcgen = { version = "0.14", default-features = false, features = ["ring", "pem"] }
+# Property tests of the MCP exact-text guarantee (src/mcp/prop_tests.rs).
+proptest = { version = "1", default-features = false, features = ["std"] }
 
 [profile.release]
 opt-level = 3
