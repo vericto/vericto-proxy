@@ -32,10 +32,12 @@ High-priority issues for this proxy include:
   (e.g. a `DELETE` without `WHERE` that is incorrectly allowed), including SQL
   that reaches the database without being evaluated.
 - **Denial of service** — input that causes excessive CPU/memory (deeply nested
-  ASTs, pathological queries, oversized messages). The proxy refuses to evaluate
-  a statement larger than `VERICTO_MAX_QUERY_BYTES` (10 MiB by default), and the
-  engine refuses statements nested more than 200 levels and stops walking an AST
-  deeper than 50 levels; bypasses of any of these are in scope.
+  ASTs, pathological queries, oversized messages). The TCP proxy refuses to evaluate
+  a statement larger than `VERICTO_MAX_QUERY_BYTES` (1 MiB by default; MCP keeps
+  64 KiB) and makes a linear lexical pass before parsing, refusing an expression with
+  more than `VERICTO_MAX_BINARY_OPERATORS` binary operators (10,000 by default).
+  The engine also refuses statements nested more than 200 levels and stops walking an
+  AST deeper than 50 levels; bypasses of any of these are in scope.
 - **Fail-open behavior** — any path where an unparseable or malformed query is
   allowed instead of blocked when the policy says to block it.
 

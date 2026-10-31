@@ -1626,4 +1626,60 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn protective_and_business_policies_fail_closed_on_a_lexical_refusal() {
+        let sql = "SELECT 1+1+1";
+        let rules = default_ruleset();
+        let access = EnforcementPolicy {
+            access_policy: Some(vericto_engine::AccessPolicy::new(
+                AccessMode::Enforce,
+                Vec::new(),
+            )),
+            ..EnforcementPolicy::default()
+        };
+        for policy in [mask_email(), access] {
+            assert!(matches!(
+                evaluate_message_guarded(
+                    sql,
+                    Dialect::Postgres,
+                    QueryKind::Simple,
+                    &rules,
+                    &policy,
+                    1,
+                ),
+                TcpDecision::Block { ref rule_code, .. }
+                    if rule_code == "VERICTO-PARSE-ERROR"
+            ));
+        }
+
+        let policy_rule = Rule {
+            rule_id: "policy-1".into(),
+            code: "POLICY-001".into(),
+            severity: Severity::High,
+            default_action: EnforcementAction::Block,
+            rule_type: vericto_engine::RuleType::Custom,
+            ast_condition_yaml: Some("action: block".into()),
+        };
+        let policies = PolicySet::compile(std::slice::from_ref(&policy_rule));
+        let ctx = EvalContext::new();
+        let decision = evaluate_message_with_guard(
+            sql,
+            Dialect::Postgres,
+            QueryKind::Simple,
+            std::slice::from_ref(&policy_rule),
+            &EnforcementPolicy::default(),
+            Some(&PolicyEval {
+                mode: PolicyRulesMode::Enforce,
+                policies: &policies,
+                ctx: &ctx,
+            }),
+            1,
+        );
+        assert!(matches!(
+            decision,
+            TcpDecision::Block { ref rule_code, .. }
+                if rule_code == "VERICTO-PARSE-ERROR"
+        ));
+    }
 }

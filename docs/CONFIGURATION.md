@@ -274,9 +274,10 @@ instead.
 Size alone does not bound parser cost: a left-associative expression such as
 `SELECT 1+1+…` can take quadratic time. Before either parser runs, the proxy therefore
 makes a linear lexical pass and refuses an expression with more than
-`VERICTO_MAX_BINARY_OPERATORS` operators (10,000 by default). Parentheses, commas and
-clause boundaries start separate expression segments; operators inside strings, quoted
-identifiers and ordinary comments do not count. MySQL executable comments do count.
+`VERICTO_MAX_BINARY_OPERATORS` operators (10,000 by default). Parentheses and commas
+separate expression segments; SQL keywords never reset the counter because words such as
+`LEFT` are also valid function names inside an expression. Operators inside strings,
+quoted identifiers and ordinary comments do not count. MySQL executable comments do.
 The refusal is a normal `VERICTO-PARSE-ERROR`: `parse_error: block`, a blocking/masking
 sensitive-column policy, an enforced allowlist or an applicable enforced business policy
 blocks it; the fail-open default forwards it with a flag. The scanner stops at operator

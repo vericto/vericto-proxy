@@ -83,8 +83,8 @@ fn scan(
     let bytes = sql.as_bytes();
     let mut i = 0;
     // The normal path stays allocation-free through 32 open parentheses; only
-    // more deeply nested input needs the overflow vector. Commas and clause
-    // boundaries start another expression at the current depth. Closing a
+    // more deeply nested input needs the overflow vector. Commas start another
+    // expression at the current depth. Closing a parenthesis resumes the outer
     // parenthesis resumes the outer expression, so `(a)+(b)+(c)` counts its two
     // outer `+`s.
     let mut parents = [0usize; 32];
@@ -196,8 +196,6 @@ fn scan(
                 let word = &bytes[start..i];
                 if is_word_operator(word) {
                     record(&mut chain, limit)?;
-                } else if is_expression_boundary(word) {
-                    chain = 0;
                 }
             }
             b if is_operator_char(b, dialect) => {
@@ -320,13 +318,13 @@ fn skip_dollar_quote(sql: &str, at: usize) -> Option<usize> {
         end += 1;
     } else {
         let first = *bytes.get(end)?;
-        if !is_ident_start(first) {
+        if !(is_ident_start(first) || first >= 0x80) {
             return None;
         }
         end += 1;
         while bytes
             .get(end)
-            .is_some_and(|b| b.is_ascii_alphanumeric() || *b == b'_')
+            .is_some_and(|b| b.is_ascii_alphanumeric() || *b == b'_' || *b >= 0x80)
         {
             end += 1;
         }
@@ -336,9 +334,11 @@ fn skip_dollar_quote(sql: &str, at: usize) -> Option<usize> {
         end += 1;
     }
     let delimiter = &sql[at..end];
-    sql[end..]
-        .find(delimiter)
-        .map(|n| end + n + delimiter.len())
+    Some(
+        sql[end..]
+            .find(delimiter)
+            .map_or(sql.len(), |n| end + n + delimiter.len()),
+    )
 }
 
 fn is_ident_start(b: u8) -> bool {
@@ -396,48 +396,6 @@ fn is_word_operator(word: &[u8]) -> bool {
     .any(|operator| word.eq_ignore_ascii_case(operator))
 }
 
-fn is_expression_boundary(word: &[u8]) -> bool {
-    [
-        b"select".as_slice(),
-        b"from",
-        b"where",
-        b"group",
-        b"order",
-        b"having",
-        b"limit",
-        b"offset",
-        b"fetch",
-        b"returning",
-        b"values",
-        b"set",
-        b"join",
-        b"inner",
-        b"left",
-        b"right",
-        b"full",
-        b"cross",
-        b"natural",
-        b"on",
-        b"when",
-        b"then",
-        b"else",
-        b"end",
-        b"window",
-        b"qualify",
-        b"filter",
-        b"update",
-        b"delete",
-        b"insert",
-        b"into",
-        b"merge",
-        b"using",
-        b"by",
-        b"as",
-    ]
-    .iter()
-    .any(|boundary| word.eq_ignore_ascii_case(boundary))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -483,6 +441,26 @@ mod tests {
     }
 
     #[test]
+    fn postgres_non_ascii_dollar_tags_are_literals() {
+        let operators = "+".repeat(64);
+        let sql = format!("DO $é${operators}$é$");
+        assert!(check(&sql, Dialect::Postgres, 0), "{sql}");
+    }
+
+    #[test]
+    fn one_unterminated_dollar_quote_consumes_the_remaining_tail() {
+        let sql = format!(
+            "SELECT {}",
+            (0..40_000)
+                .map(|i| format!("$tag{i}$"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+        assert!(sql.len() > 300_000);
+        assert!(check(&sql, Dialect::Postgres, 0));
+    }
+
+    #[test]
     fn mysql_executable_comments_are_code() {
         assert!(!check("SELECT 1 /*! + 1 + 1 */", Dialect::Mysql, 1));
         assert!(check("SELECT 1 /* + 1 + 1 */", Dialect::Mysql, 0));
@@ -514,11 +492,20 @@ mod tests {
     }
 
     #[test]
-    fn clause_boundaries_do_not_combine_independent_expressions() {
+    fn expression_valid_keywords_never_reset_the_chain() {
+        let sql = format!(
+            "SELECT 0{}",
+            " + LEFT('x', 1)".repeat(DEFAULT_MAX_BINARY_OPERATORS + 1)
+        );
+        for dialect in [Dialect::Postgres, Dialect::Mysql] {
+            let err = check_binary_operator_chains(&sql, dialect, DEFAULT_MAX_BINARY_OPERATORS)
+                .unwrap_err();
+            assert_eq!(err.seen, DEFAULT_MAX_BINARY_OPERATORS + 1, "{dialect:?}");
+        }
         assert!(check(
-            "SELECT a + b FROM t JOIN u ON t.id = u.id WHERE t.x = 1 ORDER BY t.y + 1",
+            "SELECT 1 LEFT JOIN t ON t.id = 1",
             Dialect::Postgres,
-            1
+            2
         ));
     }
 
