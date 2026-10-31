@@ -14,14 +14,23 @@
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use serde_json::{Value, json};
 
-fn free_port() -> u16 {
+/// A loopback port nothing listens on, for an address that must be
+/// unreachable (the fake database URL, the unreachable control plane).
+///
+/// The port is released before the caller uses it, so another process could
+/// bind it in between; that is acceptable here, where the test only needs
+/// the connection to fail (and a stray listener would not speak the protocol
+/// either). Never use it for a port the code under test must bind: let it
+/// bind `127.0.0.1:0` and read the bound address instead (see
+/// [`http_listen_addr`]).
+fn unused_port() -> u16 {
     let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     l.local_addr().unwrap().port()
 }
@@ -261,12 +270,17 @@ impl Drop for RealDb {
     }
 }
 
+/// A suffix for database and role names, unique per call: the clock and the
+/// pid separate processes, the counter separates calls within this one.
+/// Lowercase hex and `_` only, so it is a valid unquoted Postgres identifier.
 fn uuid_suffix() -> String {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
     let n = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    format!("{:x}{:x}", n & 0xffff_ffff, std::process::id())
+    let seq = NEXT.fetch_add(1, Ordering::Relaxed);
+    format!("{:x}_{:x}_{seq:x}", n & 0xffff_ffff, std::process::id())
 }
 
 // ── The local mode ────────────────────────────────────────────────────────────
@@ -462,7 +476,7 @@ fn linked_session(api_port: u16, trusted: &ring::signature::Ed25519KeyPair) -> S
     let url = std::env::var("VERICTO_TEST_PG_URL")
         .ok()
         .filter(|u| !u.is_empty())
-        .unwrap_or_else(|| format!("postgres://agent:pw@127.0.0.1:{}/shop", free_port()));
+        .unwrap_or_else(|| format!("postgres://agent:pw@127.0.0.1:{}/shop", unused_port()));
     let url_file = private_file(&home, "db.url", &url);
     let keys = json!([{
         "key_id": "k-local-test",
@@ -508,7 +522,7 @@ fn assert_not_ready(s: &mut Session) {
 fn a_configured_but_unreachable_control_plane_stays_not_ready() {
     let key = signer();
     // Nothing listens on the port.
-    let mut s = linked_session(free_port(), &key);
+    let mut s = linked_session(unused_port(), &key);
     let init = s.initialize();
     assert!(
         !init["result"]["instructions"]
@@ -646,29 +660,31 @@ fn http_without_a_control_plane_requires_a_bearer_token() {
     // With a tokens file it serves, and only to a holder of a token.
     let token = "local-mcp-token-0123456789abcdef-test";
     let tokens = private_file(dir.path(), "mcp.tokens", &format!("{token} laptop\n"));
-    let port = free_port();
+    // The proxy binds port 0 itself and logs the address it got, so no port
+    // is picked before the bind (no race with another process).
     let mut child = bin()
         .args([
             "mcp",
             "--transport",
             "http",
             "--listen",
-            &format!("127.0.0.1:{port}"),
+            "127.0.0.1:0",
             "--auth-tokens-file",
             tokens.to_str().unwrap(),
         ])
         .env("VERICTO_MCP_DATABASE_URL", "postgres://u:p@127.0.0.1:1/db")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()
         .unwrap();
+    let addr = http_listen_addr(&mut child);
     let init = json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "t", "version": "1"}}});
     let result = block_on(async {
         let client = reqwest::Client::new();
         let post = |auth: Option<&str>| {
             let mut r = client
-                .post(format!("http://127.0.0.1:{port}/mcp"))
+                .post(format!("http://{addr}/mcp"))
                 .header("content-type", "application/json")
                 .header("accept", "application/json, text/event-stream")
                 .json(&init);
@@ -677,16 +693,8 @@ fn http_without_a_control_plane_requires_a_bearer_token() {
             }
             r.send()
         };
-        let deadline = Instant::now() + Duration::from_secs(20);
-        let anonymous = loop {
-            match post(None).await {
-                Ok(r) => break r.status().as_u16(),
-                Err(_) if Instant::now() < deadline => {
-                    tokio::time::sleep(Duration::from_millis(100)).await
-                }
-                Err(e) => panic!("the HTTP listener never answered: {e}"),
-            }
-        };
+        // The address is logged after the bind: the listener is up.
+        let anonymous = post(None).await.unwrap().status().as_u16();
         let with_token = post(Some(token)).await.unwrap();
         let status = with_token.status().as_u16();
         let body: Value = with_token.json().await.unwrap();
@@ -698,4 +706,34 @@ fn http_without_a_control_plane_requires_a_bearer_token() {
     assert_eq!(anonymous, 401, "never served unauthenticated");
     assert_eq!(status, 200, "{body}");
     assert_eq!(body["result"]["serverInfo"]["name"], "vericto-proxy");
+}
+
+/// The address the HTTP listener of `child` bound, from its startup log line
+/// (`MCP Streamable HTTP listening on /mcp`, JSON on stderr). The rest of
+/// stderr keeps being drained so the child never blocks on a full pipe.
+fn http_listen_addr(child: &mut Child) -> std::net::SocketAddr {
+    let stderr = BufReader::new(child.stderr.take().unwrap());
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut tx = Some(tx);
+        for line in stderr.lines() {
+            let Ok(line) = line else { break };
+            let Some(t) = tx.as_ref() else { continue };
+            let Ok(v) = serde_json::from_str::<Value>(&line) else {
+                continue;
+            };
+            if v["fields"]["message"] == "MCP Streamable HTTP listening on /mcp" {
+                let _ = t.send(v["fields"]["listen"].as_str().unwrap_or("").to_string());
+                tx = None;
+            }
+        }
+    });
+    let addr = rx
+        .recv_timeout(Duration::from_secs(20))
+        .expect("the HTTP listener never logged its address");
+    let addr: std::net::SocketAddr = addr
+        .parse()
+        .unwrap_or_else(|e| panic!("listen={addr:?} is not an address: {e}"));
+    assert!(addr.ip().is_loopback() && addr.port() != 0, "{addr}");
+    addr
 }

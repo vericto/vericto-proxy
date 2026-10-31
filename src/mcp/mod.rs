@@ -445,7 +445,10 @@ pub async fn run(args: Vec<String>) {
                 Ok(l) => l,
                 Err(e) => fail(&format!("cannot listen on {}: {e}", rt.cfg.listen)),
             };
-            tracing::info!(listen = %rt.cfg.listen, tls = tls.is_some(), "MCP Streamable HTTP listening on /mcp");
+            // The bound address, not the configured one: with port 0 it names
+            // the port the OS picked (tests/mcp_local.rs reads it from here).
+            let bound = listener.local_addr().unwrap_or(rt.cfg.listen);
+            tracing::info!(listen = %bound, tls = tls.is_some(), "MCP Streamable HTTP listening on /mcp");
             if let Some(port) =
                 lookup("VERICTO_HEALTHZ_PORT").and_then(|p| p.trim().parse::<u16>().ok())
             {
