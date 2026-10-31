@@ -87,25 +87,48 @@ impl TcpDecision {
     }
 
     /// True only for a statement the lexical guard refused before parsing.
-    /// Telemetry uses this to avoid feeding the adversarial text to its own
-    /// sanitizer parser after evaluation correctly skipped it.
+    /// Telemetry and the block log use this to avoid feeding the adversarial
+    /// text to the sanitizer parser after evaluation correctly skipped it.
+    ///
+    /// Recognized by the exact message [`lexical_parse_error`] writes, never by
+    /// a substring (see [`TooManyBinaryOperators::from_message`]): an ordinary
+    /// parse error that quotes the guard's wording is reported normally.
+    ///
+    /// [`TooManyBinaryOperators::from_message`]: crate::tcp::query_complexity::TooManyBinaryOperators::from_message
     pub(crate) fn is_lexical_complexity_refusal(&self) -> bool {
-        let has_prefix = |message: &str| {
-            message.contains(crate::tcp::query_complexity::BINARY_OPERATOR_ERROR_PREFIX)
-        };
         match self {
             TcpDecision::Forward {
                 observation: Some(observation),
                 ..
-            } => observation.parse_error.as_deref().is_some_and(has_prefix),
+            } => {
+                observation.rule_code == "VERICTO-PARSE-ERROR"
+                    && observation
+                        .parse_error
+                        .as_deref()
+                        .is_some_and(is_lexical_refusal_message)
+            }
             TcpDecision::Block {
                 rule_code,
                 ast_node_path,
                 ..
-            } => rule_code == "VERICTO-PARSE-ERROR" && has_prefix(ast_node_path),
+            } => is_lexical_refusal_block(rule_code, ast_node_path),
             _ => false,
         }
     }
+}
+
+/// The guard's own refusal message, exactly.
+fn is_lexical_refusal_message(message: &str) -> bool {
+    crate::tcp::query_complexity::TooManyBinaryOperators::from_message(message).is_some()
+}
+
+/// [`TcpDecision::is_lexical_complexity_refusal`] for the fields of a block,
+/// for callers that hold them rather than the decision.
+pub(crate) fn is_lexical_refusal_block(rule_code: &str, ast_node_path: &str) -> bool {
+    rule_code == "VERICTO-PARSE-ERROR"
+        && ast_node_path
+            .strip_prefix("PARSE_ERROR: ")
+            .is_some_and(is_lexical_refusal_message)
 }
 /// A block raised by the proxy itself because the rewrite of a statement
 /// (`rewritten`, when the engine returned one) cannot be enforced as the
@@ -1551,6 +1574,54 @@ mod tests {
             TcpDecision::Forward { .. } => {
                 panic!("parse-error fail-closed must Block, not Forward")
             }
+        }
+    }
+
+    /// A refusal is recognized by the guard's exact message, in both shapes a
+    /// decision carries it; a parser error that quotes the guard's wording (the
+    /// parser echoes the token it did not expect) is an ordinary parse error,
+    /// fail-open or fail-closed.
+    #[test]
+    fn only_the_guards_own_refusal_is_a_lexical_refusal() {
+        let rules = default_ruleset();
+        let closed = EnforcementPolicy {
+            parse_error: ParseErrorAction::Block,
+            ..EnforcementPolicy::default()
+        };
+        for policy in [&EnforcementPolicy::default(), &closed] {
+            let refused = evaluate_message_guarded(
+                "SELECT 1+1+1+1",
+                Dialect::Postgres,
+                QueryKind::Simple,
+                &rules,
+                policy,
+                2,
+            );
+            assert!(refused.is_lexical_complexity_refusal());
+
+            let echo =
+                "SELECT * FROM t t2 'lexical complexity guard: more than 1 binary operators'";
+            let decision = evaluate_message_guarded(
+                echo,
+                Dialect::Postgres,
+                QueryKind::Simple,
+                &rules,
+                policy,
+                crate::tcp::query_complexity::DEFAULT_MAX_BINARY_OPERATORS,
+            );
+            let message = match &decision {
+                TcpDecision::Forward {
+                    observation: Some(o),
+                    ..
+                } => o.parse_error.clone().unwrap_or_default(),
+                TcpDecision::Block { ast_node_path, .. } => ast_node_path.clone(),
+                TcpDecision::Forward { .. } => panic!("a parse error must be reported"),
+            };
+            assert!(
+                message.contains(crate::tcp::query_complexity::BINARY_OPERATOR_ERROR_PREFIX),
+                "the parser quotes the token: {message}"
+            );
+            assert!(!decision.is_lexical_complexity_refusal(), "{message}");
         }
     }
 

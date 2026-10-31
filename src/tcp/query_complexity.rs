@@ -20,8 +20,9 @@ use std::fmt;
 
 use vericto_engine::Dialect;
 
-/// Prefix of the parse-error message emitted by this guard. Telemetry uses it
-/// to avoid handing the same adversarial text to its sanitizer parser.
+/// Prefix of the parse-error message emitted by this guard. Recognizing a
+/// refusal takes the whole message, not this prefix: see
+/// [`TooManyBinaryOperators::from_message`].
 pub const BINARY_OPERATOR_ERROR_PREFIX: &str = "lexical complexity guard:";
 
 /// Stand-in reported for text refused before parsing. As with an oversized
@@ -49,6 +50,37 @@ impl fmt::Display for TooManyBinaryOperators {
             "{} more than {} binary operators in one unparenthesized expression (saw at least {}); raise VERICTO_MAX_BINARY_OPERATORS only for reviewed SQL",
             BINARY_OPERATOR_ERROR_PREFIX, self.limit, self.seen
         )
+    }
+}
+
+impl TooManyBinaryOperators {
+    /// The refusal `message` is, when it is exactly this guard's own message as
+    /// [`fmt::Display`] writes it, and `None` for any other text.
+    ///
+    /// The message is the only trace of a refusal on a decision, so it is
+    /// matched as the serialization of this type, not by a substring: a parser
+    /// error can quote the client's tokens, and a statement that merely spells
+    /// the prefix must still be reported as the parse error it is. The engine's
+    /// own parse errors start with their `VERICTO-` code, so none can equal it.
+    pub fn from_message(message: &str) -> Option<Self> {
+        let digits = |s: &str| -> Option<usize> {
+            if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            s.parse().ok()
+        };
+        let rest = message
+            .strip_prefix(BINARY_OPERATOR_ERROR_PREFIX)?
+            .strip_prefix(" more than ")?;
+        let (limit, rest) = rest.split_once(' ')?;
+        let rest =
+            rest.strip_prefix("binary operators in one unparenthesized expression (saw at least ")?;
+        let (seen, _) = rest.split_once(')')?;
+        let refusal = Self {
+            seen: digits(seen)?,
+            limit: digits(limit)?,
+        };
+        (refusal.to_string() == message).then_some(refusal)
     }
 }
 
@@ -422,6 +454,34 @@ mod tests {
         assert_eq!(err.seen, 3);
         assert_eq!(err.limit, 2);
         assert!(err.to_string().contains("VERICTO_MAX_BINARY_OPERATORS"));
+    }
+
+    #[test]
+    fn only_the_guards_exact_message_reads_back_as_a_refusal() {
+        let refusal = TooManyBinaryOperators {
+            seen: 10_001,
+            limit: 10_000,
+        };
+        assert_eq!(
+            TooManyBinaryOperators::from_message(&refusal.to_string()),
+            Some(refusal)
+        );
+        let exact = refusal.to_string();
+        for other in [
+            String::new(),
+            BINARY_OPERATOR_ERROR_PREFIX.to_string(),
+            format!("VERICTO-PARSE-ERROR: found: {exact}"),
+            format!("{exact} "),
+            format!("{exact}; and more"),
+            exact.replace("10000", "+10000"),
+            exact.replace("10001", ""),
+        ] {
+            assert_eq!(
+                TooManyBinaryOperators::from_message(&other),
+                None,
+                "{other}"
+            );
+        }
     }
 
     #[test]
