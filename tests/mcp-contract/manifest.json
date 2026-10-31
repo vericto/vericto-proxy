@@ -9,7 +9,7 @@
     "execute-sql-output.json": "structuredContent examples the open output schema accepts, with isError (§6.3)",
     "execute-sql-next-steps.json": "every M1 outcome and its status, error code, query-event execution_status and next steps (§6.4, §6.5, §14.2)",
     "errors.json": "every error code, which M1 can answer, and the answer status each one has (§6.5)",
-    "whoami-execution.json": "whoami's execution block: Proxy mode (local whoami) and Advisory (/mcp, /mcp/account) (§6.7)",
+    "whoami-execution.json": "whoami's execution block: Proxy mode (local whoami) and Advisory (/mcp, /mcp/account) (§6.7); Proxy mode without a control plane (`proxy_unlinked`, `proxy_unlinked_control_plane`) and the values of control_plane.mode and control_plane.ruleset (`control_plane_values`), added by vericto-proxy 4.21.0",
     "ingest-events.json": "query events the proxy reports with source mcp_proxy, and what the control plane stores (§14.1, §14.2)",
     "sync-mcp.json": "what GET /api/v1/sync/rules adds for a proxy in mcp mode (§9.11, §11.2, Q8)",
     "check-sql-next-steps.json": "check_sql's next steps in Proxy mode and on /mcp (the #536 verdictStep vocabulary, with the execute_sql hints of §6.7); added by vericto-proxy 4.21.0",

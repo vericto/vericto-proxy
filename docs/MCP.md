@@ -3,9 +3,15 @@
 `vericto-proxy mcp` is an [MCP](https://modelcontextprotocol.io) server that lets an AI
 agent (Claude Code, Cursor, Codex, any MCP client) read a PostgreSQL database
 **through Vericto**. The agent gets an `execute_sql` tool and no database credential.
-Every statement is evaluated against the workspace's rules first, and the server runs
-exactly what it evaluated, or the policy's own rewrite of it (masked columns, a `LIMIT`
-bound). What is checked is what runs.
+Every statement is evaluated against the rules first, and the server runs exactly what
+it evaluated, or the policy's own rewrite of it (masked columns, a `LIMIT` bound). What
+is checked is what runs.
+
+**No account is needed to try it**: without a control plane the server runs locally on
+Vericto's built-in ruleset, the same rules the TCP proxy runs standalone, and reports
+nothing anywhere ([Try it without an account](#try-it-without-an-account)). Linked to a
+Vericto workspace it applies the workspace's rules instead
+([Connect to Vericto](#connect-to-vericto)).
 
 It is the same binary and image as the TCP proxy, in a second mode, and it reuses the
 proxy's evaluator, masks, agent-access allowlists, business policies, signed rule sync,
@@ -17,8 +23,9 @@ reads only (the "read tier").
 > can run SQL around Vericto. The server warns when it sees such a credential in its
 > environment (see [Security](#security)).
 
+- [Try it without an account](#try-it-without-an-account)
+- [Connect to Vericto](#connect-to-vericto)
 - [How it works](#how-it-works)
-- [Set up (stdio): Claude Code, Cursor, Codex](#set-up-stdio-claude-code-cursor-codex)
 - [Set up (Streamable HTTP) for a team](#set-up-streamable-http-for-a-team)
 - [Tools](#tools)
 - [What execute_sql runs](#what-execute_sql-runs)
@@ -29,6 +36,193 @@ reads only (the "read tier").
 - [Security](#security)
 - [Configuration reference](#configuration-reference)
 - [What is not in this release](#what-is-not-in-this-release)
+
+## Try it without an account
+
+Five minutes, nothing to sign up for: the server runs **locally**, on Vericto's
+built-in ruleset.
+
+**1. A dedicated read-only role.** Create a role only this server uses:
+
+```sql
+CREATE ROLE vericto_agent_ro LOGIN PASSWORD '…';
+GRANT CONNECT ON DATABASE shop TO vericto_agent_ro;
+GRANT USAGE ON SCHEMA public TO vericto_agent_ro;
+GRANT SELECT ON ALL TABLES IN SCHEMA public TO vericto_agent_ro;
+ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO vericto_agent_ro;
+```
+
+Supabase, Neon, RDS and Cloud SQL all support such a role. On Supabase use the
+Supavisor pooler host (session mode, port 5432, or transaction mode, 6543).
+
+**2. The URL in a file, not in the agent's configuration.**
+
+```bash
+mkdir -p ~/.config/vericto && chmod 700 ~/.config/vericto
+printf '%s' 'postgres://vericto_agent_ro:…@db.example.com:5432/shop?sslmode=verify-full' \
+  > ~/.config/vericto/shop.url
+chmod 600 ~/.config/vericto/shop.url
+```
+
+TLS is `verify-full` by default for any host that is not loopback; `sslrootcert=` in the
+URL (or `UPSTREAM_SSLROOTCERT`) names a CA bundle when the provider's certificate is not
+publicly trusted. A database on your own machine (`localhost`, `127.0.0.1`) needs no TLS.
+
+**3. Register the server**, with the published image or a binary built from source.
+None of `VERICTO_API_KEY`, `VERICTO_DATABASE_ID` or `VERICTO_API_URL` is set: that is
+what makes it local.
+
+With Docker (Docker cannot read a `0600` file owned by your user as the image's own
+user, so the container runs as you):
+
+```bash
+claude mcp add vericto-db -- \
+  docker run -i --rm --user "$(id -u):$(id -g)" \
+    -v ~/.config/vericto/shop.url:/run/secrets/db.url:ro \
+    vericto/vericto-proxy:4.21.0 /usr/local/bin/vericto-proxy mcp --database-url-file /run/secrets/db.url
+```
+
+Cursor (`.cursor/mcp.json`) or any client that takes a command:
+
+```json
+{
+  "mcpServers": {
+    "vericto-db": {
+      "command": "docker",
+      "args": ["run", "-i", "--rm", "--user", "501:20",
+               "-v", "/Users/me/.config/vericto/shop.url:/run/secrets/db.url:ro",
+               "vericto/vericto-proxy:4.21.0", "/usr/local/bin/vericto-proxy", "mcp",
+               "--database-url-file", "/run/secrets/db.url"]
+    }
+  }
+}
+```
+
+From inside the container a database on your own machine is `host.docker.internal`,
+which is not loopback: put `?sslmode=disable` in the URL and add
+`-e VERICTO_MCP_ALLOW_PLAINTEXT_DB=true` (the traffic stays on your machine), or use a
+source build, which reaches `localhost` directly.
+
+From source (`cargo build --release --locked`, see
+[CONTRIBUTING.md](../CONTRIBUTING.md#run-from-source)):
+
+```bash
+claude mcp add vericto-db -- /path/to/vericto-proxy/target/release/vericto-proxy \
+  mcp --database-url-file ~/.config/vericto/shop.url
+```
+
+```json
+{
+  "mcpServers": {
+    "vericto-db": {
+      "command": "/path/to/vericto-proxy/target/release/vericto-proxy",
+      "args": ["mcp", "--database-url-file", "/Users/me/.config/vericto/shop.url"]
+    }
+  }
+}
+```
+
+Codex (`~/.codex/config.toml`):
+
+```toml
+[mcp_servers.vericto-db]
+command = "/path/to/vericto-proxy/target/release/vericto-proxy"
+args = ["mcp", "--database-url-file", "/Users/me/.config/vericto/shop.url"]
+```
+
+In stdio mode stdout carries protocol messages only; every log line goes to stderr,
+which MCP clients show in their server log. The process exits when the client closes
+stdin. Homebrew and npm packages for a one-line setup are planned; until then use the
+image or a source build.
+
+**4. Ask the agent to call `whoami`**, then `describe_schema`. `whoami` reports the local
+mode: `control_plane.mode: "none"`, `control_plane.ruleset: "built-in"`,
+`control_plane.reporting: false` and the warning `no_control_plane` in
+`execution.warnings`.
+
+**What the local mode is:**
+
+- **The rules**: the built-in ruleset (destructive statements, missing `WHERE`, risky
+  DDL, data exposure), the rules the TCP proxy runs without a control plane, with the
+  default enforcement policy. `check_sql` evaluates with the same rules.
+- **The same safety**: the read tier only, the exact-text guarantee, read-only twice,
+  the limits, sanitized database errors and TLS `verify-full` are those of a linked
+  server; nothing about them depends on an account.
+- **Nothing is reported**: no event, heartbeat or rule sync leaves the machine; the
+  server talks to your database only.
+- **No masks, allowlists, business policies or kill switch.** Without a dashboard there
+  is no kill switch to press: to stop the agent, remove the server from the client or
+  stop the process.
+- **HTTP needs its own tokens**: `--transport http` without a control plane does not
+  start unless `VERICTO_MCP_AUTH_TOKENS_FILE` lists at least one bearer token
+  ([Streamable HTTP](#set-up-streamable-http-for-a-team)); it is never served
+  unauthenticated.
+
+## Connect to Vericto
+
+A Vericto account adds what the local mode does not have: **custom rules**, **business
+policies**, **sensitive-column masking** and agent-access allowlists, an **audit** of
+every call (Dashboard → Queries), a **kill switch** and the **dashboard** to manage them.
+The server then evaluates with the workspace's rules, synced as signed bundles
+([The control plane](#the-control-plane)).
+
+Add the control-plane key (`VERICTO_API_KEY`, a runtime key with `rules:read`,
+`telemetry:write` and `sql:read`) and `VERICTO_DATABASE_ID` to the setup above.
+`VERICTO_API_URL` defaults to `https://api.vericto.com` when a key is set.
+
+Claude Code:
+
+```bash
+claude mcp add vericto-db \
+  -e VERICTO_API_KEY=vtro_... -e VERICTO_DATABASE_ID=<database id> -- \
+  docker run -i --rm --user "$(id -u):$(id -g)" -e VERICTO_API_KEY -e VERICTO_DATABASE_ID \
+    -v ~/.config/vericto/shop.url:/run/secrets/db.url:ro \
+    vericto/vericto-proxy:4.21.0 /usr/local/bin/vericto-proxy mcp --database-url-file /run/secrets/db.url
+```
+
+Cursor (`.cursor/mcp.json`):
+
+```json
+{
+  "mcpServers": {
+    "vericto-db": {
+      "command": "docker",
+      "args": ["run", "-i", "--rm", "--user", "501:20",
+               "-e", "VERICTO_API_KEY", "-e", "VERICTO_DATABASE_ID",
+               "-v", "/Users/me/.config/vericto/shop.url:/run/secrets/db.url:ro",
+               "vericto/vericto-proxy:4.21.0", "/usr/local/bin/vericto-proxy", "mcp",
+               "--database-url-file", "/run/secrets/db.url"],
+      "env": { "VERICTO_API_KEY": "vtro_...", "VERICTO_DATABASE_ID": "<database id>" }
+    }
+  }
+}
+```
+
+Codex, with a source build:
+
+```toml
+[mcp_servers.vericto-db]
+command = "/path/to/vericto-proxy/target/release/vericto-proxy"
+args = ["mcp", "--database-url-file", "/Users/me/.config/vericto/shop.url"]
+env = { VERICTO_API_KEY = "vtro_...", VERICTO_DATABASE_ID = "<database id>" }
+```
+
+`whoami` then reports `control_plane.mode: "linked"` and, once the first signed bundle
+is in force, `control_plane.ruleset: "signed_bundle"` (`rules_cache` when it came from
+the rules cache).
+
+**A configured control plane is never replaced by the built-in rules.** The server is
+linked as soon as `VERICTO_API_KEY` is set (`VERICTO_DATABASE_ID` may be left out, as
+for the TCP proxy: the workspace-level ruleset applies and nothing is reported), and
+then:
+
+- until a signed bundle (or the verified rules cache) is in force, `execute_sql` and
+  `describe_schema` answer `NOT_READY`, also when the control plane is unreachable or a
+  bundle fails the signature check; `whoami` shows `control_plane.ruleset: "none"`;
+- `VERICTO_API_URL` or `VERICTO_DATABASE_ID` without `VERICTO_API_KEY` is a startup
+  error, as are `VERICTO_API_KEY` with an empty `VERICTO_API_URL` and
+  `VERICTO_MCP_REQUIRE_CONTROL_PLANE=true` without a key: a process meant to be linked
+  never starts on the built-in rules.
 
 ## How it works
 
@@ -57,89 +251,6 @@ MCP client ──JSON-RPC (stdio or HTTP)──► vericto-proxy mcp ──Postg
   `src/mcp/control.rs`, with a test that fails if SQL appears anywhere else. It uses the
   low-level `postgres-protocol` encoders, not a full driver, which would send catalog
   lookups of its own.
-
-## Set up (stdio): Claude Code, Cursor, Codex
-
-**1. A dedicated read-only role.** Create a role only this server uses:
-
-```sql
-CREATE ROLE vericto_agent_ro LOGIN PASSWORD '…';
-GRANT CONNECT ON DATABASE shop TO vericto_agent_ro;
-GRANT USAGE ON SCHEMA public TO vericto_agent_ro;
-GRANT SELECT ON ALL TABLES IN SCHEMA public TO vericto_agent_ro;
-ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO vericto_agent_ro;
-```
-
-Supabase, Neon, RDS and Cloud SQL all support such a role. On Supabase use the
-Supavisor pooler host (session mode, port 5432, or transaction mode, 6543).
-
-**2. The URL in a file, not in the agent's configuration.**
-
-```bash
-mkdir -p ~/.config/vericto && chmod 700 ~/.config/vericto
-printf '%s' 'postgres://vericto_agent_ro:…@db.example.com:5432/shop?sslmode=verify-full' \
-  > ~/.config/vericto/shop.url
-chmod 600 ~/.config/vericto/shop.url
-```
-
-TLS is `verify-full` by default for any host that is not loopback; `sslrootcert=` in the
-URL (or `UPSTREAM_SSLROOTCERT`) names a CA bundle when the provider's certificate is not
-publicly trusted.
-
-**3. Register the server.** The control-plane key (`VERICTO_API_KEY`, a runtime key with
-`rules:read`, `telemetry:write` and `sql:read`) and `VERICTO_DATABASE_ID` link it to your
-workspace (rules, masks, allowlists, kill switch, Dashboard → Queries).
-`VERICTO_API_URL` defaults to `https://api.vericto.com` when a key is set.
-
-The examples run the published image. Docker cannot read a `0600` file owned by your
-user as the image's own user, so they run the container as you; a database on your own
-machine is `host.docker.internal` from inside the container.
-
-Claude Code:
-
-```bash
-claude mcp add vericto-db \
-  -e VERICTO_API_KEY=vtro_... -e VERICTO_DATABASE_ID=<database id> -- \
-  docker run -i --rm --user "$(id -u):$(id -g)" -e VERICTO_API_KEY -e VERICTO_DATABASE_ID \
-    -v ~/.config/vericto/shop.url:/run/secrets/db.url:ro \
-    vericto/vericto-proxy:4.21.0 /usr/local/bin/vericto-proxy mcp --database-url-file /run/secrets/db.url
-```
-
-Cursor (`.cursor/mcp.json`) or any client that takes a command:
-
-```json
-{
-  "mcpServers": {
-    "vericto-db": {
-      "command": "docker",
-      "args": ["run", "-i", "--rm", "--user", "501:20",
-               "-e", "VERICTO_API_KEY", "-e", "VERICTO_DATABASE_ID",
-               "-v", "/Users/me/.config/vericto/shop.url:/run/secrets/db.url:ro",
-               "vericto/vericto-proxy:4.21.0", "/usr/local/bin/vericto-proxy", "mcp",
-               "--database-url-file", "/run/secrets/db.url"],
-      "env": { "VERICTO_API_KEY": "vtro_...", "VERICTO_DATABASE_ID": "<database id>" }
-    }
-  }
-}
-```
-
-Codex (`~/.codex/config.toml`), with a binary built from source
-(`cargo build --release`, see [CONTRIBUTING.md](../CONTRIBUTING.md#run-from-source)):
-
-```toml
-[mcp_servers.vericto-db]
-command = "/path/to/vericto-proxy"
-args = ["mcp", "--database-url-file", "/Users/me/.config/vericto/shop.url"]
-env = { VERICTO_API_KEY = "vtro_...", VERICTO_DATABASE_ID = "<database id>" }
-```
-
-In stdio mode stdout carries protocol messages only; every log line goes to stderr,
-which MCP clients show in their server log. The process exits when the client closes
-stdin. Homebrew and npm packages for a one-line setup are planned; until then use the
-image or a source build.
-
-Then ask the agent to call `whoami` (database, tiers, limits, warnings) and
-`describe_schema`.
 
 ## Set up (Streamable HTTP) for a team
 
@@ -175,7 +286,8 @@ Clients connect with the URL and their own key:
   keys with `sql:read` by the SHA-256 of the key; a revoked key stops at the next sync
   (every 30 s in `mcp` mode). Without a control plane, list tokens in
   `VERICTO_MCP_AUTH_TOKENS_FILE` (one per line: the token itself, at least 32
-  characters, or `sha256:<hex>`, optionally followed by a name).
+  characters, or `sha256:<hex>`, optionally followed by a name); the HTTP mode does not
+  start without a control plane and at least one token there.
 - **TLS**: a listener on any address other than loopback needs `PROXY_TLS_MODE=require`
   with `PROXY_TLS_CERT`/`PROXY_TLS_KEY`, or `VERICTO_MCP_ALLOW_PLAINTEXT_HTTP=true`
   behind a TLS-terminating sidecar.
@@ -188,7 +300,7 @@ Clients connect with the URL and their own key:
 | `execute_sql` | Runs one read statement and returns its rows (below). `readOnlyHint: true` |
 | `describe_schema` | Tables and views the role can read, columns and types, primary and foreign keys; masked columns carry their mask and blocked ones `sensitive: block`. Under an enforced allowlist, only what the database user may read. Optional `schema`, `table` |
 | `check_sql` | Evaluates a script or pre-split queries without running them, as the hosted `check_sql` answers, **locally** (no CI checks are spent). Its hints point to `execute_sql` |
-| `whoami` | The database, the tiers (`read` only), the limits in force, the ruleset version, the identity calls are recorded under, and warnings about the setup |
+| `whoami` | The database, the tiers (`read` only), the limits in force, the ruleset version and where it comes from (`control_plane.mode`: `none` or `linked`; `control_plane.ruleset`: `built-in`, `signed_bundle`, `rules_cache`, or `none` while `NOT_READY`), the identity calls are recorded under, and warnings about the setup |
 | `list_rules`, `show_rule` | With the control-plane link only: the rules of the signed bundle in force |
 
 `execute_sql` input:
@@ -317,8 +429,9 @@ control plane that refuses the `mcp_proxy` source gets the same events as `sourc
 (the reporter falls back once and remembers). Over the monthly query quota enforcement
 continues and telemetry pauses, as for the TCP proxy.
 
-Without the link the server runs with the built-in ruleset (air-gapped use) and reports
-nothing: no masks, allowlists or kill switch, and `whoami` says so.
+Without the link the server runs locally with the built-in ruleset and reports nothing:
+no masks, allowlists or kill switch, and `whoami` says so
+([Try it without an account](#try-it-without-an-account)).
 
 ## Security
 
@@ -382,11 +495,11 @@ the variable.
 | `VERICTO_MCP_POOL_IDLE_SECS` | `300` | Idle connections are closed after it |
 | `VERICTO_MCP_SEARCH_PATH` | the role's (under an allowlist: its default schema) | Comma-separated schema names |
 | `VERICTO_MCP_RESULT_DETAIL` | `sanitized` | `sanitized` or `full` ([errors](#errors-and-next-steps)) |
-| `VERICTO_MCP_REQUIRE_CONTROL_PLANE` | `true` when linked | Refuse `execute_sql` until a signed bundle is loaded |
+| `VERICTO_MCP_REQUIRE_CONTROL_PLANE` | `true` when linked | Refuse `execute_sql` until a signed bundle is loaded; `true` without a control plane is a startup error |
 | `VERICTO_MCP_ALLOWED_HOSTS`, `VERICTO_MCP_ALLOWED_ORIGINS` | loopback | HTTP Host and Origin allow-lists |
 | `VERICTO_MCP_ALLOW_PLAINTEXT_HTTP` | `false` | HTTP on a non-loopback address without `PROXY_TLS_MODE=require` |
-| `VERICTO_MCP_AUTH_TOKENS_FILE` | — | HTTP bearer tokens accepted besides the bundle's keys |
-| `VERICTO_API_KEY`, `VERICTO_DATABASE_ID` | — | The control-plane link |
+| `VERICTO_MCP_AUTH_TOKENS_FILE` | — | HTTP bearer tokens accepted besides the bundle's keys; required for HTTP without a control plane |
+| `VERICTO_API_KEY`, `VERICTO_DATABASE_ID` | — | The control-plane link; none of the three set is the [local mode](#try-it-without-an-account), `VERICTO_API_URL` or `VERICTO_DATABASE_ID` without a key a startup error |
 | `VERICTO_API_URL` | `https://api.vericto.com` when a key is set | |
 | `VERICTO_RULES_SYNC_INTERVAL_SECS` | `30` in `mcp` mode | At least 30 |
 | `VERICTO_POLICY_RULES` | `enforce` in `mcp` mode | `enforce` or `observe` |

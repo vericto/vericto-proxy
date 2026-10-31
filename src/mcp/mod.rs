@@ -14,6 +14,11 @@
 //!   access, business policies), rule sync with signed bundles (the signature
 //!   is always required in this mode), the rules cache, the kill switch,
 //!   telemetry (events tagged `source: mcp_proxy`) and the upstream TLS.
+//! * Without a control plane (none of `VERICTO_API_URL`, `VERICTO_API_KEY`,
+//!   `VERICTO_DATABASE_ID` set) it runs **local**: the built-in ruleset the
+//!   TCP proxy runs standalone, nothing reported, no kill switch, HTTP only
+//!   with `VERICTO_MCP_AUTH_TOKENS_FILE`. A control plane that is configured
+//!   is never replaced by the built-in rules ([`control_plane_intent`]).
 //! * The TCP listener is off in this mode.
 
 pub mod check;
@@ -105,6 +110,73 @@ pub fn policy_mode(raw: Option<&str>) -> Result<PolicyRulesMode, String> {
     }
 }
 
+/// The variables that configure the control-plane link.
+pub const CONTROL_PLANE_VARS: [&str; 3] =
+    ["VERICTO_API_URL", "VERICTO_API_KEY", "VERICTO_DATABASE_ID"];
+
+/// Whether `lookup` (flags over the environment, [`layered`]) configures a
+/// control plane: `Ok(false)` when none of [`CONTROL_PLANE_VARS`] is set (the
+/// local mode), `Ok(true)` when `VERICTO_API_KEY` is. As for the TCP proxy,
+/// `VERICTO_DATABASE_ID` may be left out (the workspace-level ruleset, no
+/// events) and `VERICTO_API_URL` defaults in this mode. `VERICTO_API_URL` or
+/// `VERICTO_DATABASE_ID` without a key is an error: that process was meant to
+/// be linked, and starting it on the built-in rules would weaken it silently.
+/// An empty value counts as unset, as on the TCP path.
+pub fn control_plane_intent(lookup: &dyn Fn(&str) -> Option<String>) -> Result<bool, String> {
+    let set = |k: &str| lookup(k).is_some_and(|v| !v.trim().is_empty());
+    if set("VERICTO_API_KEY") {
+        return Ok(true);
+    }
+    let partial: Vec<&str> = CONTROL_PLANE_VARS
+        .iter()
+        .copied()
+        .filter(|k| set(k))
+        .collect();
+    if partial.is_empty() {
+        return Ok(false);
+    }
+    Err(format!(
+        "{} {} set but VERICTO_API_KEY is not: the control plane is only partly configured. \
+         Set VERICTO_API_KEY (and VERICTO_DATABASE_ID) to link this server to your Vericto \
+         workspace, or unset {} to run locally with the built-in ruleset",
+        partial.join(" and "),
+        if partial.len() == 1 { "is" } else { "are" },
+        partial.join(" and "),
+    ))
+}
+
+/// The startup checks of the local mode (no control plane): a requirement of
+/// one cannot be met, and an HTTP listener needs its own bearer tokens (it is
+/// never served unauthenticated).
+pub fn check_local_mode(
+    transport: Transport,
+    require_control_plane: Option<bool>,
+    local_tokens: usize,
+) -> Result<(), String> {
+    if require_control_plane == Some(true) {
+        return Err(
+            "VERICTO_MCP_REQUIRE_CONTROL_PLANE=true but no control plane is configured: set \
+             VERICTO_API_KEY and VERICTO_DATABASE_ID, or unset it to run locally with the \
+             built-in ruleset"
+                .to_string(),
+        );
+    }
+    if transport == Transport::Http && local_tokens == 0 {
+        return Err(
+            "HTTP mode without a control plane needs bearer tokens: list at least one in \
+             VERICTO_MCP_AUTH_TOKENS_FILE (one per line: a token of 32 characters or more, or \
+             sha256:<hex>, optionally followed by a name). The HTTP listener is never served \
+             unauthenticated"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+/// The one-line note on what an account adds, for the local mode.
+pub const ACCOUNT_NOTE: &str = "A Vericto account adds custom rules, business policies, \
+sensitive-column masking, audit and the dashboard (docs/MCP.md, Connect to Vericto).";
+
 fn fail(msg: &str) -> ! {
     tracing::error!("{msg}");
     eprintln!("vericto-proxy mcp: {msg}");
@@ -154,10 +226,21 @@ pub async fn run(args: Vec<String>) {
         Ok(m) => m,
         Err(e) => fail(&e),
     };
+    let configured = match control_plane_intent(&lookup) {
+        Ok(c) => c,
+        Err(e) => fail(&e),
+    };
     let control_plane = match crate::config::ControlPlaneConfig::from_lookup(&lookup) {
         Ok(cp) => cp,
         Err(e) => fail(&e),
     };
+    if configured && control_plane.is_none() {
+        // A key with an empty VERICTO_API_URL: configured, but not usable.
+        fail(
+            "VERICTO_API_KEY is set but VERICTO_API_URL is empty: unset VERICTO_API_URL (it \
+             defaults to https://api.vericto.com) or set it to your control plane",
+        );
+    }
     let shared = Shared::built_in();
     let mut warnings = Vec::new();
 
@@ -188,13 +271,9 @@ pub async fn run(args: Vec<String>) {
     let mut shutdown_flush = None;
     let (telemetry, linked, database_id, process_key) = match control_plane {
         None => {
-            tracing::warn!(
-                "Control-plane link disabled (set VERICTO_API_KEY and VERICTO_DATABASE_ID): the \
-                 built-in ruleset only, no masks, allowlists, kill switch or reporting"
-            );
             warnings.push(json!({
                 "code": "no_control_plane",
-                "message": "no control-plane link: the built-in ruleset only, without the workspace's rules, masks, allowlists, kill switch or reporting",
+                "message": "no control plane (local mode): the built-in ruleset only, without the workspace's rules, masks, allowlists, kill switch or reporting",
             }));
             (None, false, None, None)
         }
@@ -297,6 +376,21 @@ pub async fn run(args: Vec<String>) {
         },
         None => Vec::new(),
     };
+    if !linked {
+        if let Err(e) =
+            check_local_mode(cfg.transport, cfg.require_control_plane, local_tokens.len())
+        {
+            fail(&e);
+        }
+        tracing::info!(
+            mode = "local",
+            control_plane = "none",
+            ruleset = "built-in",
+            "Local mode: no control plane is configured, so the built-in ruleset applies (the \
+             rules the TCP proxy runs standalone), read tier only, and nothing is reported \
+             anywhere. No masks, allowlists or dashboard kill switch. {ACCOUNT_NOTE}"
+        );
+    }
     let rt = Arc::new(Runtime {
         pool: pool::Pool::new(
             cfg.database.clone(),
@@ -347,16 +441,14 @@ pub async fn run(args: Vec<String>) {
                 Ok(t) => t,
                 Err(e) => fail(&e),
             };
-            if rt.local_tokens.is_empty() && !rt.linked {
-                tracing::warn!(
-                    "HTTP mode with no control plane and no VERICTO_MCP_AUTH_TOKENS_FILE: every request is refused (401)"
-                );
-            }
             let listener = match tokio::net::TcpListener::bind(rt.cfg.listen).await {
                 Ok(l) => l,
                 Err(e) => fail(&format!("cannot listen on {}: {e}", rt.cfg.listen)),
             };
-            tracing::info!(listen = %rt.cfg.listen, tls = tls.is_some(), "MCP Streamable HTTP listening on /mcp");
+            // The bound address, not the configured one: with port 0 it names
+            // the port the OS picked (tests/mcp_local.rs reads it from here).
+            let bound = listener.local_addr().unwrap_or(rt.cfg.listen);
+            tracing::info!(listen = %bound, tls = tls.is_some(), "MCP Streamable HTTP listening on /mcp");
             if let Some(port) =
                 lookup("VERICTO_HEALTHZ_PORT").and_then(|p| p.trim().parse::<u16>().ok())
             {
@@ -418,5 +510,98 @@ fn http_tls(
             }
             Ok(None)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn env(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> + use<> {
+        let map: HashMap<String, String> = pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        layered(HashMap::new(), move |k: &str| map.get(k).cloned())
+    }
+
+    #[test]
+    fn no_control_plane_variable_is_the_local_mode() {
+        assert_eq!(control_plane_intent(&env(&[])), Ok(false));
+        // Empty values count as unset, as on the TCP path.
+        let e = env(&[
+            ("VERICTO_API_URL", ""),
+            ("VERICTO_API_KEY", " "),
+            ("VERICTO_DATABASE_ID", ""),
+        ]);
+        assert_eq!(control_plane_intent(&e), Ok(false));
+    }
+
+    #[test]
+    fn a_key_configures_the_control_plane_as_on_the_tcp_path() {
+        // The key alone: VERICTO_API_URL defaults in mcp mode; without
+        // VERICTO_DATABASE_ID the workspace-level ruleset applies (TCP rule).
+        let e = env(&[("VERICTO_API_KEY", "vtro_x")]);
+        assert_eq!(control_plane_intent(&e), Ok(true));
+        assert_eq!(e("VERICTO_API_URL").as_deref(), Some(DEFAULT_API_URL));
+        let cp = crate::config::ControlPlaneConfig::from_lookup(&e)
+            .unwrap()
+            .unwrap();
+        assert!(cp.database_id.is_none());
+        for pairs in [
+            &[("VERICTO_API_KEY", "vtro_x"), ("VERICTO_DATABASE_ID", "db")][..],
+            &[
+                ("VERICTO_API_KEY", "vtro_x"),
+                ("VERICTO_API_URL", "https://api.example.com"),
+                ("VERICTO_DATABASE_ID", "db"),
+            ][..],
+        ] {
+            assert_eq!(control_plane_intent(&env(pairs)), Ok(true), "{pairs:?}");
+        }
+    }
+
+    #[test]
+    fn a_partial_control_plane_is_a_startup_error() {
+        for (pairs, named) in [
+            (
+                &[("VERICTO_DATABASE_ID", "db")][..],
+                &["VERICTO_DATABASE_ID"][..],
+            ),
+            (
+                &[("VERICTO_API_URL", "https://api.vericto.com")][..],
+                &["VERICTO_API_URL"][..],
+            ),
+            (
+                &[
+                    ("VERICTO_API_URL", "https://api.vericto.com"),
+                    ("VERICTO_DATABASE_ID", "db"),
+                    ("VERICTO_API_KEY", ""),
+                ][..],
+                &["VERICTO_API_URL", "VERICTO_DATABASE_ID"][..],
+            ),
+        ] {
+            let err = control_plane_intent(&env(pairs)).unwrap_err();
+            for n in named {
+                assert!(err.contains(n), "{err}");
+            }
+            assert!(err.contains("VERICTO_API_KEY is not"), "{err}");
+        }
+        // The --database-id flag counts like the variable.
+        let flags = HashMap::from([("VERICTO_DATABASE_ID".to_string(), "db".to_string())]);
+        let e = layered(flags, |_: &str| None);
+        assert!(control_plane_intent(&e).is_err());
+    }
+
+    #[test]
+    fn the_local_mode_requires_tokens_over_http_and_no_control_plane() {
+        assert!(check_local_mode(Transport::Stdio, None, 0).is_ok());
+        assert!(check_local_mode(Transport::Stdio, Some(false), 0).is_ok());
+        let e = check_local_mode(Transport::Http, None, 0).unwrap_err();
+        assert!(e.contains("VERICTO_MCP_AUTH_TOKENS_FILE"), "{e}");
+        assert!(e.contains("never served unauthenticated"), "{e}");
+        assert!(check_local_mode(Transport::Http, None, 1).is_ok());
+        let e = check_local_mode(Transport::Stdio, Some(true), 0).unwrap_err();
+        assert!(e.contains("VERICTO_MCP_REQUIRE_CONTROL_PLANE"), "{e}");
+        assert!(check_local_mode(Transport::Http, Some(true), 3).is_err());
     }
 }
