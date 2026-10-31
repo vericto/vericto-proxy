@@ -90,8 +90,33 @@ answers every statement exactly as in 4.20.0. See [docs/MCP.md](docs/MCP.md).
   sent the same events as `source: mcp` (once detected, for the life of the process).
 - **A principal signal `mcp_credential`** (strong) in the `principals` section, matched by
   the key an MCP call presents; a TCP session never has one.
+- **Try it without an account: the local mode.** With none of `VERICTO_API_URL`,
+  `VERICTO_API_KEY` and `VERICTO_DATABASE_ID` set, `vericto-proxy mcp` starts on the
+  built-in ruleset the TCP proxy runs standalone, read tier only, with every safety of a
+  linked server (exact text, read-only twice, limits, sanitized errors, TLS
+  `verify-full`), and sends nothing anywhere (no event, heartbeat or sync). The startup
+  log says so (`mode=local`); `whoami` reports `control_plane.mode: "none"`,
+  `control_plane.ruleset: "built-in"` and `control_plane.reporting: false` (new fields,
+  also `ruleset: "signed_bundle"`, `"rules_cache"`, or `"none"` while `NOT_READY` when
+  linked; `whoami-execution.json` gains `proxy_unlinked_control_plane` and
+  `control_plane_values`); the server instructions and `whoami` say once that an account
+  adds custom rules, business policies, sensitive-column masking, audit and the
+  dashboard. There is no dashboard kill switch in this mode. `docs/MCP.md` starts with a
+  quick start without an account (Claude Code, Cursor, Codex; Docker or a source build),
+  then "Connect to Vericto".
 
 ### Security
+
+- **A configured control plane is never replaced by the built-in rules** in `mcp` mode.
+  `VERICTO_API_KEY` links the server (`VERICTO_DATABASE_ID` optional, as on the TCP
+  path); it then answers `NOT_READY` until a signed bundle or the verified rules cache is
+  in force, also when the control plane is unreachable or a bundle fails the signature
+  check. `VERICTO_API_URL` or `VERICTO_DATABASE_ID` without a key, a key with an empty
+  `VERICTO_API_URL`, and `VERICTO_MCP_REQUIRE_CONTROL_PLANE=true` without a key are
+  startup errors (the TCP proxy keeps its behaviour: it runs standalone).
+- **HTTP without a control plane needs bearer tokens**: `--transport http` in the local
+  mode does not start unless `VERICTO_MCP_AUTH_TOKENS_FILE` lists at least one token
+  (before, it started and refused every request).
 
 - **Parsing on a large stack.** In `mcp` mode every parse of agent text runs on a thread
   with a large stack (reserved, committed as touched), at most 8 at a time, and

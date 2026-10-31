@@ -1,5 +1,5 @@
 {
-  "description": "whoami's `execution` block (docs/design/mcp-proxy-mode.md \u00a76.7). `proxy_stdio` and `proxy_http` are what `vericto-proxy mcp` answers locally (M1: labels and taint are null until M1.4, allowance is Gateway only); `advisory` is what /mcp and /mcp/account answer today for a workspace with one database named shop (postgres).",
+  "description": "whoami's `execution` block (docs/design/mcp-proxy-mode.md \u00a76.7). `proxy_stdio` and `proxy_http` are what `vericto-proxy mcp` answers locally (M1: labels and taint are null until M1.4, allowance is Gateway only); `advisory` is what /mcp and /mcp/account answer today for a workspace with one database named shop (postgres). `proxy_unlinked` is the local mode (no control plane configured: the built-in ruleset, nothing reported); `proxy_unlinked_control_plane` is the `control_plane` object whoami answers next to it, and `control_plane_values` lists the values of its `mode` and `ruleset` (added by vericto-proxy 4.21.0).",
   "proxy_stdio": {
     "mode": "proxy",
     "databases": [
@@ -97,6 +97,15 @@
       "no_control_plane"
     ]
   },
+  "proxy_unlinked_control_plane": {
+    "mode": "none",
+    "linked": false,
+    "ruleset": "built-in",
+    "reporting": false,
+    "bundle": "none",
+    "signature_required": true,
+    "trusted_keys": false
+  },
   "advisory_input": [
     {
       "name": "shop",
@@ -130,5 +139,17 @@
     "agent_environment_has_db_credentials",
     "no_control_plane",
     "rules_from_cache"
-  ]
+  ],
+  "control_plane_values": {
+    "mode": [
+      "none",
+      "linked"
+    ],
+    "ruleset": [
+      "built-in",
+      "signed_bundle",
+      "rules_cache",
+      "none"
+    ]
+  }
 }

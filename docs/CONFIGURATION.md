@@ -739,4 +739,9 @@ shared ones in that mode: `UPSTREAM_SSLMODE` is `verify-full` for any host that 
 loopback, `VERICTO_RULES_SYNC_INTERVAL_SECS` is 30, `VERICTO_MAX_QUERY_BYTES` is 64 KiB
 (at most 1 MiB) and `VERICTO_POLICY_RULES` is `enforce`; every sync bundle must be signed.
 `VERICTO_API_URL` defaults to `https://api.vericto.com` when `VERICTO_API_KEY` is set.
-The TCP listener is off in that mode. See [MCP.md](MCP.md#configuration-reference).
+With none of `VERICTO_API_URL`, `VERICTO_API_KEY` and `VERICTO_DATABASE_ID` set it runs
+locally on the built-in ruleset, as the TCP proxy does without a control plane; unlike
+the TCP proxy, `VERICTO_API_URL` or `VERICTO_DATABASE_ID` without a key is a startup
+error in that mode. The TCP listener is off in that mode. See
+[MCP.md](MCP.md#try-it-without-an-account) and
+[MCP.md](MCP.md#configuration-reference).

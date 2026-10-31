@@ -144,8 +144,10 @@ pub fn help_text() -> String {
     s.push_str(
         "\nThe database: VERICTO_MCP_DATABASE_URL_FILE (preferred), VERICTO_MCP_DATABASE_URL, or\n\
          UPSTREAM_HOST/UPSTREAM_PORT/UPSTREAM_USER/UPSTREAM_PASSWORD_FILE/UPSTREAM_DBNAME.\n\
-         The control plane: VERICTO_API_KEY and VERICTO_DATABASE_ID (VERICTO_API_URL defaults\n\
-         to https://api.vericto.com when a key is set).\n",
+         The control plane (optional): VERICTO_API_KEY and VERICTO_DATABASE_ID (VERICTO_API_URL\n\
+         defaults to https://api.vericto.com when a key is set). With none of the three set the\n\
+         server runs locally on the built-in ruleset and reports nothing; HTTP mode then needs\n\
+         VERICTO_MCP_AUTH_TOKENS_FILE.\n",
     );
     s
 }

@@ -227,22 +227,31 @@ the block. Lifting the block restores the session at the following sync. See
 
 `vericto-proxy mcp` (4.21.0) is an MCP server for AI agents: Claude Code, Cursor,
 Codex or any MCP client gets an `execute_sql` tool and **no database credential**.
-Each statement is evaluated against the workspace's rules, masks and allowlists, and
-the server runs exactly what it evaluated (or the policy's rewrite of it) on
-PostgreSQL, read-only, in a transaction that always rolls back, with row, size and time
-caps. `describe_schema`, a local `check_sql` and `whoami` come with it. Over stdio for a
-developer's machine, or Streamable HTTP for a team:
+Each statement is evaluated first, and the server runs exactly what it evaluated (or
+the policy's rewrite of it) on PostgreSQL, read-only, in a transaction that always rolls
+back, with row, size and time caps. `describe_schema`, a local `check_sql` and `whoami`
+come with it. Over stdio for a developer's machine, or Streamable HTTP for a team.
+
+**Try it without an account.** With no control plane configured it runs locally on the
+built-in ruleset (the rules the TCP proxy runs standalone) and reports nothing:
 
 ```bash
-claude mcp add vericto-db -e VERICTO_API_KEY=vtro_... -e VERICTO_DATABASE_ID=<id> -- \
-  docker run -i --rm --user "$(id -u):$(id -g)" -e VERICTO_API_KEY -e VERICTO_DATABASE_ID \
+claude mcp add vericto-db -- \
+  docker run -i --rm --user "$(id -u):$(id -g)" \
     -v ~/.config/vericto/shop.url:/run/secrets/db.url:ro \
     vericto/vericto-proxy:4.21.0 /usr/local/bin/vericto-proxy mcp --database-url-file /run/secrets/db.url
 ```
 
+**Connect to Vericto** for custom rules, business policies, sensitive-column masking,
+audit and the dashboard: add `-e VERICTO_API_KEY=vtro_... -e VERICTO_DATABASE_ID=<id>`
+(and pass both into the container). A configured control plane is never replaced by the
+built-in rules: until its first signed bundle is in force the server answers
+`NOT_READY`.
+
 What is checked is what runs, **provided the agent has no other credential for the
-database**: the server warns when its environment exposes one. Setup for each client,
-the HTTP mode, the limits and the security notes are in [docs/MCP.md](docs/MCP.md).
+database**: the server warns when its environment exposes one. Setup for each client
+(with or without an account), the HTTP mode, the limits and the security notes are in
+[docs/MCP.md](docs/MCP.md).
 
 ---
 

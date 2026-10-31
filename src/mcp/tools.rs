@@ -245,7 +245,7 @@ fn base_tools(rt: &Runtime) -> Value {
         {
             "name": "whoami",
             "title": "Who am I",
-            "description": "This server's database (name, dialect), the permission tiers enabled (read only), the result limits, the ruleset version (an earlier verdict holds while it is unchanged), the identity calls are recorded under, and warnings about the setup.",
+            "description": "This server's database (name, dialect), the permission tiers enabled (read only), the result limits, the ruleset version (an earlier verdict holds while it is unchanged), whether a Vericto control plane is linked or the server runs locally on the built-in ruleset, the identity calls are recorded under, and warnings about the setup.",
             "inputSchema": { "type": "object", "properties": {} },
             "outputSchema": open_output(&["execution"], json!({
                 "ruleset_version": { "type": "string" },
@@ -264,6 +264,28 @@ pub const EXECUTION_WARNINGS: &[&str] = &[
     "no_control_plane",
     "rules_from_cache",
 ];
+
+/// `whoami.control_plane.mode`: `none` (the local mode) or `linked`
+/// (whoami-execution.json, `control_plane_values`).
+#[cfg(test)]
+pub const CONTROL_PLANE_MODES: &[&str] = &["none", "linked"];
+
+/// `whoami.control_plane.ruleset`: where the rules in force come from.
+/// `none` while `execute_sql` answers `NOT_READY`.
+#[cfg(test)]
+pub const RULESET_SOURCES: &[&str] = &["built-in", "signed_bundle", "rules_cache", "none"];
+
+/// Where the rules in force come from (one of [`RULESET_SOURCES`]).
+pub fn ruleset_source(rt: &Runtime) -> &'static str {
+    if rt.not_ready() {
+        return "none";
+    }
+    match rt.shared.watch.origin() {
+        BundleOrigin::None => "built-in",
+        BundleOrigin::Cache => "rules_cache",
+        BundleOrigin::Sync => "signed_bundle",
+    }
+}
 
 /// `whoami`: the hosted tool's fields where they apply, and the `execution`
 /// block of whoami-execution.json.
@@ -350,7 +372,10 @@ pub fn whoami(rt: &Runtime, caller: &Caller) -> ToolOutput {
         "identity": identity,
         "client": { "name": caller.client.name, "version": caller.client.version },
         "control_plane": {
+            "mode": if rt.linked { "linked" } else { "none" },
             "linked": rt.linked,
+            "ruleset": ruleset_source(rt),
+            "reporting": rt.telemetry.is_some(),
             "bundle": match rt.shared.watch.origin() {
                 BundleOrigin::None => "none",
                 BundleOrigin::Cache => "cache",
@@ -364,9 +389,15 @@ pub fn whoami(rt: &Runtime, caller: &Caller) -> ToolOutput {
         "next_step": next_step,
     });
     let mut text = format!(
-        "Proxy mode · database {} (postgres) · tiers: read {read}, write/delete/ddl off · ruleset {}\nLimits: {} rows (max {}), {} bytes, {} bytes per value, {} ms timeout.",
+        "Proxy mode · {} · database {} (postgres) · tiers: read {read}, write/delete/ddl off · ruleset {} ({})\nLimits: {} rows (max {}), {} bytes, {} bytes per value, {} ms timeout.",
+        if rt.linked {
+            "linked to a Vericto control plane"
+        } else {
+            "local (no control plane)"
+        },
         rt.database_name(),
         rt.ruleset_version(),
+        ruleset_source(rt),
         l.max_rows,
         l.max_rows_cap,
         l.max_result_bytes,
@@ -378,6 +409,12 @@ pub fn whoami(rt: &Runtime, caller: &Caller) -> ToolOutput {
             "\nWarning ({}): {}",
             w["code"].as_str().unwrap_or(""),
             w["message"].as_str().unwrap_or("")
+        ));
+    }
+    if !rt.linked {
+        text.push_str(&format!(
+            "\nLocal mode: Vericto's built-in ruleset, nothing reported anywhere, no dashboard kill switch. {}",
+            crate::mcp::ACCOUNT_NOTE
         ));
     }
     text.push_str(&format!("\nNext: {next_step}"));

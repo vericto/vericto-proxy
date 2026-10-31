@@ -643,6 +643,73 @@ async fn whoami_execution_matches_the_contract() {
     assert_eq!(w.structured["execution"], doc["proxy_stdio"]);
 }
 
+/// The local mode's `control_plane` object, and the values of its `mode` and
+/// `ruleset`, are the contract's (whoami-execution.json).
+#[test]
+fn whoami_control_plane_matches_the_contract() {
+    let doc = fixture("whoami-execution.json");
+    let values = &doc["control_plane_values"];
+    assert_eq!(
+        values["mode"],
+        json!(crate::mcp::tools::CONTROL_PLANE_MODES)
+    );
+    assert_eq!(values["ruleset"], json!(crate::mcp::tools::RULESET_SOURCES));
+    let url = "postgres://u:p@127.0.0.1:1/db";
+    // Local: no control plane configured.
+    let (rt, _) = fake_pg::runtime(url, Shared::built_in(), Opts::default());
+    let mut local = Arc::try_unwrap(rt).ok().unwrap();
+    local.trusted_keys = false;
+    local.process_key = None;
+    local.database_id = None;
+    let rt = Arc::new(local);
+    let w = crate::mcp::tools::whoami(&rt, &fake_pg::caller(&rt));
+    let cp = &w.structured["control_plane"];
+    for (k, v) in doc["proxy_unlinked_control_plane"].as_object().unwrap() {
+        assert_eq!(&cp[k], v, "control_plane.{k}: {cp}");
+    }
+    assert!(w.structured["identity"].is_null(), "no key, no identity");
+    assert!(w.structured["kill_switch"].is_null());
+    assert!(w.text.contains("local (no control plane)"), "{}", w.text);
+    assert!(w.text.contains(crate::mcp::ACCOUNT_NOTE), "{}", w.text);
+    let init = crate::mcp::server::instructions(&rt);
+    assert_eq!(
+        init.matches("A Vericto account adds").count(),
+        1,
+        "mentioned once: {init}"
+    );
+    assert!(init.contains("built-in ruleset"), "{init}");
+    // Linked, no bundle yet: NOT_READY, no rules in force, no account note.
+    let (rt, _) = fake_pg::runtime(
+        url,
+        Shared::built_in(),
+        Opts {
+            require_control_plane: true,
+            ..Opts::default()
+        },
+    );
+    let w = crate::mcp::tools::whoami(&rt, &fake_pg::caller(&rt));
+    assert_eq!(w.structured["control_plane"]["mode"], "linked");
+    assert_eq!(w.structured["control_plane"]["ruleset"], "none");
+    assert!(!w.text.contains(crate::mcp::ACCOUNT_NOTE));
+    assert!(
+        !crate::mcp::server::instructions(&rt).contains("A Vericto account adds"),
+        "linked: no account note"
+    );
+    // Linked, a signed bundle in force.
+    let shared = Shared::built_in();
+    shared.watch.record_for_tests("v", None);
+    let (rt, _) = fake_pg::runtime(
+        url,
+        shared,
+        Opts {
+            require_control_plane: true,
+            ..Opts::default()
+        },
+    );
+    let w = crate::mcp::tools::whoami(&rt, &fake_pg::caller(&rt));
+    assert_eq!(w.structured["control_plane"]["ruleset"], "signed_bundle");
+}
+
 #[test]
 fn ingest_events_of_the_contract_are_the_proxys_event_shape() {
     let doc = fixture("ingest-events.json");
