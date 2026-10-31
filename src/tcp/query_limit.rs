@@ -36,16 +36,15 @@
 use crate::tcp::codec_mysql::MYSQL_MAX_PACKET_LEN;
 use vericto_engine::Dialect;
 
-/// Default ceiling: 10 MiB, about 3.8 s of evaluation at the rate in the table
-/// above (about 2.4 s at the 0.23 ms/KB measured end to end).
+/// Default ceiling: 1 MiB, about 0.36 s of evaluation at the rate in the table
+/// above (about 0.24 s at the 0.23 ms/KB measured end to end).
 ///
-/// Chosen to clear realistic large statements rather than to minimise latency.
-/// The shapes that legitimately get big are batch inserts and long `IN` lists —
-/// 100 000 UUIDs in an `IN` list is roughly 3.8 MB, a 5 000-row insert across 20
-/// columns roughly 2 MB — so this leaves headroom over both. Rejecting a
-/// customer's ETL is a worse outcome than evaluating it slowly, which is why the
-/// default errs high and the knob exists.
-pub const DEFAULT_MAX_QUERY_BYTES: usize = 10 * 1024 * 1024;
+/// This covers ordinary ORM traffic, migrations and analytical queries while
+/// bounding the CPU one statement can occupy on the 0.25-vCPU production task.
+/// Batch loaders and generated SQL that legitimately need more can raise
+/// `VERICTO_MAX_QUERY_BYTES` up to the wire-protocol cap. MCP mode keeps its
+/// stricter 64 KiB default.
+pub const DEFAULT_MAX_QUERY_BYTES: usize = 1024 * 1024;
 
 /// Hard ceiling per wire protocol: the point past which the codec already
 /// refuses the message, so configuring beyond it changes nothing.
@@ -90,6 +89,36 @@ fn max_query_bytes_from(raw: Option<&str>) -> usize {
                     "VERICTO_MAX_QUERY_BYTES is not a positive integer; using the default"
                 );
                 DEFAULT_MAX_QUERY_BYTES
+            }
+        },
+    }
+}
+
+/// Read `VERICTO_MAX_BINARY_OPERATORS`, falling back to the 10,000-operator
+/// lexical guard. Resolved once at startup, never per statement.
+pub fn configured_max_binary_operators() -> usize {
+    max_binary_operators_from(
+        std::env::var("VERICTO_MAX_BINARY_OPERATORS")
+            .ok()
+            .as_deref(),
+    )
+}
+
+/// [`configured_max_binary_operators`] for an injected value. Shared with MCP
+/// configuration, whose tests use an injected environment lookup.
+pub(crate) fn max_binary_operators_from(raw: Option<&str>) -> usize {
+    use crate::tcp::query_complexity::DEFAULT_MAX_BINARY_OPERATORS;
+    match raw {
+        None => DEFAULT_MAX_BINARY_OPERATORS,
+        Some(raw) => match raw.trim().parse::<usize>() {
+            Ok(v) if v > 0 => v,
+            _ => {
+                tracing::warn!(
+                    value = %raw,
+                    default = DEFAULT_MAX_BINARY_OPERATORS,
+                    "VERICTO_MAX_BINARY_OPERATORS is not a positive integer; using the default"
+                );
+                DEFAULT_MAX_BINARY_OPERATORS
             }
         },
     }
@@ -284,6 +313,7 @@ mod tests {
 
     #[test]
     fn the_default_fits_under_every_cap() {
+        assert_eq!(DEFAULT_MAX_QUERY_BYTES, 1024 * 1024);
         for dialect in [
             Dialect::Postgres,
             Dialect::Mysql,
@@ -362,6 +392,23 @@ mod tests {
             assert_eq!(
                 max_query_bytes_from(Some(bad)),
                 DEFAULT_MAX_QUERY_BYTES,
+                "{bad:?} must fall back"
+            );
+        }
+    }
+
+    #[test]
+    fn the_operator_limit_is_configurable_and_bad_values_fall_back() {
+        use crate::tcp::query_complexity::DEFAULT_MAX_BINARY_OPERATORS;
+        assert_eq!(
+            max_binary_operators_from(None),
+            DEFAULT_MAX_BINARY_OPERATORS
+        );
+        assert_eq!(max_binary_operators_from(Some(" 25000 \n")), 25_000);
+        for bad in ["", "0", "-1", "10k", "1e4"] {
+            assert_eq!(
+                max_binary_operators_from(Some(bad)),
+                DEFAULT_MAX_BINARY_OPERATORS,
                 "{bad:?} must fall back"
             );
         }

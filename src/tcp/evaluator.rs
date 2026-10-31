@@ -85,8 +85,28 @@ impl TcpDecision {
             access_denied,
         }
     }
-}
 
+    /// True only for a statement the lexical guard refused before parsing.
+    /// Telemetry uses this to avoid feeding the adversarial text to its own
+    /// sanitizer parser after evaluation correctly skipped it.
+    pub(crate) fn is_lexical_complexity_refusal(&self) -> bool {
+        let has_prefix = |message: &str| {
+            message.contains(crate::tcp::query_complexity::BINARY_OPERATOR_ERROR_PREFIX)
+        };
+        match self {
+            TcpDecision::Forward {
+                observation: Some(observation),
+                ..
+            } => observation.parse_error.as_deref().is_some_and(has_prefix),
+            TcpDecision::Block {
+                rule_code,
+                ast_node_path,
+                ..
+            } => rule_code == "VERICTO-PARSE-ERROR" && has_prefix(ast_node_path),
+            _ => false,
+        }
+    }
+}
 /// A block raised by the proxy itself because the rewrite of a statement
 /// (`rewritten`, when the engine returned one) cannot be enforced as the
 /// engine described it: never the original instead. A mask (or no rewrite at
@@ -371,6 +391,98 @@ pub fn evaluate_message_with(
         _ => evaluate(sql, dialect, rules, policy),
     };
     checked_for_kind(decision, sql, dialect, kind)
+}
+
+/// [`evaluate_message_with`] behind the proxy's linear-time lexical complexity
+/// guard. This is the entry point for untrusted statement text on both TCP and
+/// MCP paths; keeping the unguarded function lets evaluator unit tests exercise
+/// the engine adapter directly.
+///
+/// A rejected chain is deliberately a normal parse error, not a new rule: the
+/// statement has no trustworthy AST. Therefore `parse_error: block`, a block or
+/// mask sensitive-column policy, an enforced allowlist, and enforced business
+/// policies still fail closed; the default forwards it with a parse-error flag.
+pub fn evaluate_message_with_guard(
+    sql: &str,
+    dialect: Dialect,
+    kind: QueryKind,
+    rules: &[Rule],
+    policy: &EnforcementPolicy,
+    policies: Option<&PolicyEval<'_>>,
+    max_binary_operators: usize,
+) -> TcpDecision {
+    match crate::tcp::query_complexity::check_binary_operator_chains(
+        sql,
+        dialect,
+        max_binary_operators,
+    ) {
+        Ok(()) => evaluate_message_with(sql, dialect, kind, rules, policy, policies),
+        Err(e) => lexical_parse_error(dialect, kind, rules, policy, policies, e.to_string()),
+    }
+}
+
+/// The guarded form without business policies.
+pub fn evaluate_message_guarded(
+    sql: &str,
+    dialect: Dialect,
+    kind: QueryKind,
+    rules: &[Rule],
+    policy: &EnforcementPolicy,
+    max_binary_operators: usize,
+) -> TcpDecision {
+    evaluate_message_with_guard(
+        sql,
+        dialect,
+        kind,
+        rules,
+        policy,
+        None,
+        max_binary_operators,
+    )
+}
+
+/// Resolve a lexical refusal through exactly the path a parser failure takes.
+///
+/// The engine owns the policy-sensitive parse-error semantics, including
+/// principal-aware business policies. Rather than duplicate them here (and let
+/// them drift), evaluate a fixed, tiny syntax error and replace only its error
+/// text. The adversarial statement never reaches a parser. `SELECT (` is invalid
+/// in every dialect this proxy serves, and tests pin that assumption.
+fn lexical_parse_error(
+    dialect: Dialect,
+    kind: QueryKind,
+    rules: &[Rule],
+    policy: &EnforcementPolicy,
+    policies: Option<&PolicyEval<'_>>,
+    message: String,
+) -> TcpDecision {
+    const TINY_SYNTAX_ERROR: &str = "SELECT (";
+    let mut decision =
+        evaluate_message_with(TINY_SYNTAX_ERROR, dialect, kind, rules, policy, policies);
+    let path = format!("PARSE_ERROR: {message}");
+    match &mut decision {
+        TcpDecision::Forward {
+            observation: Some(observation),
+            ..
+        } if observation.rule_code == "VERICTO-PARSE-ERROR" => {
+            observation.ast_node_path = path;
+            observation.parse_error = Some(message);
+        }
+        TcpDecision::Block {
+            rule_code,
+            ast_node_path,
+            ..
+        } if rule_code == "VERICTO-PARSE-ERROR" => {
+            *ast_node_path = path;
+        }
+        _ => {
+            // A policy finding may accompany a parse-error observation, but the
+            // existing merge keeps the parse error as the winner. If that contract
+            // changes, never hide this refusal silently.
+            tracing::error!("lexical complexity guard did not resolve as VERICTO-PARSE-ERROR");
+        }
+    }
+    decision
 }
 
 /// The decision for any outcome of `evaluate_with_context`, a parse error
@@ -1438,6 +1550,79 @@ mod tests {
             }
             TcpDecision::Forward { .. } => {
                 panic!("parse-error fail-closed must Block, not Forward")
+            }
+        }
+    }
+
+    #[test]
+    fn lexical_complexity_uses_the_normal_parse_error_policy() {
+        let sql = "SELECT 1+1+1+1";
+        let rules = default_ruleset();
+        let open = evaluate_message_guarded(
+            sql,
+            Dialect::Postgres,
+            QueryKind::Simple,
+            &rules,
+            &EnforcementPolicy::default(),
+            2,
+        );
+        match open {
+            TcpDecision::Forward {
+                observation: Some(o),
+                ..
+            } => {
+                assert_eq!(o.rule_code, "VERICTO-PARSE-ERROR");
+                assert!(
+                    o.parse_error
+                        .as_deref()
+                        .is_some_and(|e| e.contains("VERICTO_MAX_BINARY_OPERATORS"))
+                );
+            }
+            _ => panic!("the fail-open default must forward with a parse-error flag"),
+        }
+
+        let closed = EnforcementPolicy {
+            parse_error: ParseErrorAction::Block,
+            ..EnforcementPolicy::default()
+        };
+        match evaluate_message_guarded(
+            sql,
+            Dialect::Postgres,
+            QueryKind::Simple,
+            &rules,
+            &closed,
+            2,
+        ) {
+            TcpDecision::Block {
+                rule_code,
+                ast_node_path,
+                ..
+            } => {
+                assert_eq!(rule_code, "VERICTO-PARSE-ERROR");
+                assert!(ast_node_path.contains("VERICTO_MAX_BINARY_OPERATORS"));
+            }
+            _ => panic!("parse_error=block must reject the lexical refusal"),
+        }
+    }
+
+    #[test]
+    fn lexical_complexity_guard_works_for_both_wire_dialects() {
+        let rules = default_ruleset();
+        for dialect in [Dialect::Postgres, Dialect::Mysql] {
+            let decision = evaluate_message_guarded(
+                "SELECT 1+1+1",
+                dialect,
+                QueryKind::Simple,
+                &rules,
+                &EnforcementPolicy::default(),
+                1,
+            );
+            match decision {
+                TcpDecision::Forward {
+                    observation: Some(o),
+                    ..
+                } => assert_eq!(o.rule_code, "VERICTO-PARSE-ERROR", "{dialect:?}"),
+                _ => panic!("{dialect:?}: expected a flagged parse error"),
             }
         }
     }

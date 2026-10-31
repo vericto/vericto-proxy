@@ -129,9 +129,21 @@ answers every statement exactly as in 4.20.0. See [docs/MCP.md](docs/MCP.md).
   instead of on the blocking pool's 2 MiB threads; the async runtime's threads get an
   8 MiB stack. Verdicts are unchanged. A statement that could not be given a thread is
   not forwarded and its session ends.
+- **Linear pre-parse complexity guard.** Before either SQL parser sees untrusted text,
+  the proxy counts binary operators in each unparenthesized expression and stops at
+  operator 10,001 by default (`VERICTO_MAX_BINARY_OPERATORS`). This bounds a
+  left-associative expression whose parse time grows quadratically, independently of
+  statement size. Strings, quoted identifiers and ordinary comments do not count;
+  MySQL executable comments do. A refusal is `VERICTO-PARSE-ERROR`, so the existing
+  fail-closed / fail-open policy decides whether it is blocked or forwarded with a flag.
+  Both TCP protocols and MCP `check_sql` / `execute_sql` use the guard.
 
 ### Changed
 
+- **The TCP default of `VERICTO_MAX_QUERY_BYTES` is 1 MiB, down from 10 MiB.**
+  Ordinary ORM traffic, migrations and analytical queries fit; a batch loader or
+  generated query that legitimately needs more can raise the variable up to the
+  protocol cap. MCP mode keeps its 64 KiB default.
 - `TelemetryEvent` gains optional MCP fields (omitted on every TCP event, so a TCP
   event's JSON is what 4.20.0 sent); the principal map, the rule sync and the telemetry
   reporter gain the hooks `mcp` mode uses, each a no-op on the TCP path.

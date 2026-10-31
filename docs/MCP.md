@@ -362,6 +362,7 @@ repository's tests and by the control plane's.
 | Statement time | 15 s | 60 s | `VERICTO_MCP_STATEMENT_TIMEOUT_MS`, `…_CAP_MS`, `timeout_ms` | `TIMEOUT` |
 | Lock wait | 2 s | 10 s | `VERICTO_MCP_LOCK_TIMEOUT_MS` | `DATABASE_ERROR` 55P03 |
 | Statement size | 64 KiB | 1 MiB | `VERICTO_MAX_QUERY_BYTES` | `INVALID_INPUT` |
+| Binary operators in one unparenthesized expression | 10,000 | configurable | `VERICTO_MAX_BINARY_OPERATORS` | parse-error policy (`check_sql`: flag by default; `execute_sql`: unreadable, so refused) |
 
 The control plane sends the database's limits in the bundle; a value lower than this
 process's applies, a higher one never does. Rows are fetched with `Execute{max_rows+1}`,

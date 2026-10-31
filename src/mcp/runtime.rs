@@ -15,7 +15,9 @@ use vericto_engine::{Dialect, EnforcementPolicy, SensitivePolicy};
 use crate::mcp::config::{McpConfig, Transport};
 use crate::mcp::identity::{self, Identity};
 use crate::mcp::pool::Pool;
-use crate::tcp::evaluator::{PolicyEval, TcpDecision, evaluate_message, evaluate_message_with};
+use crate::tcp::evaluator::{
+    PolicyEval, TcpDecision, evaluate_message_guarded, evaluate_message_with_guard,
+};
 use crate::tcp::kill_switch::{KillBlock, SharedKillSwitch};
 use crate::tcp::policy_rules::{
     PolicyRulesMode, PolicyTelemetry, SessionSignals, SharedPolicyRules,
@@ -358,7 +360,7 @@ impl Runtime {
             }
             let ctx = crate::tcp::policy_rules::at_now(&ctx);
             let rules = bundle.rules.as_ref().unwrap_or(&rules);
-            let d = evaluate_message_with(
+            let d = evaluate_message_with_guard(
                 sql,
                 Dialect::Postgres,
                 kind,
@@ -369,11 +371,19 @@ impl Runtime {
                     policies: &bundle.policies,
                     ctx: &ctx,
                 }),
+                self.cfg.max_binary_operators,
             );
             (d, Some(Arc::new(telemetry)))
         } else {
             (
-                evaluate_message(sql, Dialect::Postgres, kind, &rules, &policy),
+                evaluate_message_guarded(
+                    sql,
+                    Dialect::Postgres,
+                    kind,
+                    &rules,
+                    &policy,
+                    self.cfg.max_binary_operators,
+                ),
                 None,
             )
         };

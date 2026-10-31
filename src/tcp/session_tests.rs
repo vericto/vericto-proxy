@@ -12,7 +12,7 @@
 use std::sync::Arc;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use vericto_engine::EnforcementPolicy;
+use vericto_engine::{EnforcementPolicy, ParseErrorAction};
 
 use super::sensitive_tests::{
     Wire, config_with, cstr, events, first_query_reaching_db, my_cmd, my_err,
@@ -68,6 +68,21 @@ fn session_limited(proto: Box<dyn WireProtocol>, limit: usize, monitor_mode: boo
     };
     let (cfg, queue) = proxy_config(policy, Some(limit));
     wire_with(proto, cfg, queue)
+}
+
+fn session_operator_limited(proto: Box<dyn WireProtocol>, limit: usize, fail_closed: bool) -> Wire {
+    let policy = EnforcementPolicy {
+        parse_error: if fail_closed {
+            ParseErrorAction::Block
+        } else {
+            ParseErrorAction::AllowReport
+        },
+        ..EnforcementPolicy::default()
+    };
+    let (cfg, queue) = proxy_config(policy, None);
+    let mut cfg = Arc::into_inner(cfg).expect("unshared config");
+    cfg.max_binary_operators = limit;
+    wire_with(proto, Arc::new(cfg), queue)
 }
 
 fn pg_msg(tag: u8, body: &[u8]) -> Vec<u8> {
@@ -312,6 +327,50 @@ async fn pg_oversized_query_in_monitor_mode_is_forwarded_unevaluated() {
     assert_eq!(ev[0]["rule_code"], OVERSIZE_RULE_CODE);
 }
 
+/// The lexical guard takes the ordinary fail-open parse-error path: the valid
+/// statement is forwarded unchanged, but it is explicitly reported as a parse
+/// error. A following query proves the session remains usable.
+#[tokio::test]
+async fn pg_operator_chain_fail_open_is_forwarded_and_flagged() {
+    let sql = "SELECT 1+1+1+1";
+    let mut w = session_operator_limited(Box::new(PostgresProtocol), 2, false);
+    w.client.write_all(&pg_query(sql)).await.unwrap();
+    assert_eq!(cstr(&read_pg(&mut w.db).await.body), sql);
+    assert_eq!(first_query_reaching_db(&mut w).await, "SELECT 1");
+
+    let ev = events(&w.queue);
+    assert_eq!(ev.len(), 2);
+    assert_eq!(ev[0]["status"], "PARSE_ERROR");
+    assert_eq!(ev[0]["rule_code"], "VERICTO-PARSE-ERROR");
+    assert!(
+        ev[0]["parse_error_message"]
+            .as_str()
+            .is_some_and(|e| e.contains("VERICTO_MAX_BINARY_OPERATORS")),
+        "{}",
+        ev[0]
+    );
+}
+
+/// Under the normal fail-closed policy the same lexical refusal blocks a
+/// prepared statement and swallows Bind/Execute until Sync, exactly as a parser
+/// error does. No bytes from the refused sequence reach the database.
+#[tokio::test]
+async fn pg_operator_chain_fail_closed_blocks_parse_until_sync() {
+    let sql = "SELECT 1+1+1+1";
+    let mut w = session_operator_limited(Box::new(PostgresProtocol), 2, true);
+    for m in [
+        pg_parse("long", sql, &[]),
+        pg_bind("long"),
+        pg_execute(),
+        pg_sync(),
+    ] {
+        w.client.write_all(&m).await.unwrap();
+    }
+    let msg = pg_expect_block(&mut w, "VERICTO-PARSE-ERROR").await;
+    assert!(msg.contains("VERICTO_MAX_BINARY_OPERATORS"), "{msg}");
+    assert_eq!(first_query_reaching_db(&mut w).await, "SELECT 1");
+}
+
 // ── MySQL: the daily path ────────────────────────────────────────────────────
 
 /// COM_QUERY: allowed SQL reaches the database; dangerous SQL gets an ERR_Packet
@@ -381,6 +440,18 @@ async fn mysql_query_size_limit_refuses_one_byte_over() {
     assert_eq!(my_first_query_reaching_db(&mut w).await, "SELECT 1");
 }
 
+#[tokio::test]
+async fn mysql_operator_chain_uses_the_same_parse_error_policy() {
+    let sql = "SELECT 1+1+1+1";
+    let mut w = session_operator_limited(Box::new(MysqlProtocol), 2, false);
+    w.client.write_all(&my_cmd(COM_QUERY, sql)).await.unwrap();
+    assert_eq!(my_sql(&read_my(&mut w.db).await), sql);
+    assert_eq!(my_first_query_reaching_db(&mut w).await, "SELECT 1");
+    let ev = events(&w.queue);
+    assert_eq!(ev[0]["status"], "PARSE_ERROR");
+    assert_eq!(ev[0]["rule_code"], "VERICTO-PARSE-ERROR");
+}
+
 // ── Where a statement is evaluated (4.19.0) ──────────────────────────────────
 
 /// Up to the threshold (never above its ceiling) the evaluation runs on the
@@ -434,7 +505,7 @@ fn assert_deep_then_allowed(ev: &[serde_json::Value]) {
 #[tokio::test]
 async fn pg_a_deeply_nested_statement_gets_a_verdict() {
     let deep = deep_statement(64 * 1024);
-    let mut w = session(Box::new(PostgresProtocol));
+    let mut w = session_operator_limited(Box::new(PostgresProtocol), usize::MAX, false);
     w.client.write_all(&pg_query(&deep)).await.unwrap();
     let q = read_pg(&mut w.db).await;
     assert_eq!(q.tag, b'Q');
@@ -455,7 +526,7 @@ async fn pg_a_deeply_nested_statement_gets_a_verdict() {
 #[tokio::test]
 async fn mysql_a_deeply_nested_statement_gets_a_verdict() {
     let deep = deep_statement(256 * 1024);
-    let mut w = session(Box::new(MysqlProtocol));
+    let mut w = session_operator_limited(Box::new(MysqlProtocol), usize::MAX, false);
     for cmd in [COM_QUERY, COM_STMT_PREPARE] {
         w.client.write_all(&my_cmd(cmd, &deep)).await.unwrap();
         let p = read_my(&mut w.db).await;

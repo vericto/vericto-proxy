@@ -42,13 +42,25 @@ fn input_error(message: &str) -> ToolOutput {
 /// are single tokens), cut at `;`. `whole_script` when the scanner cannot
 /// read it or the parser says one statement spans what the scanner split
 /// (a procedural body), as the hosted tool does.
-pub fn split_script(sql: &str) -> (Vec<(u32, String)>, &'static str) {
+pub fn split_script(sql: &str, max_binary_operators: usize) -> (Vec<(u32, String)>, &'static str) {
     let line_of =
         |offset: usize| -> u32 { sql[..offset.min(sql.len())].matches('\n').count() as u32 + 1 };
     let whole = || {
         let first = sql.len() - sql.trim_start().len();
         (vec![(line_of(first), sql.to_string())], "whole_script")
     };
+    // `split_with_parser` below is a parser call, so the lexical complexity
+    // guard must run before even splitting a script. Returning it whole lets
+    // Runtime::evaluate produce the normal parse-error verdict and telemetry.
+    if crate::tcp::query_complexity::check_binary_operator_chains(
+        sql,
+        vericto_engine::Dialect::Postgres,
+        max_binary_operators,
+    )
+    .is_err()
+    {
+        return whole();
+    }
     let Ok(scan) = pg_query::scan(sql) else {
         return whole();
     };
@@ -97,7 +109,7 @@ pub fn check_sql(rt: &Arc<Runtime>, caller: &Caller, args: &Value) -> ToolOutput
     }
     let (statements, evaluated_as) = match (args.get("sql"), args.get("queries")) {
         (Some(Value::String(sql)), None) => {
-            let (s, how) = split_script(sql);
+            let (s, how) = split_script(sql, rt.cfg.max_binary_operators);
             if s.is_empty() {
                 return input_error(
                     "The script has no SQL statements (only whitespace or comments).",
@@ -301,7 +313,8 @@ mod tests {
 
     #[test]
     fn scripts_split_with_their_lines() {
-        let (s, how) = split_script("SELECT 1;\n-- c\nSELECT ';';\n\n  DELETE FROM t");
+        let max = crate::tcp::query_complexity::DEFAULT_MAX_BINARY_OPERATORS;
+        let (s, how) = split_script("SELECT 1;\n-- c\nSELECT ';';\n\n  DELETE FROM t", max);
         assert_eq!(how, "statements");
         assert_eq!(
             s,
@@ -313,11 +326,23 @@ mod tests {
         );
         let (s, how) = split_script(
             "CREATE FUNCTION f() RETURNS int LANGUAGE plpgsql AS $$ BEGIN RETURN 1; END $$;",
+            max,
         );
         assert_eq!(how, "statements");
         assert_eq!(s.len(), 1);
-        let (s, how) = split_script("CREATE PROCEDURE p() BEGIN ATOMIC SELECT 1; SELECT 2; END;");
+        let (s, how) = split_script(
+            "CREATE PROCEDURE p() BEGIN ATOMIC SELECT 1; SELECT 2; END;",
+            max,
+        );
         assert_eq!(how, "whole_script");
         assert_eq!(s.len(), 1);
+    }
+
+    #[test]
+    fn an_operator_chain_is_returned_whole_without_parser_splitting() {
+        let sql = "\n\n SELECT 1+1+1+1";
+        let (statements, how) = split_script(sql, 2);
+        assert_eq!(how, "whole_script");
+        assert_eq!(statements, vec![(3, sql.to_string())]);
     }
 }

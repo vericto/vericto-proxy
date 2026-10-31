@@ -22,6 +22,7 @@ pub mod pg_response;
 pub mod policy_rules;
 pub mod postgres;
 pub mod protocol;
+pub mod query_complexity;
 pub mod query_limit;
 pub mod session;
 pub mod tx_state;
@@ -223,6 +224,7 @@ pub async fn run_pg_proxy(
             query_limit::configured_max_query_bytes(),
             vericto_engine::Dialect::Postgres,
         ),
+        max_binary_operators: query_limit::configured_max_binary_operators(),
         inline_eval_max_bytes: query_limit::configured_inline_eval_max_bytes(),
         trivial_fast_path: opts.trivial_fast_path,
         policy_rules: policy_runtime(&opts, policy_rules),
@@ -320,6 +322,7 @@ pub async fn run_mysql_proxy(
             query_limit::configured_max_query_bytes(),
             vericto_engine::Dialect::Mysql,
         ),
+        max_binary_operators: query_limit::configured_max_binary_operators(),
         inline_eval_max_bytes: query_limit::configured_inline_eval_max_bytes(),
         trivial_fast_path: opts.trivial_fast_path,
         policy_rules: policy_runtime(&opts, policy_rules),

@@ -309,6 +309,8 @@ pub struct McpConfig {
     pub requested_tiers_above_read: Vec<String>,
     /// `VERICTO_MAX_QUERY_BYTES` (clamped as for the TCP proxy).
     pub max_query_bytes: usize,
+    /// `VERICTO_MAX_BINARY_OPERATORS`, shared with the TCP proxy.
+    pub max_binary_operators: usize,
     /// Settings the operator wrote that this release ignores, for a warning.
     pub warnings: Vec<String>,
 }
@@ -486,6 +488,9 @@ impl McpConfig {
             }
             Some(v) => v.max(1024),
         };
+        let max_binary_operators = crate::tcp::query_limit::max_binary_operators_from(
+            env("VERICTO_MAX_BINARY_OPERATORS").as_deref(),
+        );
 
         Ok(Self {
             transport,
@@ -506,6 +511,7 @@ impl McpConfig {
             allow_md5: flag(env, "VERICTO_MCP_ALLOW_MD5").unwrap_or(false),
             requested_tiers_above_read,
             max_query_bytes,
+            max_binary_operators,
             warnings,
         })
     }
@@ -867,6 +873,18 @@ mod tests {
         assert_eq!(c.limits, Limits::default());
         assert_eq!(c.transport, Transport::Stdio);
         assert_eq!(c.listen.to_string(), "127.0.0.1:8808");
+        assert_eq!(
+            c.max_binary_operators,
+            crate::tcp::query_complexity::DEFAULT_MAX_BINARY_OPERATORS
+        );
+        let env = lookup(&[
+            ("VERICTO_MCP_DATABASE_URL", "postgres://u:p@localhost/x"),
+            ("VERICTO_MAX_BINARY_OPERATORS", "25000"),
+        ]);
+        assert_eq!(
+            McpConfig::from_lookup(&env).unwrap().max_binary_operators,
+            25_000
+        );
     }
 
     #[test]

@@ -67,6 +67,9 @@ pub struct PgProxyConfig {
     /// Largest query this proxy will evaluate, already clamped to what the wire
     /// protocol can deliver. Resolved once at startup — see `tcp::query_limit`.
     pub max_query_bytes: usize,
+    /// Most binary operators accepted in one unparenthesized expression before
+    /// parsing. Resolved once at startup (`VERICTO_MAX_BINARY_OPERATORS`).
+    pub max_binary_operators: usize,
     /// Statements of at most this many bytes are evaluated on the session's own
     /// task, larger ones on a thread of their own (`crate::stack`); 0 sends every
     /// statement there (`VERICTO_INLINE_EVAL_MAX_BYTES`, since 4.19.0, at most
@@ -951,6 +954,7 @@ pub(crate) fn build_event(
     // to placeholders before any query text leaves the customer network. Rule
     // evaluation already happened on the full query — this only affects reporting.
     let sanitized = mode == TelemetryQueryMode::Sanitized;
+    let lexical_refusal = decision.is_lexical_complexity_refusal();
     let reported = |text: &str| -> String {
         if sanitized {
             sanitize_for(text, dialect)
@@ -1103,7 +1107,15 @@ pub(crate) fn build_event(
         })
         .collect();
 
-    let reported_sql = reported(sql);
+    // The lexical guard refused this text precisely so no parser sees it. The
+    // sanitized telemetry path normally parses once more; report the same kind
+    // of size-only marker as the oversize guard instead, in raw mode too. This
+    // both preserves the CPU bound and avoids exporting text never evaluated.
+    let reported_sql = if lexical_refusal {
+        crate::tcp::query_complexity::refusal_marker(sql.len())
+    } else {
+        reported(sql)
+    };
     let (query_text, rewritten_query) = match rewritten {
         Some(r) => {
             let (o, r) = crate::telemetry::truncate_reported_pair(&reported_sql, &reported(r));
@@ -1885,6 +1897,46 @@ mod tests {
     }
 
     #[test]
+    fn lexical_refusal_never_reparses_or_reports_the_statement() {
+        let sql = format!("SELECT {}1", "1+".repeat(10_001));
+        let decision = crate::tcp::evaluator::evaluate_message_guarded(
+            &sql,
+            Dialect::Postgres,
+            crate::tcp::protocol::QueryKind::Simple,
+            &crate::tcp::evaluator::default_ruleset(),
+            &vericto_engine::EnforcementPolicy::default(),
+            10_000,
+        );
+        for mode in [
+            crate::tcp::rules_sync::TelemetryQueryMode::Raw,
+            crate::tcp::rules_sync::TelemetryQueryMode::Sanitized,
+        ] {
+            let ev = build_event(
+                "db1",
+                &sql,
+                Dialect::Postgres,
+                &decision,
+                10,
+                mode,
+                &EventIdentity::default(),
+                chrono::Utc::now(),
+            );
+            assert_eq!(ev.status, "PARSE_ERROR");
+            assert!(
+                ev.query_text.contains(&sql.len().to_string()),
+                "{}",
+                ev.query_text
+            );
+            assert!(
+                ev.query_text.contains("text not reported"),
+                "{}",
+                ev.query_text
+            );
+            assert!(!ev.query_text.contains("1+1"), "{}", ev.query_text);
+        }
+    }
+
+    #[test]
     fn telemetry_parse_error_message_is_bounded() {
         let decision = TcpDecision::Forward {
             violations: Vec::new(),
@@ -2267,6 +2319,7 @@ mod tests {
             )),
             telemetry: None,
             max_query_bytes: crate::tcp::query_limit::DEFAULT_MAX_QUERY_BYTES,
+            max_binary_operators: crate::tcp::query_complexity::DEFAULT_MAX_BINARY_OPERATORS,
             inline_eval_max_bytes: crate::tcp::query_limit::DEFAULT_INLINE_EVAL_MAX_BYTES,
             trivial_fast_path: true,
             policy_rules: Default::default(),
