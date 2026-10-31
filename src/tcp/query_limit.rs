@@ -40,10 +40,9 @@ use vericto_engine::Dialect;
 /// above (about 0.24 s at the 0.23 ms/KB measured end to end).
 ///
 /// This covers ordinary ORM traffic, migrations and analytical queries while
-/// bounding the CPU one statement can occupy on the 0.25-vCPU production task.
-/// Batch loaders and generated SQL that legitimately need more can raise
-/// `VERICTO_MAX_QUERY_BYTES` up to the wire-protocol cap. MCP mode keeps its
-/// stricter 64 KiB default.
+/// bounding the CPU one statement can occupy. Batch loaders and generated SQL
+/// that legitimately need more can raise `VERICTO_MAX_QUERY_BYTES` up to the
+/// wire-protocol cap. MCP mode keeps its stricter 64 KiB default.
 pub const DEFAULT_MAX_QUERY_BYTES: usize = 1024 * 1024;
 
 /// Hard ceiling per wire protocol: the point past which the codec already

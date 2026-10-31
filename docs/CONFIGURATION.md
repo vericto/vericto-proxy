@@ -259,7 +259,19 @@ hop; `PROXY_TLS_MODE` covers the client→proxy hop.
 | Variable                          | Default             | Description                                                        |
 |-----------------------------------|---------------------|--------------------------------------------------------------------|
 | `VERICTO_MAX_QUERY_BYTES`         | `1048576` (1 MiB)  | Largest statement the TCP proxy evaluates                          |
-| `VERICTO_MAX_BINARY_OPERATORS`    | `10000`             | Most binary operators in one unparenthesized expression            |
+| `VERICTO_MAX_BINARY_OPERATORS`    | `10000`             | 4.22.0+. Most binary operators in one unparenthesized expression   |
+
+> **Behavior change in 4.22.0.** The TCP default of `VERICTO_MAX_QUERY_BYTES` is
+> 1 MiB, down from 10 MiB: a statement between 1 MiB and 10 MiB that 4.21.0
+> evaluated is now refused with `VERICTO-QUERY-TOO-LARGE` (blocked under
+> enforcement, forwarded unevaluated in `monitor_mode`). Set
+> `VERICTO_MAX_QUERY_BYTES=10485760` to restore the previous value. Also new in
+> 4.22.0: a long generated `OR` or `CASE WHEN` chain, more than 10,000 operators
+> in one expression (roughly 5,000 `col = value OR …` terms), is refused before
+> parsing as a `VERICTO-PARSE-ERROR`: blocked under fail-closed, forwarded with a
+> flag under the fail-open default. Raise `VERICTO_MAX_BINARY_OPERATORS` only for
+> reviewed SQL, or send such a list as `col IN (…)` or `col = ANY($1)`, whose
+> commas separate the terms.
 
 Evaluation runs before the query reaches the database, and its cost grows with the
 statement's size. On the measurements in `src/tcp/query_limit.rs` it takes about
@@ -282,8 +294,8 @@ The refusal is a normal `VERICTO-PARSE-ERROR`: `parse_error: block`, a blocking/
 sensitive-column policy, an enforced allowlist or an applicable enforced business policy
 blocks it; the fail-open default forwards it with a flag. The scanner stops at operator
 10,001, before the adversarial tail is read by a parser. Raw and sanitized telemetry
-report only the statement's byte length for this refusal; the text was never evaluated
-and is not sent through the sanitizer parser.
+and the proxy's log report only the statement's byte length for this refusal; the text
+was never evaluated and is not sent through the sanitizer parser.
 
 A size value larger than the wire protocol can carry is clamped, with a warning: 64 MiB
 for PostgreSQL, 16 MiB − 1 byte for MySQL. A value that is not a positive integer falls

@@ -128,8 +128,7 @@ fn scan(
     // The normal path stays allocation-free through 32 open parentheses; only
     // more deeply nested input needs the overflow vector. Commas start another
     // expression at the current depth. Closing a parenthesis resumes the outer
-    // parenthesis resumes the outer expression, so `(a)+(b)+(c)` counts its two
-    // outer `+`s.
+    // expression, so `(a)+(b)+(c)` counts its two outer `+`s.
     let mut parents = [0usize; 32];
     let mut overflow = Vec::new();
     let mut depth = 0usize;
