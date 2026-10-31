@@ -290,8 +290,10 @@ The rest is optional and documented in
   [several proxies on one volume](docs/CONFIGURATION.md#several-proxies-on-one-volume).
 - **[TLS](docs/CONFIGURATION.md#tls-optional)** on each hop, client→proxy and
   proxy→database. On MySQL, TLS must be on both hops or neither.
-- **[Query size limit](docs/CONFIGURATION.md#query-size-limit)**
-  (`VERICTO_MAX_QUERY_BYTES`, 10 MiB by default).
+- **[Query admission limits](docs/CONFIGURATION.md#query-size-limit)**:
+  `VERICTO_MAX_QUERY_BYTES` (1 MiB by default on TCP; MCP stays at 64 KiB) and a
+  linear pre-parse guard against expressions with more than 10,000 binary operators
+  (`VERICTO_MAX_BINARY_OPERATORS`).
 - **[Business policy rules](docs/CONFIGURATION.md#business-policy-rules-preview-off-by-default)**
   (`VERICTO_POLICY_RULES`, `off` by default): a preview, off unless you turn it
   on; with it off the proxy skips principal-aware policy evaluation. PostgreSQL

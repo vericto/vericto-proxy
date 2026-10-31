@@ -408,6 +408,48 @@ fn without_a_control_plane_the_local_mode_runs_on_the_built_in_rules() {
     assert_eq!(db.count_users(), 2, "nothing was written");
 }
 
+#[test]
+fn operator_guard_reaches_both_mcp_tool_outcomes_before_database_io() {
+    let home = tempfile::tempdir().unwrap();
+    let url = format!(
+        "postgres://u:p@127.0.0.1:{}/db?sslmode=disable",
+        unused_port()
+    );
+    let url_file = private_file(home.path(), "db.url", &url);
+    let mut cmd = bin();
+    cmd.args(["mcp", "--database-url-file", url_file.to_str().unwrap()])
+        .env("HOME", home.path())
+        .env("VERICTO_MAX_BINARY_OPERATORS", "2");
+    let mut s = Session::start(cmd);
+    s.initialize();
+
+    let sql = "SELECT 1+1+1+1";
+    let checked = s.call("check_sql", json!({"sql": sql, "verbose": true}));
+    assert_eq!(checked["summary"]["parse_errors"], 1, "{checked}");
+    assert_eq!(
+        checked["queries"][0]["verdict"]["status"], "PARSE_ERROR",
+        "{checked}"
+    );
+    assert!(
+        checked["queries"][0]["verdict"]["ast_node_path"]
+            .as_str()
+            .is_some_and(|p| p.contains("VERICTO_MAX_BINARY_OPERATORS")),
+        "{checked}"
+    );
+
+    let executed = s.call("execute_sql", json!({"sql": sql}));
+    assert_eq!(executed["status"], "BLOCKED", "{executed}");
+    assert_eq!(executed["error"]["code"], "BLOCKED", "{executed}");
+    assert_eq!(executed["verdict"]["status"], "PARSE_ERROR", "{executed}");
+    assert!(
+        executed["event_id"].is_null(),
+        "local mode reports nothing: {executed}"
+    );
+
+    let err = s.finish();
+    assert!(err.contains("Local mode"), "{err}");
+}
+
 // ── A configured control plane never falls back ──────────────────────────────
 
 /// A stand-in control plane on loopback: `/api/v1/sync/rules` answers `body`

@@ -256,19 +256,51 @@ hop; `PROXY_TLS_MODE` covers the client→proxy hop.
 
 ## Query size limit
 
-| Variable                  | Default              | Description                                   |
-|---------------------------|----------------------|-----------------------------------------------|
-| `VERICTO_MAX_QUERY_BYTES` | `10485760` (10 MiB)  | Largest statement the proxy evaluates         |
+| Variable                          | Default             | Description                                                        |
+|-----------------------------------|---------------------|--------------------------------------------------------------------|
+| `VERICTO_MAX_QUERY_BYTES`         | `1048576` (1 MiB)  | Largest statement the TCP proxy evaluates                          |
+| `VERICTO_MAX_BINARY_OPERATORS`    | `10000`             | 4.22.0+. Most binary operators in one unparenthesized expression   |
+
+> **Behavior change in 4.22.0.** The TCP default of `VERICTO_MAX_QUERY_BYTES` is
+> 1 MiB, down from 10 MiB: a statement between 1 MiB and 10 MiB that 4.21.0
+> evaluated is now refused with `VERICTO-QUERY-TOO-LARGE` (blocked under
+> enforcement, forwarded unevaluated in `monitor_mode`). Set
+> `VERICTO_MAX_QUERY_BYTES=10485760` to restore the previous value. Also new in
+> 4.22.0: a long generated `OR` or `CASE WHEN` chain, more than 10,000 operators
+> in one expression (roughly 5,000 `col = value OR …` terms), is refused before
+> parsing as a `VERICTO-PARSE-ERROR`: blocked under fail-closed, forwarded with a
+> flag under the fail-open default. Raise `VERICTO_MAX_BINARY_OPERATORS` only for
+> reviewed SQL, or send such a list as `col IN (…)` or `col = ANY($1)`, whose
+> commas separate the terms.
 
 Evaluation runs before the query reaches the database, and its cost grows with the
 statement's size. On the measurements in `src/tcp/query_limit.rs` it takes about
-22 ms for 64 KB and 3.8 s for 10 MB. A statement over the limit is refused before it
-is parsed, with the same native error as a blocked query and the code
-`VERICTO-QUERY-TOO-LARGE`. In `monitor_mode` it is forwarded unevaluated instead.
+22 ms for 64 KB, 0.36 s for 1 MiB and 3.8 s for 10 MiB. The 1 MiB default covers
+normal ORM traffic, migrations and analytical queries while bounding the CPU one
+statement can occupy; batch loaders or generated SQL that legitimately need more can
+raise `VERICTO_MAX_QUERY_BYTES`. MCP mode keeps its 64 KiB default. A statement over the
+limit is refused before it is parsed, with the same native error as a blocked query and
+the code `VERICTO-QUERY-TOO-LARGE`. In `monitor_mode` it is forwarded unevaluated
+instead.
 
-A value larger than the wire protocol can carry is clamped, with a warning: 64 MiB for
-PostgreSQL, 16 MiB − 1 byte for MySQL. A value that is not a positive integer falls
-back to the default, also with a warning.
+Size alone does not bound parser cost: a left-associative expression such as
+`SELECT 1+1+…` can take quadratic time. Before either parser runs, the proxy therefore
+makes a linear lexical pass and refuses an expression with more than
+`VERICTO_MAX_BINARY_OPERATORS` operators (10,000 by default). Parentheses and commas
+separate expression segments; SQL keywords never reset the counter because words such as
+`LEFT` are also valid function names inside an expression. Operators inside strings,
+quoted identifiers and ordinary comments do not count. MySQL executable comments do.
+The refusal is a normal `VERICTO-PARSE-ERROR`: `parse_error: block`, a blocking/masking
+sensitive-column policy, an enforced allowlist or an applicable enforced business policy
+blocks it; the fail-open default forwards it with a flag. The scanner stops at operator
+10,001, before the adversarial tail is read by a parser. Raw and sanitized telemetry
+and the proxy's log report only the statement's byte length for this refusal; the text
+was never evaluated and is not sent through the sanitizer parser.
+
+A size value larger than the wire protocol can carry is clamped, with a warning: 64 MiB
+for PostgreSQL, 16 MiB − 1 byte for MySQL. A value that is not a positive integer falls
+back to the default, also with a warning. The operator limit follows the same positive-
+integer rule.
 
 ## Business policy rules (preview, off by default)
 

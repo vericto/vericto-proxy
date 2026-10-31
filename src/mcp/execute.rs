@@ -653,9 +653,19 @@ pub async fn execute_once(rt: &Arc<Runtime>, caller: &Caller, input: Input) -> T
     let ruleset = rt.ruleset_version();
     let c = ctx(rt, &ruleset, &access);
 
-    // 1. One statement per call, before evaluation (§6.2). Every parse of
-    // agent text runs on a thread with a large stack (stack.rs).
-    let analysed = {
+    // 1. One statement per call, before evaluation (§6.2). The linear
+    // complexity guard runs before either parser used by statement_count and
+    // classify; a refusal is carried as their normal Parse outcome, then
+    // Runtime::evaluate resolves it through the configured parse-error policy.
+    // Other agent text is parsed on a thread with a large stack (stack.rs).
+    let complexity = crate::tcp::query_complexity::check_binary_operator_chains(
+        &sql,
+        vericto_engine::Dialect::Postgres,
+        rt.cfg.max_binary_operators,
+    );
+    let analysed = if let Err(e) = complexity {
+        Some((1, Err(Unclassifiable::Parse(e.to_string()))))
+    } else {
         let sql = Arc::clone(&sql);
         crate::stack::on_big_stack(move || {
             (classify::statement_count(&sql), classify::classify(&sql))

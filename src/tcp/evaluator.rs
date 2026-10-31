@@ -85,8 +85,51 @@ impl TcpDecision {
             access_denied,
         }
     }
+
+    /// True only for a statement the lexical guard refused before parsing.
+    /// Telemetry and the block log use this to avoid feeding the adversarial
+    /// text to the sanitizer parser after evaluation correctly skipped it.
+    ///
+    /// Recognized by the exact message [`lexical_parse_error`] writes, never by
+    /// a substring (see [`TooManyBinaryOperators::from_message`]): an ordinary
+    /// parse error that quotes the guard's wording is reported normally.
+    ///
+    /// [`TooManyBinaryOperators::from_message`]: crate::tcp::query_complexity::TooManyBinaryOperators::from_message
+    pub(crate) fn is_lexical_complexity_refusal(&self) -> bool {
+        match self {
+            TcpDecision::Forward {
+                observation: Some(observation),
+                ..
+            } => {
+                observation.rule_code == "VERICTO-PARSE-ERROR"
+                    && observation
+                        .parse_error
+                        .as_deref()
+                        .is_some_and(is_lexical_refusal_message)
+            }
+            TcpDecision::Block {
+                rule_code,
+                ast_node_path,
+                ..
+            } => is_lexical_refusal_block(rule_code, ast_node_path),
+            _ => false,
+        }
+    }
 }
 
+/// The guard's own refusal message, exactly.
+fn is_lexical_refusal_message(message: &str) -> bool {
+    crate::tcp::query_complexity::TooManyBinaryOperators::from_message(message).is_some()
+}
+
+/// [`TcpDecision::is_lexical_complexity_refusal`] for the fields of a block,
+/// for callers that hold them rather than the decision.
+pub(crate) fn is_lexical_refusal_block(rule_code: &str, ast_node_path: &str) -> bool {
+    rule_code == "VERICTO-PARSE-ERROR"
+        && ast_node_path
+            .strip_prefix("PARSE_ERROR: ")
+            .is_some_and(is_lexical_refusal_message)
+}
 /// A block raised by the proxy itself because the rewrite of a statement
 /// (`rewritten`, when the engine returned one) cannot be enforced as the
 /// engine described it: never the original instead. A mask (or no rewrite at
@@ -371,6 +414,98 @@ pub fn evaluate_message_with(
         _ => evaluate(sql, dialect, rules, policy),
     };
     checked_for_kind(decision, sql, dialect, kind)
+}
+
+/// [`evaluate_message_with`] behind the proxy's linear-time lexical complexity
+/// guard. This is the entry point for untrusted statement text on both TCP and
+/// MCP paths; keeping the unguarded function lets evaluator unit tests exercise
+/// the engine adapter directly.
+///
+/// A rejected chain is deliberately a normal parse error, not a new rule: the
+/// statement has no trustworthy AST. Therefore `parse_error: block`, a block or
+/// mask sensitive-column policy, an enforced allowlist, and enforced business
+/// policies still fail closed; the default forwards it with a parse-error flag.
+pub fn evaluate_message_with_guard(
+    sql: &str,
+    dialect: Dialect,
+    kind: QueryKind,
+    rules: &[Rule],
+    policy: &EnforcementPolicy,
+    policies: Option<&PolicyEval<'_>>,
+    max_binary_operators: usize,
+) -> TcpDecision {
+    match crate::tcp::query_complexity::check_binary_operator_chains(
+        sql,
+        dialect,
+        max_binary_operators,
+    ) {
+        Ok(()) => evaluate_message_with(sql, dialect, kind, rules, policy, policies),
+        Err(e) => lexical_parse_error(dialect, kind, rules, policy, policies, e.to_string()),
+    }
+}
+
+/// The guarded form without business policies.
+pub fn evaluate_message_guarded(
+    sql: &str,
+    dialect: Dialect,
+    kind: QueryKind,
+    rules: &[Rule],
+    policy: &EnforcementPolicy,
+    max_binary_operators: usize,
+) -> TcpDecision {
+    evaluate_message_with_guard(
+        sql,
+        dialect,
+        kind,
+        rules,
+        policy,
+        None,
+        max_binary_operators,
+    )
+}
+
+/// Resolve a lexical refusal through exactly the path a parser failure takes.
+///
+/// The engine owns the policy-sensitive parse-error semantics, including
+/// principal-aware business policies. Rather than duplicate them here (and let
+/// them drift), evaluate a fixed, tiny syntax error and replace only its error
+/// text. The adversarial statement never reaches a parser. `SELECT (` is invalid
+/// in every dialect this proxy serves, and tests pin that assumption.
+fn lexical_parse_error(
+    dialect: Dialect,
+    kind: QueryKind,
+    rules: &[Rule],
+    policy: &EnforcementPolicy,
+    policies: Option<&PolicyEval<'_>>,
+    message: String,
+) -> TcpDecision {
+    const TINY_SYNTAX_ERROR: &str = "SELECT (";
+    let mut decision =
+        evaluate_message_with(TINY_SYNTAX_ERROR, dialect, kind, rules, policy, policies);
+    let path = format!("PARSE_ERROR: {message}");
+    match &mut decision {
+        TcpDecision::Forward {
+            observation: Some(observation),
+            ..
+        } if observation.rule_code == "VERICTO-PARSE-ERROR" => {
+            observation.ast_node_path = path;
+            observation.parse_error = Some(message);
+        }
+        TcpDecision::Block {
+            rule_code,
+            ast_node_path,
+            ..
+        } if rule_code == "VERICTO-PARSE-ERROR" => {
+            *ast_node_path = path;
+        }
+        _ => {
+            // A policy finding may accompany a parse-error observation, but the
+            // existing merge keeps the parse error as the winner. If that contract
+            // changes, never hide this refusal silently.
+            tracing::error!("lexical complexity guard did not resolve as VERICTO-PARSE-ERROR");
+        }
+    }
+    decision
 }
 
 /// The decision for any outcome of `evaluate_with_context`, a parse error
@@ -1440,5 +1575,182 @@ mod tests {
                 panic!("parse-error fail-closed must Block, not Forward")
             }
         }
+    }
+
+    /// A refusal is recognized by the guard's exact message, in both shapes a
+    /// decision carries it; a parser error that quotes the guard's wording (the
+    /// parser echoes the token it did not expect) is an ordinary parse error,
+    /// fail-open or fail-closed.
+    #[test]
+    fn only_the_guards_own_refusal_is_a_lexical_refusal() {
+        let rules = default_ruleset();
+        let closed = EnforcementPolicy {
+            parse_error: ParseErrorAction::Block,
+            ..EnforcementPolicy::default()
+        };
+        for policy in [&EnforcementPolicy::default(), &closed] {
+            let refused = evaluate_message_guarded(
+                "SELECT 1+1+1+1",
+                Dialect::Postgres,
+                QueryKind::Simple,
+                &rules,
+                policy,
+                2,
+            );
+            assert!(refused.is_lexical_complexity_refusal());
+
+            let echo =
+                "SELECT * FROM t t2 'lexical complexity guard: more than 1 binary operators'";
+            let decision = evaluate_message_guarded(
+                echo,
+                Dialect::Postgres,
+                QueryKind::Simple,
+                &rules,
+                policy,
+                crate::tcp::query_complexity::DEFAULT_MAX_BINARY_OPERATORS,
+            );
+            let message = match &decision {
+                TcpDecision::Forward {
+                    observation: Some(o),
+                    ..
+                } => o.parse_error.clone().unwrap_or_default(),
+                TcpDecision::Block { ast_node_path, .. } => ast_node_path.clone(),
+                TcpDecision::Forward { .. } => panic!("a parse error must be reported"),
+            };
+            assert!(
+                message.contains(crate::tcp::query_complexity::BINARY_OPERATOR_ERROR_PREFIX),
+                "the parser quotes the token: {message}"
+            );
+            assert!(!decision.is_lexical_complexity_refusal(), "{message}");
+        }
+    }
+
+    #[test]
+    fn lexical_complexity_uses_the_normal_parse_error_policy() {
+        let sql = "SELECT 1+1+1+1";
+        let rules = default_ruleset();
+        let open = evaluate_message_guarded(
+            sql,
+            Dialect::Postgres,
+            QueryKind::Simple,
+            &rules,
+            &EnforcementPolicy::default(),
+            2,
+        );
+        match open {
+            TcpDecision::Forward {
+                observation: Some(o),
+                ..
+            } => {
+                assert_eq!(o.rule_code, "VERICTO-PARSE-ERROR");
+                assert!(
+                    o.parse_error
+                        .as_deref()
+                        .is_some_and(|e| e.contains("VERICTO_MAX_BINARY_OPERATORS"))
+                );
+            }
+            _ => panic!("the fail-open default must forward with a parse-error flag"),
+        }
+
+        let closed = EnforcementPolicy {
+            parse_error: ParseErrorAction::Block,
+            ..EnforcementPolicy::default()
+        };
+        match evaluate_message_guarded(
+            sql,
+            Dialect::Postgres,
+            QueryKind::Simple,
+            &rules,
+            &closed,
+            2,
+        ) {
+            TcpDecision::Block {
+                rule_code,
+                ast_node_path,
+                ..
+            } => {
+                assert_eq!(rule_code, "VERICTO-PARSE-ERROR");
+                assert!(ast_node_path.contains("VERICTO_MAX_BINARY_OPERATORS"));
+            }
+            _ => panic!("parse_error=block must reject the lexical refusal"),
+        }
+    }
+
+    #[test]
+    fn lexical_complexity_guard_works_for_both_wire_dialects() {
+        let rules = default_ruleset();
+        for dialect in [Dialect::Postgres, Dialect::Mysql] {
+            let decision = evaluate_message_guarded(
+                "SELECT 1+1+1",
+                dialect,
+                QueryKind::Simple,
+                &rules,
+                &EnforcementPolicy::default(),
+                1,
+            );
+            match decision {
+                TcpDecision::Forward {
+                    observation: Some(o),
+                    ..
+                } => assert_eq!(o.rule_code, "VERICTO-PARSE-ERROR", "{dialect:?}"),
+                _ => panic!("{dialect:?}: expected a flagged parse error"),
+            }
+        }
+    }
+
+    #[test]
+    fn protective_and_business_policies_fail_closed_on_a_lexical_refusal() {
+        let sql = "SELECT 1+1+1";
+        let rules = default_ruleset();
+        let access = EnforcementPolicy {
+            access_policy: Some(vericto_engine::AccessPolicy::new(
+                AccessMode::Enforce,
+                Vec::new(),
+            )),
+            ..EnforcementPolicy::default()
+        };
+        for policy in [mask_email(), access] {
+            assert!(matches!(
+                evaluate_message_guarded(
+                    sql,
+                    Dialect::Postgres,
+                    QueryKind::Simple,
+                    &rules,
+                    &policy,
+                    1,
+                ),
+                TcpDecision::Block { ref rule_code, .. }
+                    if rule_code == "VERICTO-PARSE-ERROR"
+            ));
+        }
+
+        let policy_rule = Rule {
+            rule_id: "policy-1".into(),
+            code: "POLICY-001".into(),
+            severity: Severity::High,
+            default_action: EnforcementAction::Block,
+            rule_type: vericto_engine::RuleType::Custom,
+            ast_condition_yaml: Some("action: block".into()),
+        };
+        let policies = PolicySet::compile(std::slice::from_ref(&policy_rule));
+        let ctx = EvalContext::new();
+        let decision = evaluate_message_with_guard(
+            sql,
+            Dialect::Postgres,
+            QueryKind::Simple,
+            std::slice::from_ref(&policy_rule),
+            &EnforcementPolicy::default(),
+            Some(&PolicyEval {
+                mode: PolicyRulesMode::Enforce,
+                policies: &policies,
+                ctx: &ctx,
+            }),
+            1,
+        );
+        assert!(matches!(
+            decision,
+            TcpDecision::Block { ref rule_code, .. }
+                if rule_code == "VERICTO-PARSE-ERROR"
+        ));
     }
 }

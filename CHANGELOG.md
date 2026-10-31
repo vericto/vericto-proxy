@@ -7,6 +7,62 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [4.22.0] - 2026-10-31
+
+**Bounded parse cost before and after evaluation.** The TCP proxy evaluates
+statements up to 1 MiB by default (10 MiB before) and refuses, before any parser
+runs, an expression with more than 10,000 binary operators. Log previews and
+sanitized telemetry normalize a long statement on a stack sized for it. Ordinary
+traffic is answered exactly as in 4.21.0.
+
+### Upgrade notes
+
+- **Behavior change: the TCP default of `VERICTO_MAX_QUERY_BYTES` is 1 MiB, down
+  from 10 MiB.** A statement larger than 1 MiB that 4.21.0 evaluated is now refused
+  before parsing with `VERICTO-QUERY-TOO-LARGE`: blocked under enforcement,
+  forwarded unevaluated (and reported) under `monitor_mode`. Set
+  `VERICTO_MAX_QUERY_BYTES=10485760` to restore the previous value. MCP mode keeps
+  its 64 KiB default.
+- **Behavior change: long generated `OR` / `CASE WHEN` chains are refused before
+  parsing.** An expression with more than 10,000 binary operators outside
+  parentheses (roughly 5,000 `col = value OR …` terms) is a `VERICTO-PARSE-ERROR`:
+  blocked under fail-closed (`parse_error: block`, a block or mask sensitive-column
+  policy, an enforced allowlist or an applicable enforced business policy),
+  forwarded with a parse-error flag under the fail-open default. Raise
+  `VERICTO_MAX_BINARY_OPERATORS` for reviewed SQL, or send such a list as
+  `col IN (…)` or `col = ANY($1)`, which the guard does not count as one chain.
+
+### Security
+
+- **Linear pre-parse complexity guard.** Before either SQL parser sees untrusted text,
+  the proxy counts binary operators in each unparenthesized expression and stops at
+  operator 10,001 by default (`VERICTO_MAX_BINARY_OPERATORS`). This bounds a
+  left-associative expression whose parse time grows quadratically, independently of
+  statement size. Strings, quoted identifiers and ordinary comments do not count;
+  MySQL executable comments do. A refusal is `VERICTO-PARSE-ERROR`, so the existing
+  fail-closed / fail-open policy decides whether it is blocked or forwarded with a flag.
+  Both TCP protocols and MCP `check_sql` / `execute_sql` use the guard. Telemetry
+  and the block log report a refusal by the statement's size only, never its text.
+  A refusal is recognized by the guard's exact message, so an ordinary parse error
+  that quotes the guard's wording is reported as the parse error it is.
+- **Bound the stack used by log previews and sanitized telemetry.** The block log's
+  `query_preview` and sanitized telemetry normalize a PostgreSQL statement with
+  libpg_query, which needs stack in proportion to the statement's depth. A
+  statement longer than 1 KiB is now normalized on a thread whose stack is sized
+  for its length, as its evaluation already was, instead of on an async worker
+  (8 MiB) or the telemetry builder thread (2 MiB); shorter statements are
+  unchanged. A statement the complexity guard refused is never normalized: the log
+  names only its size, as telemetry already did. Logs and events still carry no
+  literal, and text that cannot be normalized is still the fixed redaction marker.
+  MySQL text is sanitized by a linear, non-recursive tokenizer and is unchanged.
+
+### Changed
+
+- The TCP default of `VERICTO_MAX_QUERY_BYTES` is 1 MiB, down from 10 MiB (see
+  Upgrade notes). Ordinary ORM traffic, migrations and analytical queries fit; a
+  batch loader or generated query that legitimately needs more can raise the
+  variable up to the protocol cap.
+
 ## [4.21.0] - 2026-10-30
 
 **MCP Proxy mode: an agent runs SQL through Vericto, and what is checked is what

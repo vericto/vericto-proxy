@@ -27,8 +27,8 @@ use vericto_engine::{AccessMode, AccessPolicy, AccessPolicyMap, EnforcementPolic
 use crate::tcp::client_tls::{ClientRead, ClientWrite};
 use crate::tcp::codec::PgMessage;
 use crate::tcp::evaluator::{
-    PolicyEval, TcpDecision, access_command_decision, evaluate_message, evaluate_message_with,
-    rewrite_not_enforceable,
+    PolicyEval, TcpDecision, access_command_decision, evaluate_message, evaluate_message_guarded,
+    evaluate_message_with_guard, rewrite_not_enforceable,
 };
 use crate::tcp::postgres::{EventIdentity, PgProxyConfig};
 use crate::tcp::protocol::mysql::UseTarget;
@@ -967,7 +967,7 @@ pub async fn intercept_client_to_server(
                             Some((bundle, ctx)) => {
                                 let ctx = crate::tcp::policy_rules::at_now(ctx);
                                 let rules = bundle.rules.as_ref().unwrap_or(&rules);
-                                evaluate_message_with(
+                                evaluate_message_with_guard(
                                     &sql,
                                     dialect,
                                     kind,
@@ -978,9 +978,17 @@ pub async fn intercept_client_to_server(
                                         policies: &bundle.policies,
                                         ctx: &ctx,
                                     }),
+                                    config.max_binary_operators,
                                 )
                             }
-                            None => evaluate_message(&sql, dialect, kind, &rules, &policy),
+                            None => evaluate_message_guarded(
+                                &sql,
+                                dialect,
+                                kind,
+                                &rules,
+                                &policy,
+                                config.max_binary_operators,
+                            ),
                         };
                         let eval_us = eval_start.elapsed().as_micros();
                         // Telemetry before any forwarding (R5.7): enqueued in memory,
@@ -1785,7 +1793,7 @@ async fn refresh_prepared(
         let decision = match (&snapshot.bundle, &snapshot.context) {
             (Some(bundle), Some(ctx)) => {
                 let ctx = crate::tcp::policy_rules::at_now(ctx);
-                evaluate_message_with(
+                evaluate_message_with_guard(
                     &evaluated_sql,
                     vericto_engine::Dialect::Postgres,
                     QueryKind::Prepared,
@@ -1796,14 +1804,16 @@ async fn refresh_prepared(
                         policies: &bundle.policies,
                         ctx: &ctx,
                     }),
+                    config_for_task.max_binary_operators,
                 )
             }
-            _ => evaluate_message(
+            _ => evaluate_message_guarded(
                 &evaluated_sql,
                 vericto_engine::Dialect::Postgres,
                 QueryKind::Prepared,
                 &snapshot.rules,
                 &snapshot.policy,
+                config_for_task.max_binary_operators,
             ),
         };
         let desired = match &decision {
