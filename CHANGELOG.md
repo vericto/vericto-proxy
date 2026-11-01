@@ -78,6 +78,14 @@ which the proxy now enforces on both protocols and in MCP `check_sql` / `execute
 - **vericto-engine v4.6.0 → v4.7.1** (git tag, `64e13ef`). `Cargo.lock` changes only
   the engine entry; `pg_query` 6.2 and `sqlparser` 0.63 stay aligned with it. No
   public engine API the proxy uses changed, so no proxy code changes.
+- **Image metadata for the official MCP Registry.** Released images carry the label
+  `io.modelcontextprotocol.server.name=com.vericto/vericto-proxy`, which the registry
+  checks before it lists the `vericto-proxy mcp` server under that name, and the image
+  description reads "Vericto: database guardrails for AI agents — deterministic AST
+  parsing". A `glama.json` at the repository root names the maintainers for Glama's MCP
+  directory. The install examples in the README and `docs/MCP.md` pin 4.23.0. The crate
+  description (`cargo metadata`, crates listings) and the binary's module docs say
+  "database guardrails for AI agents" instead of "SQL firewall".
 
 ## [4.22.0] - 2026-10-31
 

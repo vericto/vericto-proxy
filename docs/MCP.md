@@ -15,7 +15,7 @@ Vericto workspace it applies the workspace's rules instead
 
 It is the same binary and image as the TCP proxy, in a second mode, and it reuses the
 proxy's evaluator, masks, agent-access allowlists, business policies, signed rule sync,
-kill switch and telemetry. This release (4.21.0) is **read-only**: `execute_sql` runs
+kill switch and telemetry. This release (4.23.0) is **read-only**: `execute_sql` runs
 reads only (the "read tier").
 
 > **The guarantee holds only if the agent has no other database credential.** If the
@@ -79,7 +79,7 @@ user, so the container runs as you):
 claude mcp add vericto-db -- \
   docker run -i --rm --user "$(id -u):$(id -g)" \
     -v ~/.config/vericto/shop.url:/run/secrets/db.url:ro \
-    vericto/vericto-proxy:4.21.0 /usr/local/bin/vericto-proxy mcp --database-url-file /run/secrets/db.url
+    vericto/vericto-proxy:4.23.0 /usr/local/bin/vericto-proxy mcp --database-url-file /run/secrets/db.url
 ```
 
 Cursor (`.cursor/mcp.json`) or any client that takes a command:
@@ -91,7 +91,7 @@ Cursor (`.cursor/mcp.json`) or any client that takes a command:
       "command": "docker",
       "args": ["run", "-i", "--rm", "--user", "501:20",
                "-v", "/Users/me/.config/vericto/shop.url:/run/secrets/db.url:ro",
-               "vericto/vericto-proxy:4.21.0", "/usr/local/bin/vericto-proxy", "mcp",
+               "vericto/vericto-proxy:4.23.0", "/usr/local/bin/vericto-proxy", "mcp",
                "--database-url-file", "/run/secrets/db.url"]
     }
   }
@@ -177,7 +177,7 @@ claude mcp add vericto-db \
   -e VERICTO_API_KEY=vtro_... -e VERICTO_DATABASE_ID=<database id> -- \
   docker run -i --rm --user "$(id -u):$(id -g)" -e VERICTO_API_KEY -e VERICTO_DATABASE_ID \
     -v ~/.config/vericto/shop.url:/run/secrets/db.url:ro \
-    vericto/vericto-proxy:4.21.0 /usr/local/bin/vericto-proxy mcp --database-url-file /run/secrets/db.url
+    vericto/vericto-proxy:4.23.0 /usr/local/bin/vericto-proxy mcp --database-url-file /run/secrets/db.url
 ```
 
 Cursor (`.cursor/mcp.json`):
@@ -190,7 +190,7 @@ Cursor (`.cursor/mcp.json`):
       "args": ["run", "-i", "--rm", "--user", "501:20",
                "-e", "VERICTO_API_KEY", "-e", "VERICTO_DATABASE_ID",
                "-v", "/Users/me/.config/vericto/shop.url:/run/secrets/db.url:ro",
-               "vericto/vericto-proxy:4.21.0", "/usr/local/bin/vericto-proxy", "mcp",
+               "vericto/vericto-proxy:4.23.0", "/usr/local/bin/vericto-proxy", "mcp",
                "--database-url-file", "/run/secrets/db.url"],
       "env": { "VERICTO_API_KEY": "vtro_...", "VERICTO_DATABASE_ID": "<database id>" }
     }
@@ -264,7 +264,7 @@ docker run -d --name vericto-mcp -p 8808:8808 \
   -e VERICTO_MCP_ALLOWED_HOSTS=vericto-mcp.internal \
   -e PROXY_TLS_MODE=require -e PROXY_TLS_CERT=/run/secrets/tls.crt -e PROXY_TLS_KEY=/run/secrets/tls.key \
   -v /srv/secrets:/run/secrets:ro \
-  vericto/vericto-proxy:4.21.0 /usr/local/bin/vericto-proxy mcp --database-url-file /run/secrets/db.url
+  vericto/vericto-proxy:4.23.0 /usr/local/bin/vericto-proxy mcp --database-url-file /run/secrets/db.url
 ```
 
 Clients connect with the URL and their own key:
