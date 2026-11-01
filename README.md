@@ -63,7 +63,7 @@ docker network create vericto-demo
 docker run -d --name vericto-demo-db --network vericto-demo \
   -e POSTGRES_PASSWORD=demo postgres:17
 docker run -d --name vericto-demo-proxy --network vericto-demo \
-  -e UPSTREAM_HOST=vericto-demo-db vericto/vericto-proxy:4.21.0
+  -e UPSTREAM_HOST=vericto-demo-db vericto/vericto-proxy:4.23.0
 until docker exec vericto-demo-db pg_isready -q -h localhost -U postgres; do sleep 1; done
 
 docker run --rm --network vericto-demo postgres:17 \
@@ -75,7 +75,7 @@ docker run --rm --network vericto-demo postgres:17 \
   -c "SELECT id, email FROM users"
 ```
 
-The image comes from Docker Hub; `ghcr.io/vericto/vericto-proxy:4.21.0` serves the
+The image comes from Docker Hub; `ghcr.io/vericto/vericto-proxy:4.23.0` serves the
 same digest (see [Docker](#docker)).
 
 The `DELETE` without a `WHERE` never reaches the database; the one with a `WHERE`
@@ -239,7 +239,7 @@ built-in ruleset (the rules the TCP proxy runs standalone) and reports nothing:
 claude mcp add vericto-db -- \
   docker run -i --rm --user "$(id -u):$(id -g)" \
     -v ~/.config/vericto/shop.url:/run/secrets/db.url:ro \
-    vericto/vericto-proxy:4.21.0 /usr/local/bin/vericto-proxy mcp --database-url-file /run/secrets/db.url
+    vericto/vericto-proxy:4.23.0 /usr/local/bin/vericto-proxy mcp --database-url-file /run/secrets/db.url
 ```
 
 **Connect to Vericto** for custom rules, business policies, sensitive-column masking,
@@ -330,17 +330,17 @@ whichever your environment allows.
 ```bash
 # Postgres. On Linux, add --add-host=host.docker.internal:host-gateway
 docker run --rm -e UPSTREAM_HOST=host.docker.internal -p 5433:5433 \
-  vericto/vericto-proxy:4.21.0
+  vericto/vericto-proxy:4.23.0
 
 # MySQL
 docker run --rm \
   -e VERICTO_WIRE_PROTOCOL=mysql \
   -e UPSTREAM_HOST=host.docker.internal \
   -p 3307:3307 \
-  vericto/vericto-proxy:4.21.0
+  vericto/vericto-proxy:4.23.0
 
 # The same image from GHCR
-docker pull ghcr.io/vericto/vericto-proxy:4.21.0
+docker pull ghcr.io/vericto/vericto-proxy:4.23.0
 ```
 
 Images released from now on carry a build provenance attestation (Sigstore,
@@ -383,7 +383,7 @@ With Docker Compose:
 
 ```yaml
 proxy:
-  image: ${VERICTO_PROXY_IMAGE:-vericto/vericto-proxy:4.21.0}
+  image: ${VERICTO_PROXY_IMAGE:-vericto/vericto-proxy:4.23.0}
   ports:
     - "5433:5433"
   environment:

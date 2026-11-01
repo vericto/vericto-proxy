@@ -7,6 +7,86 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [4.23.0] - 2026-10-31
+
+**Engine 4.7: existing rules catch the same destructive operation through more
+equivalent SQL forms.** The proxy pins vericto-engine v4.7.1 (from v4.6.0). No rule,
+severity or policy default changes, and the proxy's own code, settings, protocols and
+telemetry are unchanged, but some statements that 4.22.0 forwarded are now flagged or
+blocked by the rule they always should have matched. Minor release because verdicts
+change.
+
+### Upgrade notes
+
+- dbt-snowflake's parenthesized incremental `INSERT … (SELECT …)` now matches
+  VERICTO-040, and SQL Server `SELECT … INTO #temp` matches VERICTO-084. Both copy
+  rows by design. Trial 4.23.0 with `monitor_mode`, then set the affected rule action
+  explicitly if those copies are approved workflow operations.
+- An optional-filter expression rendered with a literal NULL branch, such as
+  `status = 'active' OR NULL IS NULL`, now matches VERICTO-090 because it is
+  unconditionally true. Keep runtime values as bind parameters when the branch is
+  data-dependent; approve intentional all-row operations through policy rather than
+  disguising them as a filter.
+- Business policies (CEL, preview): `uint()` of a negative double in (-1, 0), such as
+  `uint(-0.5)`, is now a range error, as `uint(-1.0)` already was; earlier releases
+  returned `0u`. A `when` / `deny_if` / `require` condition that reaches
+  that case is now inconclusive, so the policy's `on_unknown` decides.
+
+### Engine 4.7.0
+
+User-visible changes of vericto-engine 4.7.0 (engine CHANGELOG [4.7.0]), all of
+which the proxy now enforces on both protocols and in MCP `check_sql` / `execute_sql`:
+
+- **Constant predicates count as WHERE-less** for VERICTO-003/030/042: `NULL IS NULL`,
+  `1 IS NOT NULL`, `NOT (1 IS NULL)`, `(1=1) IS TRUE`, `TRUE IS TRUE`,
+  `NULL IS UNKNOWN`, `1 IS DISTINCT FROM NULL`, `NULL IS NOT DISTINCT FROM NULL`.
+  Inside an `OR` they reach VERICTO-090; on an `INSERT … SELECT` they are not a
+  filter for VERICTO-040.
+- **A known match makes a positive `IN` true**: `1 IN (1, NULL)` and `1 IN (1, id)`
+  no longer bypass those rules. `1 IN (2, id)` and every `NOT IN` stay undecided.
+- **VERICTO-084 covers table-copy syntax on every parser path**: MySQL and Oracle
+  `CREATE TABLE … AS SELECT …`, PostgreSQL / SQL Server `SELECT … INTO <table>`, and
+  materialized-view creation on the sqlparser dialects. MySQL `SELECT … INTO @variable`
+  and ordinary views are not table copies.
+- **VERICTO-040 covers set-operation, parenthesized and `TABLE t` sources**:
+  `INSERT … SELECT … UNION SELECT …` and `INSERT … TABLE t` on MySQL / Oracle /
+  SQL Server / Snowflake. An enclosing limit, effective filters on every UNION arm,
+  INTERSECT / EXCEPT, `TOP` and fixed-row Snowflake `SAMPLE` keep the source bounded;
+  literal VALUES inside parentheses or set operations stay VALUES inserts.
+- **VERICTO-061 counts parenthesized VALUES batches** above its 10,000-row threshold.
+- **VERICTO-070 and custom `func_name` rules see every executed expression**: a
+  sleep-family call can no longer hide in `JOIN … ON`, `GROUP BY` / `HAVING`,
+  `ORDER BY`, `UPDATE … SET`, `INSERT … VALUES`, window clauses, `RETURNING`,
+  `ON CONFLICT`, MySQL `SET`, prepared statement bodies, PostgreSQL expression
+  wrappers or a nested query. `EXPLAIN ANALYZE` is inspected; plain `EXPLAIN` is not.
+- **VERICTO-051 treats a qualified wildcard (`t.*`) as `SELECT *`.**
+- False-positive controls stay narrow: no function, arithmetic, correlated-subquery
+  or row-dependent folding, so `id IS NOT NULL`, `name LIKE '%'`, `1 IN (2, id)` and
+  `NOT IN` remain real filters.
+
+### Engine 4.7.1
+
+- **The per-statement cost 4.7.0 added on the sqlparser path is recovered** (MySQL,
+  SQL Server, Oracle, Snowflake, SQLite): the complete expression walk visits the
+  clauses statements are made of directly instead of running sqlparser's generic
+  traversal over every node. Coverage and records are unchanged; on the MySQL perf-gate
+  statements the engine is back to 4.6.0's instruction count.
+- **CEL `uint()` of a negative double is a range error** (see Upgrade notes).
+
+### Changed
+
+- **vericto-engine v4.6.0 → v4.7.1** (git tag, `64e13ef`). `Cargo.lock` changes only
+  the engine entry; `pg_query` 6.2 and `sqlparser` 0.63 stay aligned with it. No
+  public engine API the proxy uses changed, so no proxy code changes.
+- **Image metadata for the official MCP Registry.** Released images carry the label
+  `io.modelcontextprotocol.server.name=com.vericto/vericto-proxy`, which the registry
+  checks before it lists the `vericto-proxy mcp` server under that name, and the image
+  description reads "Vericto: database guardrails for AI agents — deterministic AST
+  parsing". A `glama.json` at the repository root names the maintainers for Glama's MCP
+  directory. The install examples in the README and `docs/MCP.md` pin 4.23.0. The crate
+  description (`cargo metadata`, crates listings) and the binary's module docs say
+  "database guardrails for AI agents" instead of "SQL firewall".
+
 ## [4.22.0] - 2026-10-31
 
 **Bounded parse cost before and after evaluation.** The TCP proxy evaluates

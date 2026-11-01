@@ -99,7 +99,9 @@ jobs:
       # The labels are set here because this is the step whose labels reach the image.
       # Without the explicit licenses label, metadata-action fills it from GitHub's
       # license detection, which does not recognise FSL-1.1-ALv2 (nor ELv2 before
-      # it) and reports NOASSERTION.
+      # it) and reports NOASSERTION. The official MCP Registry accepts an OCI package
+      # only if the image carries io.modelcontextprotocol.server.name equal to the
+      # server.json name (com.vericto/vericto-proxy, the `vericto-proxy mcp` server).
       - name: Derive labels
         id: meta
         uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
@@ -107,8 +109,9 @@ jobs:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           labels: |
             org.opencontainers.image.title=vericto-proxy
-            org.opencontainers.image.description=Vericto SQL security proxy — deterministic AST parsing
+            org.opencontainers.image.description=Vericto: database guardrails for AI agents — deterministic AST parsing
             org.opencontainers.image.licenses=FSL-1.1-ALv2
+            io.modelcontextprotocol.server.name=com.vericto/vericto-proxy
 
       # The gate runs before anything is pushed: the image is built once into a
       # local archive, scanned, and only then built again (every layer from the

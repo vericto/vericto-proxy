@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Vericto S.A.S.
 // SPDX-License-Identifier: FSL-1.1-ALv2
 
-//! vericto-proxy — Deterministic SQL firewall (TCP wire-protocol mode).
+//! vericto-proxy — database guardrails for AI agents (TCP wire-protocol mode).
 //!
 //! Customer-facing component: intercepts every query via the PostgreSQL or MySQL
 //! wire protocol, evaluates it with the vericto-engine AST parser, and either
