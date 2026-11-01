@@ -16,7 +16,7 @@ path = "src/main.rs"
 # AST engine, Vericto's own source-available library, under FSL-1.1-ALv2 like
 # the proxy from v4.3.0 on (earlier engine releases stay under the Elastic
 # License 2.0).
-vericto-engine = { git = "https://github.com/vericto/vericto-engine", tag = "v4.7.0" }
+vericto-engine = { git = "https://github.com/vericto/vericto-engine", tag = "v4.7.1" }
 
 # PostgreSQL query normalization for sanitized telemetry (literals → $1, $2…).
 # Same major version the engine uses, so libpg_query resolves to a single build.

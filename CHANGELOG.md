@@ -9,8 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [4.23.0] - 2026-10-31
 
-**Engine 4.7.0: existing rules catch the same destructive operation through more
-equivalent SQL forms.** The proxy pins vericto-engine v4.7.0 (from v4.6.0). No rule,
+**Engine 4.7: existing rules catch the same destructive operation through more
+equivalent SQL forms.** The proxy pins vericto-engine v4.7.1 (from v4.6.0). No rule,
 severity or policy default changes, and the proxy's own code, settings, protocols and
 telemetry are unchanged, but some statements that 4.22.0 forwarded are now flagged or
 blocked by the rule they always should have matched. Minor release because verdicts
@@ -27,6 +27,10 @@ change.
   unconditionally true. Keep runtime values as bind parameters when the branch is
   data-dependent; approve intentional all-row operations through policy rather than
   disguising them as a filter.
+- Business policies (CEL, preview): `uint()` of a negative double in (-1, 0), such as
+  `uint(-0.5)`, is now a range error, as `uint(-1.0)` already was; earlier releases
+  returned `0u`. A `when` / `deny_if` / `require` condition that reaches
+  that case is now inconclusive, so the policy's `on_unknown` decides.
 
 ### Engine 4.7.0
 
@@ -60,9 +64,18 @@ which the proxy now enforces on both protocols and in MCP `check_sql` / `execute
   or row-dependent folding, so `id IS NOT NULL`, `name LIKE '%'`, `1 IN (2, id)` and
   `NOT IN` remain real filters.
 
+### Engine 4.7.1
+
+- **The per-statement cost 4.7.0 added on the sqlparser path is recovered** (MySQL,
+  SQL Server, Oracle, Snowflake, SQLite): the complete expression walk visits the
+  clauses statements are made of directly instead of running sqlparser's generic
+  traversal over every node. Coverage and records are unchanged; on the MySQL perf-gate
+  statements the engine is back to 4.6.0's instruction count.
+- **CEL `uint()` of a negative double is a range error** (see Upgrade notes).
+
 ### Changed
 
-- **vericto-engine v4.6.0 → v4.7.0** (git tag, `c24ae9d`). `Cargo.lock` changes only
+- **vericto-engine v4.6.0 → v4.7.1** (git tag, `64e13ef`). `Cargo.lock` changes only
   the engine entry; `pg_query` 6.2 and `sqlparser` 0.63 stay aligned with it. No
   public engine API the proxy uses changed, so no proxy code changes.
 

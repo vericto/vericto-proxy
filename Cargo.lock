@@ -2809,8 +2809,8 @@ checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
 
 [[package]]
 name = "vericto-engine"
-version = "4.7.0"
-source = "git+https://github.com/vericto/vericto-engine?tag=v4.7.0#c24ae9d05a604711e85b4613764c2fa818f4d421"
+version = "4.7.1"
+source = "git+https://github.com/vericto/vericto-engine?tag=v4.7.1#64e13ef36631ddecf15f9ba4862642e00bbed109"
 dependencies = [
  "pg_query",
  "regex",
