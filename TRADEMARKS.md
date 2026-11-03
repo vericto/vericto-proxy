@@ -1,38 +1,51 @@
 # Trademarks
 
-"Vericto", the Vericto logo and the names of Vericto's products and services
-(together, the "Vericto marks") are trademarks of Vericto S.A.S., whether or not
-they are registered.
+"Vericto", the Vericto logo and the names of Vericto products and services are
+referred to here as the "Vericto marks". Some may be registered and others may
+be unregistered. This policy does not represent that a particular mark is
+registered in a particular country.
 
-The license in [LICENSE](LICENSE) covers the code in this repository. It does
-not grant any right to use the Vericto marks. The Functional Source License
-says so in its "Trademarks" clause, the Apache License 2.0 in its section 6 and
-the BSD 2-Clause License by not granting any. This policy explains what you can
-do with the marks anyway, so that people can always tell an official Vericto
-release from someone else's build.
+The software license in [LICENSE](LICENSE) grants copyright and patent rights.
+It does not grant a general right to use a Vericto mark. The AGPL permits a
+licensor to decline trademark rights, and applicable trademark and unfair
+competition law continues to apply.
 
-## What you may do without asking
+This policy explains uses Vericto permits without separate written approval.
+It does not modify the software license or prevent nominative use that
+applicable law permits.
 
-- Refer to Vericto and its products by name, truthfully and without suggesting
-  that Vericto endorses you: "works with Vericto", "a plugin for vericto-cli",
-  "based on vericto-engine".
-- Redistribute unmodified official releases under their original names, as
-  their license allows.
-- Fork this repository on GitHub to develop or propose changes, keeping its
-  name.
-- Keep the copyright, license, NOTICE and trademark notices that come with the
-  code. The licenses require it.
+## Uses permitted without asking
 
-## What needs written permission
+You may:
 
-- Using a Vericto mark, or something confusingly similar, in the name of your
-  product, service, company, domain, package or container image.
-- Distributing a modified version under a Vericto mark or with the Vericto logo.
-  Give a modified version a different name and say that it is not an official
-  Vericto release. "Based on vericto-engine" is fine.
-- Using the Vericto logo for anything other than linking to Vericto.
-- Any use that suggests Vericto sponsors, certifies or supports your product or
-  service.
+- refer truthfully to Vericto or a Vericto product without implying sponsorship,
+  certification or endorsement, for example "works with Vericto", "a plugin for
+  vericto-cli" or "based on vericto-engine";
+- redistribute an unmodified official release under its original name when the
+  software license permits that redistribution;
+- keep the repository name on a GitHub fork solely to develop or propose
+  changes to the upstream project; and
+- reproduce copyright, license, attribution and trademark notices as needed to
+  comply with a license or accurately identify the software's origin.
+
+## Uses that require written permission
+
+Written permission from Vericto is required to:
+
+- use a Vericto mark, or a confusingly similar mark, in the name of a product,
+  service, company, domain, package or container image;
+- distribute a modified version under a Vericto product name or with a Vericto
+  logo;
+- use a Vericto logo, except when an unmodified official release reproduces the
+  logo exactly as Vericto distributed it; or
+- suggest that Vericto sponsors, certifies, supports or endorses another
+  product, service or organization.
+
+A modified distribution must use a different product and package name and must
+state that it is not an official Vericto release. It may truthfully say "based
+on vericto-engine".
 
 Write to [legal@vericto.com](mailto:legal@vericto.com) for permission or with
-questions. This policy may change; it is not a license to any mark.
+questions. Permission must be in writing and may state conditions for a
+specific use. This policy may change for future uses; a written permission
+already granted is governed by its own terms.

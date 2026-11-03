@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # SPDX-FileCopyrightText: 2026 Vericto S.A.S.
-# SPDX-License-Identifier: FSL-1.1-ALv2
+# SPDX-License-Identifier: AGPL-3.0-only
 #
 # Trains the profile of a profile-guided (PGO) release build on the corpus of the
 # performance gate (docs/PERFORMANCE.md, "PGO").

@@ -1,5 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Vericto S.A.S.
-// SPDX-License-Identifier: FSL-1.1-ALv2
+// SPDX-License-Identifier: AGPL-3.0-only
 
 //! `describe_schema` (design "MCP execution modes" §6.6): tables, columns,
 //! types, primary and foreign keys, from the fixed catalog queries of

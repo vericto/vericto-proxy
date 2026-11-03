@@ -1,10 +1,11 @@
 # Contributing to Vericto Proxy
 
 Thanks for your interest in improving Vericto Proxy. This guide covers the TCP
-wire-protocol proxy in this repository, which is source-available under the
-[Functional Source License, Version 1.1, ALv2 Future License](LICENSE)
-(FSL-1.1-ALv2; see [LICENSING.md](LICENSING.md)). Contributions are accepted under the Vericto
-[Contributor License Agreement](#contributor-license-agreement).
+wire-protocol proxy in this repository, which is open source under the
+[GNU Affero General Public License, version 3 only](LICENSE)
+(AGPL-3.0-only) and also available under a commercial license (see
+[LICENSING.md](LICENSING.md)). Contributions are accepted under the Vericto
+[Contributor License Agreement](#license-and-contributor-license-agreement).
 
 ## Code of Conduct
 
@@ -121,8 +122,8 @@ Scopes for this repo: `tcp`, `telemetry`, `rules-sync`, `config`, `healthz`,
 `docker`, `deps`, `docs`.
 
 **Write in English** — commit subjects and bodies, code comments, test names, identifiers,
-`CHANGELOG.md` entries and pull request descriptions. The codebase is source-available
-under FSL-1.1-ALv2 and read by people who do not share a first language with its authors,
+`CHANGELOG.md` entries and pull request descriptions. The codebase is open source
+under AGPL-3.0-only and read by people who do not share a first language with its authors,
 so a single language keeps it reviewable. Part of this repository's early history is in
 Spanish; those commits are left as they are rather than rewritten, and everything from
 here forward is English.
@@ -143,33 +144,66 @@ here forward is English.
 
 Do **not** open a public issue for vulnerabilities. See [SECURITY.md](SECURITY.md).
 
-## Contributor License Agreement
+## License and Contributor License Agreement
 
-Before your first pull request can be merged, you need to sign the Vericto
-Contributor License Agreement (CLA), version 1.0, in [CLA.md](CLA.md). It gives
-Vericto S.A.S. the rights it needs to distribute your contribution as part of the
-project: under the project's license (the FSL, and the Apache License 2.0 once a
-version converts) and under the commercial licenses it offers. CLA 1.0 names the
-Elastic License 2.0, the project's license when it was written; its section 2 also
-covers later and other licenses, so it applies unchanged.
-New source files start with the same two SPDX lines as the existing ones
-(`SPDX-FileCopyrightText: 2026 Vericto S.A.S.` and
-`SPDX-License-Identifier: FSL-1.1-ALv2`).
+vericto-proxy 5.0.0 and later is open source under the
+[GNU Affero General Public License, version 3 only](LICENSE)
+(`AGPL-3.0-only`). Vericto S.A.S. also offers separate commercial licenses.
+Older releases keep their original terms; see [LICENSING.md](LICENSING.md) and
+[LICENSE_HISTORY.md](LICENSE_HISTORY.md).
 
-On your first pull request, the `CLA` check comments with a link to the agreement and
-fails until every author of a commit in the pull request has signed. To sign, read the
-agreement, then post this comment on the pull request, exactly as written:
+Before a pull request can be merged, every human commit author must sign the
+Vericto Individual Contributor License Agreement, version 1.1
+([CLA index](CLA.md), permanent text [legal/cla/1.1.md](legal/cla/1.1.md)). The
+agreement lets Vericto distribute accepted contributions under the project's
+public license and under separate commercial licenses while the contributor
+keeps copyright.
+
+Read the agreement and post this exact pull-request comment:
 
 ```
 I have read the CLA Document and I hereby sign the CLA
 ```
 
-The check records your GitHub username and account id, the pull request, your comment
-and its time on this repository's `cla-signatures` branch, and passes. The signature
-applies to your later pull requests here. If the check does not rerun on its own,
-comment `recheck`. A commit whose email is not linked to a GitHub account cannot be
-signed for: add the email to your account, or amend the commit. When the pull request
-is closed, its conversation is locked so that the signature comment stays as it was.
+The CLA workflow records your GitHub username and numeric account ID,
+repository ID, pull-request number, comment ID, comment timestamp, CLA version
+and SHA-256 document hash in `signatures/v1.1/cla.json` on the
+`cla-signatures` branch. The data and retention are described in
+[CLA_PRIVACY_NOTICE.md](CLA_PRIVACY_NOTICE.md). If the check does not rerun,
+comment `recheck`. A commit whose email is not linked to a GitHub account
+cannot be matched to a signer. Closed pull requests are locked to preserve the
+signature comment.
 
-If you contribute on behalf of an employer, write to
-[legal@vericto.com](mailto:legal@vericto.com) before opening the pull request.
+If an employer, client or other person may own rights in your contribution,
+obtain written authorization and send it to
+[legal@vericto.com](mailto:legal@vericto.com) before submitting.
+
+## Copyright and SPDX headers
+
+A contributor keeps copyright under CLA 1.1. A new source file must identify
+its actual copyright holder, followed by the project license:
+
+```text
+// SPDX-FileCopyrightText: 2026 Your Name or Organization
+// SPDX-License-Identifier: AGPL-3.0-only
+```
+
+Use `Vericto S.A.S.` only when Vericto owns that file through employment,
+contract or written assignment. Preserve existing copyright and license
+notices. Do not replace another contributor's notice with Vericto's name.
+
+## Third-party and AI-assisted material
+
+Do not copy code or documentation from an issue, comment, website or other
+source unless the pull request identifies the source and Vericto has rights to
+include it. Ideas and facts are different from copyrightable text or code.
+
+Read [AI_POLICY.md](AI_POLICY.md). If an AI or code-generation tool assisted
+the pull request, disclose it in the description using:
+
+```text
+Created with: <tool name>; assistance: <what it produced>
+```
+
+You remain responsible for understanding, testing and licensing the submitted
+material. Do not name an AI system in a `Co-authored-by` trailer.

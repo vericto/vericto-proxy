@@ -1,5 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Vericto S.A.S.
-// SPDX-License-Identifier: FSL-1.1-ALv2
+// SPDX-License-Identifier: AGPL-3.0-only
 
 //! Database errors as the agent sees them (design "MCP execution modes" §15,
 //! T5). A value can leak through an error: `SELECT 1 WHERE CAST(ssn AS int) =

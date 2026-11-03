@@ -1,30 +1,58 @@
 vericto-proxy
-Copyright 2026 Vericto S.A.S.
+Copyright 2026 Vericto S.A.S. and contributors.
 
-This software is licensed under the Functional Source License, Version 1.1,
-ALv2 Future License (SPDX-License-Identifier: FSL-1.1-ALv2). The full terms
+Version 5.0.0 and later is free software under the GNU Affero General
+Public License as published by the Free Software Foundation, version 3 only
+(SPDX-License-Identifier: AGPL-3.0-only). The controlling public-license terms
 are in LICENSE.
 
-Future license: each version of this software is also licensed under the
-Apache License, Version 2.0 (SPDX-License-Identifier: Apache-2.0) from the
-second anniversary of the date Vericto S.A.S. makes that version available,
-as the "Grant of Future License" section of LICENSE states.
+This program is distributed in the hope that it will be useful, but WITHOUT
+ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
+FOR A PARTICULAR PURPOSE. See the GNU Affero General Public License for more
+details.
 
-The FSL applies from version 4.14.0. Versions 4.13.0 and earlier, and every
-commit before the one that introduced the FSL, were released under the
-Elastic License 2.0 (SPDX-License-Identifier: Elastic-2.0) and remain under
-it. See LICENSING.md.
+Vericto S.A.S. also offers separate commercial licenses. A commercial license
+exists only in a signed agreement and does not change the AGPL permissions of
+other recipients. Contact legal@vericto.com. See LICENSING.md.
 
-vericto-engine, Vericto's SQL engine (Copyright 2026 Vericto S.A.S.), is
-compiled into the vericto-proxy binary. The release it pins (v4.3.0 in
-vericto-proxy 4.14.0) is itself licensed under FSL-1.1-ALv2.
+License history:
 
-The vericto-proxy binary also contains third-party Rust crates and the C code
-that the pg_query crate compiles in (libpg_query, PostgreSQL, protobuf-c and
-xxHash) and, since 4.19.0, that the libmimalloc-sys crate compiles in (mimalloc),
-each under its own license. The Docker image lists them with their
-license texts in /usr/share/doc/vericto-proxy/THIRD_PARTY_LICENSES, which
-third-party/build-notices.sh generates when the image is built.
+- v5.0.0 and later: AGPL-3.0-only, or a separate commercial license;
+- v4.14.0 through v4.23.0: FSL-1.1-ALv2, with the future Apache-2.0 grant in
+  that license; and
+- v4.13.0 and earlier: Elastic-2.0.
 
-"Vericto" and the Vericto logo are trademarks of Vericto S.A.S. The licenses
-grant no right to use them; see TRADEMARKS.md.
+LICENSE_HISTORY.md identifies release tags, commits and documented dates. The
+license file distributed with each version controls that version.
+
+Embedded Vericto component:
+
+- vericto-engine is compiled into the vericto-proxy binary. Version 5.0.0 of
+  the proxy pins version 5.0.0 of the engine. Both public components use
+  AGPL-3.0-only. Earlier engine and proxy versions retain the licenses under
+  which Vericto made them available.
+
+Third-party software:
+
+- the binary contains third-party Rust crates and C code compiled by pg_query,
+  including libpg_query, PostgreSQL, protobuf-c and xxHash;
+- it also contains mimalloc through libmimalloc-sys where enabled; and
+- each third-party component remains under its own license.
+
+The container includes:
+
+- the generated compiled-dependency inventory and controlling texts at
+  `/usr/share/doc/vericto-proxy/THIRD_PARTY_LICENSES`;
+- the pinned Chainguard runtime package inventory, source locations and license
+  texts at `/usr/share/doc/vericto-proxy/RUNTIME_BASE_LICENSES`; and
+- the runtime packages' SPDX documents under `/var/lib/db/sbom`.
+
+`third-party/build-notices.sh` builds `THIRD_PARTY_LICENSES` for the exact Rust
+and C dependency graph shipped in the binary. `third-party/runtime-base.txt`
+covers the pinned runtime image.
+
+"Vericto" and the Vericto logo are marks of Vericto S.A.S. The software
+licenses do not grant a general right to use them. See TRADEMARKS.md.
+
+The contents of this NOTICE file are informational. They do not modify the
+AGPL or any third-party license.

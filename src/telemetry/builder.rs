@@ -1,5 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Vericto S.A.S.
-// SPDX-License-Identifier: FSL-1.1-ALv2
+// SPDX-License-Identifier: AGPL-3.0-only
 
 //! Telemetry events built off the query path (4.19.0,
 //! `VERICTO_TELEMETRY_BUILD_QUEUE`).

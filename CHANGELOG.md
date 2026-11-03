@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **License and major version.** Version 5.0.0 and later is available under the
+  GNU Affero General Public License, version 3 only (`AGPL-3.0-only`), or under
+  a separate commercial license from Vericto S.A.S. `LICENSE` is the official
+  AGPL text, unmodified. Versions 4.14.0 through 4.23.0 retain FSL-1.1-ALv2 and
+  its future Apache-2.0 grant; versions 4.13.0 and earlier retain Elastic-2.0.
+  Proxy behavior, protocols, configuration and telemetry are unchanged.
+- `LICENSE_HISTORY.md` records the tag and SHA of the last FSL release and the
+  documented public dates used for its future-license schedule. Tag `v5.0.0`
+  will identify the first AGPL release.
+- Version 5.0.0 pins vericto-engine 5.0.0. Both Vericto crates use
+  `AGPL-3.0-only` in their public metadata and generated image notices.
+- `Cargo.toml`, image metadata and source headers declare `AGPL-3.0-only`.
+  `NOTICE`, `LICENSING.md`, README, CONTRIBUTING and TRADEMARKS describe the
+  new license without changing the AGPL text.
+- CLA 1.1 aligns the contribution grant with dual licensing, the actual GitHub
+  comment-signature workflow, moral-right consent, enforcement cooperation,
+  employer authorization and AI-assisted contributions. CLA 1.0 is preserved;
+  new signatures use a separate v1.1 record.
+- `deny.toml` and `third-party/about.toml` allow `AGPL-3.0-only` only for
+  vericto-proxy and vericto-engine. Third-party copyleft or source-available
+  dependencies remain blocked from the commercially licensed binary.
+
 ## [4.23.0] - 2026-10-31
 
 **Engine 4.7: existing rules catch the same destructive operation through more
@@ -3102,7 +3126,8 @@ the service now targets the rebranded engine.
 - Optional control-plane link: ruleset hot-sync and telemetry reporting.
 - `/health` and `/metrics` (p50/p99 latency) endpoints.
 
-[Unreleased]: https://github.com/vericto/vericto-proxy/compare/v4.7.1...HEAD
+[Unreleased]: https://github.com/vericto/vericto-proxy/compare/v4.23.0...HEAD
+[4.23.0]: https://github.com/vericto/vericto-proxy/compare/v4.22.0...v4.23.0
 [4.7.1]: https://github.com/vericto/vericto-proxy/compare/v4.7.0...v4.7.1
 [4.7.0]: https://github.com/vericto/vericto-proxy/compare/v4.6.0...v4.7.0
 [4.6.0]: https://github.com/vericto/vericto-proxy/compare/v4.5.1...v4.6.0

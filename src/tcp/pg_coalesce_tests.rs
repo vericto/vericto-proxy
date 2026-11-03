@@ -1,5 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Vericto S.A.S.
-// SPDX-License-Identifier: FSL-1.1-ALv2
+// SPDX-License-Identifier: AGPL-3.0-only
 
 //! 4.17.3: the frontend messages framed from one client read go to the
 //! database in one write and one flush ([`crate::tcp::session::UpstreamSender`]),

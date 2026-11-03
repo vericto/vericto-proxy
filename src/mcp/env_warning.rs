@@ -1,5 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Vericto S.A.S.
-// SPDX-License-Identifier: FSL-1.1-ALv2
+// SPDX-License-Identifier: AGPL-3.0-only
 
 //! "The agent may also have credentials" (design "MCP execution modes" §12.1,
 //! T9). In stdio mode the server runs as the same OS user as the agent, with

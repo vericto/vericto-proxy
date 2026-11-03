@@ -1,157 +1,141 @@
 # Licensing
 
-vericto-proxy is **source-available** under the
-[Functional Source License, Version 1.1, ALv2 Future License](LICENSE)
-(SPDX `FSL-1.1-ALv2`), from version 4.14.0 on. Each version becomes
-**open source under the [Apache License 2.0](https://www.apache.org/licenses/LICENSE-2.0)**
-two years after Vericto makes it available.
+`vericto-proxy` version 5.0.0 and later is available under either:
 
-| Versions | License |
+1. the [GNU Affero General Public License, version 3 only](LICENSE)
+   (`AGPL-3.0-only`); or
+2. a separate commercial license from Vericto S.A.S.
+
+You may choose the AGPL without asking Vericto. A commercial license applies
+only after Vericto and the customer sign an agreement covering the relevant
+software and use.
+
+| Source release | License |
 |---|---|
-| 4.14.0 and later | [FSL-1.1-ALv2](LICENSE); each version also under Apache-2.0 from the second anniversary of its publication |
-| 4.13.0 and earlier | [Elastic License 2.0](https://www.elastic.co/licensing/elastic-license) (SPDX `Elastic-2.0`), unchanged |
+| 5.0.0 and later | AGPL-3.0-only, or a separate commercial license from Vericto S.A.S. |
+| 4.14.0 through 4.23.0 | FSL-1.1-ALv2, including its future Apache-2.0 grant |
+| 4.13.0 and earlier | Elastic-2.0 |
 
-The licensor is Vericto S.A.S. (see [NOTICE](NOTICE)). This page is a summary
-written to help you; it is not legal advice and does not change the license.
-If this page and [LICENSE](LICENSE) disagree, LICENSE applies.
+The exact tags, commits and documented publication dates are in
+[LICENSE_HISTORY.md](LICENSE_HISTORY.md). The license text distributed with a
+specific version controls that version.
 
-## The engine inside the binary
+This page is a practical summary, not legal advice and not an additional
+license. If it conflicts with [LICENSE](LICENSE), LICENSE controls the public
+AGPL option.
 
-vericto-proxy compiles in [vericto-engine](https://github.com/vericto/vericto-engine),
-Vericto's own SQL engine. vericto-proxy 4.14.0 pins vericto-engine v4.3.0,
-which is licensed under FSL-1.1-ALv2 like the proxy, so the whole binary,
-engine included, is under one license; the engine's crate metadata and its
-entry in the image's `THIRD_PARTY_LICENSES` say `FSL-1.1-ALv2`. Earlier
-vericto-engine releases, 4.2.0 and before, stay under the Elastic License 2.0.
+## AGPL option
 
-The third-party crates and C libraries in the binary keep their own licenses;
-the Docker image lists them with their license texts in
-`/usr/share/doc/vericto-proxy/THIRD_PARTY_LICENSES`.
+The AGPL is an OSI-approved open-source license. It permits use, modification,
+distribution and commercial activity, subject to its conditions.
 
-## FAQ
+Important cases include:
 
-### Is vericto-proxy open source?
+- **Running an unmodified copy.** The AGPL gives unlimited permission to run an
+  unmodified copy. Merely operating it through a network does not by itself
+  trigger section 13.
+- **Distributing source or binaries.** Sections 4 through 6 require the license
+  notices and, for covered object code, the complete corresponding source by
+  one of the permitted methods. A covered combined work must be licensed as a
+  whole under the AGPL, as section 5(c) requires. Separate components may keep
+  compatible licenses where the AGPL permits that combination.
+- **Modified network use.** If you modify the Program and users interact with
+  that modified version remotely through a computer network, section 13
+  requires you to offer those users the corresponding source of that version
+  at no charge through a standard or customary means.
+- **Internal use.** Making or modifying a private copy without conveying it is
+  generally permitted by section 2. Section 13 can still matter if users
+  interact remotely with a modified version. A parent, subsidiary or other
+  affiliate is a separate legal person unless applicable law provides
+  otherwise.
 
-Not yet. The FSL is not an [OSI-approved](https://opensource.org/licenses)
-license, so we call vericto-proxy "source-available". Every version becomes open
-source on a fixed date: two years after we make it available, it is also
-licensed under the Apache License 2.0, irrevocably.
+Whether the proxy and another component form one covered work is a
+fact-specific copyright question. Packaging, linking, process boundaries and
+the substance of communication can be relevant, but none decides every case
+by itself. Vericto does not grant an exception through this FAQ. Obtain your
+own legal advice or a commercial license when a closed-source integration
+depends on that conclusion.
 
-### What can I do with it?
+The AGPL does not prohibit a competitor from using, modifying, selling or
+providing the software as a service when the competitor complies with the
+license. Its network-source rule applies to modified versions; it is not a
+non-compete restriction.
 
-Anything that is not a Competing Use (next question). In particular, you can:
+## Embedded engine
 
-- read, build, run, copy and modify the code;
-- use it in production for your own organization, including inside a
-  for-profit company ("internal use and access");
-- build it into your own product or service, as long as that product or
-  service is not a Competing Use;
-- use it for non-commercial education and non-commercial research;
-- provide professional services, such as consulting or integration, to a
-  customer who uses it under the license;
-- redistribute copies, modified or not, with a copy of (or a link to) the
-  license, keeping the copyright notices.
+Version 5.0.0 pins `vericto-engine` version 5.0.0. Both public components use
+`AGPL-3.0-only`, so the public binary and its Vericto source components have a
+single compatible public-license path. Third-party components keep their own
+licenses.
 
-### What is not allowed?
+A separate commercial agreement for the proxy may include rights for the
+engine it embeds when the agreement says so. This FAQ does not itself grant a
+commercial license.
 
-A **Competing Use**: making the software available to others in a commercial
-product or service that
+The container includes the project license, project notice, compiled dependency
+notices and runtime-base license texts at `/usr/share/doc/vericto-proxy/`. It
+also retains the base packages' SPDX documents under `/var/lib/db/sbom`.
+Image labels identify the source repository and exact proxy revision; the
+release `Cargo.lock` identifies the exact engine tag and commit. Together they
+provide the directions needed to locate the corresponding Vericto source for
+the image.
 
-1. substitutes for the software;
-2. substitutes for any other product or service Vericto offers using the
-   software that exists when that version is made available; or
-3. offers the same or substantially similar functionality as the software.
+## Commercial option
 
-For example, selling a SQL firewall or SQL-guardrail product or service, hosted
-or self-managed, that is built on vericto-proxy is a Competing Use. Running
-vericto-proxy to protect your own databases is not.
+A commercial license is available for organizations that want rights beyond
+the AGPL option, such as:
 
-How Vericto reads these terms, for example:
+- embedding the proxy in a closed-source distributed product;
+- distributing a modified version without applying the AGPL to the covered
+  combined work;
+- operating a modified version without the section 13 source offer; or
+- satisfying an organizational policy that does not permit AGPL software.
 
-- Selling others a hosted or managed service that checks, blocks or rewrites
-  their SQL with vericto-proxy is a Competing Use, including when it runs
-  inside each customer's own account. Operating vericto-proxy for one customer
-  as part of consulting or integration work, where that customer holds the
-  license and the work is not sold as a product, is a permitted professional
-  service.
-- A product that costs nothing but is offered as part of a commercial business
-  (to win customers for a paid product, bundled with one, or as the free tier
-  of one) is still a commercial product.
-- Building vericto-proxy into a larger product that blocks, flags or rewrites
-  SQL for others offers substantially similar functionality, even when
-  guardrails are not that product's main purpose.
+Scope, price, included components, support, warranties and other conditions
+are set only by the signed commercial agreement. Vericto may decline a
+request. Until an agreement is signed, only the AGPL option applies to version
+5.0.0 and later.
 
-Not sure whether your case is a Competing Use? Write to
-[legal@vericto.com](mailto:legal@vericto.com) before you rely on it.
+Contact [legal@vericto.com](mailto:legal@vericto.com) with the company name,
+product, version and intended deployment or distribution model.
 
-### When does a version become Apache-2.0?
+## Older versions
 
-On the second anniversary of the date Vericto made that version available:
-a published release, a pushed commit or a published package each count. A
-version released on 2026-11-01 is available under the Apache License 2.0 from
-2028-11-01, while newer versions are still under the FSL until their own date.
-To find the newest commit that is already two years old:
+A license change does not revoke permissions already granted for an older
+version.
 
-```sh
-git rev-list -n 1 --before="2 years ago" main
-```
+- Versions 4.14.0 through 4.23.0 remain under the Functional Source License,
+  Version 1.1, ALv2 Future License. Each version receives Apache License 2.0 on
+  the second anniversary of the date Vericto first made that version
+  available. See [LICENSE_HISTORY.md](LICENSE_HISTORY.md); the FSL text in each
+  tag controls that version.
+- Versions 4.13.0 and earlier remain under Elastic License 2.0. The license
+  text in each tag controls those versions.
 
-### What about versions released before 4.14.0?
+Security fixes are made for supported releases under [SECURITY.md](SECURITY.md).
 
-vericto-proxy 4.13.0 and earlier, and every commit before the one that introduced
-the FSL, were released under the Elastic License 2.0 and stay under it. Nothing
-you received under it is taken away. The FSL applies only to 4.14.0 and later.
-If you move to a newer version, the FSL applies to that version.
+## Other Vericto projects
 
-Those versions are no longer maintained and receive no security fixes (see
-[SECURITY.md](SECURITY.md)). The Elastic License 2.0 does not allow providing
-them to others as a hosted or managed service, or removing their license
-notices, and it grants no right to the Vericto marks: a modified build must not
-carry a Vericto name (see [TRADEMARKS.md](TRADEMARKS.md)).
+This repository licenses only `vericto-proxy`. Other projects, SDKs and hosted
+services are governed by their own license or terms for the version received.
+Nothing here changes another project's terms.
 
-### Can I get a commercial license?
+## Contributions
 
-Yes. You probably don't need one: the FSL already lets you run vericto-proxy to
-protect your own databases, and build it into a product that is not a Competing
-Use. Integrating with Vericto through its API or MCP server needs no commercial
-license either; that use is governed by the [Terms of
-Service](https://vericto.com/terms).
+Contributions are governed by the Vericto Individual Contributor License
+Agreement ([CLA.md](CLA.md)). It gives Vericto the rights needed to distribute
+accepted contributions under the public project license and separate
+commercial licenses while the contributor keeps copyright. The permanent text
+of the current agreement is
+[legal/cla/1.1.md](legal/cla/1.1.md).
 
-A commercial license is for cases the FSL does not cover:
+See [CONTRIBUTING.md](CONTRIBUTING.md) and [AI_POLICY.md](AI_POLICY.md).
 
-- **OEM / embedding.** You want SQL guardrails inside your own product or
-  hosted service (for example a database gateway, a connection pooler or a
-  managed database platform) in a way that would be a Competing Use. An OEM
-  license lets you embed and distribute vericto-proxy, modified or not, in the
-  product named in the agreement. OEM agreements normally include attribution,
-  such as "powered by Vericto"; the agreement grants the trademark permission
-  that [TRADEMARKS.md](TRADEMARKS.md) otherwise requires in writing, and sets
-  how modified builds may be described.
-- **Other terms.** Your organization cannot accept the FSL and needs
-  vericto-proxy under different terms.
+## Trademarks and third-party software
 
-Scope, price, support and update commitments are agreed in each contract. OEM
-and Enterprise agreements can include a continuity clause: if Vericto stops
-offering and maintaining the licensed component and no successor takes it over,
-the licensee receives the version covered by its agreement under the Apache
-License 2.0. Vericto reviews every request and may decline it. Until an
-agreement is signed, the FSL applies. A commercial license does not change the
-FSL for anyone else, and every FSL version still becomes Apache-2.0 on its
-second anniversary.
+No software license grants a general right to use the Vericto marks. See
+[TRADEMARKS.md](TRADEMARKS.md).
 
-To ask, write to [enterprise@vericto.com](mailto:enterprise@vericto.com) with
-your company, the product vericto-proxy would go into, how it is distributed
-(hosted, self-managed or both), the SQL dialects you need and the expected
-scale. Not sure whether you need a license? Write to
-[legal@vericto.com](mailto:legal@vericto.com) first.
-
-### How are contributions licensed?
-
-Contributors sign the Vericto Contributor License Agreement ([CLA.md](CLA.md)),
-which lets Vericto distribute contributions under this license, under the
-Apache License 2.0 when a version converts, and under its commercial licenses.
-See [CONTRIBUTING.md](CONTRIBUTING.md).
-
-### Can I use the Vericto name and logo?
-
-The license does not grant trademark rights. See [TRADEMARKS.md](TRADEMARKS.md).
+Third-party components remain under their own licenses. The container's
+`THIRD_PARTY_LICENSES` file is generated by
+[third-party/build-notices.sh](third-party/build-notices.sh).

@@ -1,23 +1,5 @@
-# Contributor License Agreement check, run in GitHub Actions. It replaces
-# cla-assistant.io, whose webhook failed on every delivery on 2026-10-17 and
-# 2026-10-18 and left pull requests without a status.
-#
-# CLA Assistant Lite asks every commit author of a pull request who has not
-# signed the Vericto ICLA (CLA.md, v1.0) to sign it by commenting
-#   I have read the CLA Document and I hereby sign the CLA
-# and records the signature (GitHub login and id, comment id, time, pull
-# request) in signatures/v1.0/cla.json on the `cla-signatures` branch of this
-# repository. A maintainer creates that branch and file once, before the first
-# run: the action does not create them. Commenting `recheck` reruns the check.
-#
-# Safety: pull_request_target runs this file from the base branch with a
-# write token, for pull requests from forks too. It must never check out,
-# build or run code from the pull request: there is no actions/checkout here
-# and none may be added. The action reads the pull request's commits and
-# comments through the API only, and the comment text is only compared in
-# `if:`, never passed to a shell.
-#
-# The job name `CLA` is a required status check in the branch ruleset: keep it.
+# Vericto CLA 1.1 check. This workflow runs only base-branch code and GitHub API
+# calls. It never checks out, builds or executes pull-request code.
 name: CLA
 
 on:
@@ -31,39 +13,163 @@ permissions: {}
 jobs:
   cla:
     name: CLA
-    # Every pull request event; on comments, only the two the action acts on,
-    # and only on pull requests (issue_comment also fires on issues).
     if: >-
       github.event_name == 'pull_request_target' ||
       (github.event.issue.pull_request &&
         (github.event.comment.body == 'recheck' ||
-          contains(github.event.comment.body, 'I have read the CLA Document and I hereby sign the CLA')))
+          github.event.comment.body == 'I have read the CLA Document and I hereby sign the CLA'))
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
-      actions: write # rerun the pull request's failed CLA run after a signature
-      contents: write # commit signatures to the cla-signatures branch
-      pull-requests: write # post and update the comment, lock the closed pull request
+      actions: write
+      contents: write
+      issues: write
+      pull-requests: write
     steps:
-      # The repository is archived upstream (v2.6.1 is the last release); the
-      # commit is pinned, so nothing changes under us. It targets Node 20 and
-      # runs on the runner's Node 24.
-      - name: Check the CLA signatures
-        uses: contributor-assistant/github-action@ca4a40a7d1004f18d9960b404b97e5f30a505a08 # v2.6.1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Validate authorship and CLA signatures
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
         with:
-          path-to-document: https://github.com/${{ github.repository }}/blob/main/CLA.md
-          path-to-signatures: signatures/v1.0/cla.json
-          branch: cla-signatures
-          # Exact logins, no wildcards: the maintainers and the bots that commit here.
-          allowlist: vericto,donkan168,vericto-bot[bot],dependabot[bot],github-actions[bot]
-          custom-notsigned-prcomment: >-
-            Thank you for your pull request. Before it can be merged, $you need to sign the
-            [Vericto Individual Contributor License Agreement](https://github.com/${{ github.repository }}/blob/main/CLA.md),
-            version 1.0. You keep the copyright in your contribution; the agreement gives
-            Vericto S.A.S. a license to distribute it. Read it, then sign by posting a comment
-            on this pull request with exactly the sentence below. If you contribute on behalf
-            of an employer, write to legal@vericto.com first.<br/>
-          # Keep the signature comment on record once the pull request is closed.
-          lock-pullrequest-aftermerge: true
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const number = context.issue.number || context.payload.pull_request?.number;
+            const claVersion = "1.1";
+            const claPath = "legal/cla/1.1.md";
+            const signaturePath = "signatures/v1.1/cla.json";
+            const signatureBranch = "cla-signatures";
+            const signatureSentence = "I have read the CLA Document and I hereby sign the CLA";
+            const marker = "<!-- vericto-cla-check -->";
+            const claDocumentSha256 = "2e68144074fba8c31aeece81011217388467589a9f133aa2271cb76852931f7a";
+            // Exact logins, no wildcards. Maintainer contributions are covered by
+            // the copyright assignment to Vericto S.A.S., not by the CLA.
+            const exemptAccounts = new Set(["vericto", "donkan168"]);
+            const allowedBots = new Set(["vericto-bot[bot]", "dependabot[bot]", "github-actions[bot]"]);
+
+            if (!number) {
+              core.setFailed("CLA check could not identify the pull request");
+              return;
+            }
+            const pull = (await github.rest.pulls.get({ owner, repo, pull_number: number })).data;
+            if (context.eventName === "pull_request_target" && context.payload.action === "closed") {
+              await github.rest.issues.lock({ owner, repo, issue_number: number, lock_reason: "resolved" });
+              return;
+            }
+
+            const claFile = (await github.rest.repos.getContent({
+              owner, repo, path: claPath, ref: context.payload.repository.default_branch,
+            })).data;
+            const actualClaSha256 = require("crypto")
+              .createHash("sha256")
+              .update(Buffer.from(claFile.content, "base64"))
+              .digest("hex");
+            if (actualClaSha256 !== claDocumentSha256) {
+              core.setFailed(`${claPath} changed without a new CLA version and signature path`);
+              return;
+            }
+
+            const commits = await github.paginate(github.rest.pulls.listCommits, {
+              owner, repo, pull_number: number, per_page: 100,
+            });
+            if (commits.length > 100) {
+              core.setFailed("CLA verification supports at most 100 commits; split this pull request");
+              return;
+            }
+
+            const humans = new Map();
+            for (const commit of commits) {
+              if (/^Co-authored-by:/mi.test(commit.commit.message)) {
+                core.setFailed(`Commit ${commit.sha} has Co-authored-by trailers; use separate commits so every human can sign`);
+                return;
+              }
+              const author = commit.author;
+              if (!author) {
+                core.setFailed(`Commit ${commit.sha} has no GitHub-linked author; link the author email or amend it`);
+                return;
+              }
+              if (author.type === "Bot" || author.login.endsWith("[bot]")) {
+                if (!allowedBots.has(author.login) || commit.commit.verification?.verified !== true) {
+                  core.setFailed(`Commit ${commit.sha} is attributed to an unapproved or unverified bot`);
+                  return;
+                }
+              } else if (!exemptAccounts.has(author.login)) {
+                humans.set(author.id, { name: author.login, id: author.id });
+              }
+            }
+
+            async function readSignatures() {
+              try {
+                const file = (await github.rest.repos.getContent({
+                  owner, repo, path: signaturePath, ref: signatureBranch,
+                })).data;
+                return {
+                  file,
+                  data: JSON.parse(Buffer.from(file.content, "base64").toString("utf8")),
+                };
+              } catch (error) {
+                if (error.status !== 404) throw error;
+                return { file: null, data: { signedContributors: [] } };
+              }
+            }
+
+            let signatures = await readSignatures();
+            if (context.eventName === "issue_comment" && context.payload.comment.body === signatureSentence) {
+              const signer = context.payload.comment.user;
+              if (!humans.has(signer.id)) {
+                core.setFailed("Only a human commit author on this pull request may sign its CLA");
+                return;
+              }
+              if (!signatures.data.signedContributors.some(entry => entry.id === signer.id)) {
+                signatures.data.signedContributors.push({
+                  name: signer.login,
+                  id: signer.id,
+                  comment_id: context.payload.comment.id,
+                  created_at: context.payload.comment.created_at,
+                  repoId: context.payload.repository.id,
+                  pullRequestNo: number,
+                  cla_version: claVersion,
+                  cla_document_sha256: claDocumentSha256,
+                });
+                await github.rest.repos.createOrUpdateFileContents({
+                  owner, repo, path: signaturePath, branch: signatureBranch,
+                  message: `${signer.login} signed Vericto CLA ${claVersion} in #${number}`,
+                  content: Buffer.from(JSON.stringify(signatures.data, null, 2) + "\n").toString("base64"),
+                  ...(signatures.file?.sha ? { sha: signatures.file.sha } : {}),
+                });
+                signatures = await readSignatures();
+              }
+            }
+
+            const signedIds = new Set(signatures.data.signedContributors
+              .filter(entry => entry.cla_version === claVersion &&
+                entry.cla_document_sha256 === claDocumentSha256)
+              .map(entry => entry.id));
+            const unsigned = [...humans.values()].filter(author => !signedIds.has(author.id));
+
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              owner, repo, issue_number: number, per_page: 100,
+            });
+            const prior = comments.find(comment =>
+              comment.user?.login === "github-actions[bot]" && comment.body?.includes(marker));
+            const body = unsigned.length
+              ? `${marker}\nThe following commit authors must read [Vericto ICLA 1.1](https://github.com/${owner}/${repo}/blob/main/${claPath}) and post this exact comment:\n\n\`${signatureSentence}\`\n\nUnsigned: ${unsigned.map(author => `@${author.name}`).join(", ")}\n\nIf the check does not rerun, comment \`recheck\`.`
+              : `${marker}\nAll contributors have signed the CLA ✍️ ✅<br/><sub>Posted by the CLA Assistant Lite bot.</sub>`;
+            if (prior) {
+              await github.rest.issues.updateComment({ owner, repo, comment_id: prior.id, body });
+            } else {
+              await github.rest.issues.createComment({ owner, repo, issue_number: number, body });
+            }
+
+            if (unsigned.length) {
+              core.setFailed(`Unsigned CLA authors: ${unsigned.map(author => author.name).join(", ")}`);
+              return;
+            }
+
+            if (context.eventName === "issue_comment") {
+              const runs = await github.paginate(github.rest.actions.listWorkflowRuns, {
+                owner, repo, workflow_id: "cla.yml", event: "pull_request_target", per_page: 100,
+              });
+              const failed = runs.find(run => run.head_sha === pull.head.sha && run.conclusion === "failure");
+              if (failed) {
+                await github.rest.actions.reRunWorkflow({ owner, repo, run_id: failed.id });
+              }
+            }

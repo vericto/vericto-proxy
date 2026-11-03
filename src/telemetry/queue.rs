@@ -1,5 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Vericto S.A.S.
-// SPDX-License-Identifier: FSL-1.1-ALv2
+// SPDX-License-Identifier: AGPL-3.0-only
 
 //! Event queue abstraction with two implementations selected by config:
 //!   - MemoryQueue: bounded in-memory ring buffer (default).

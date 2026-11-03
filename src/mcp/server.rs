@@ -1,5 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Vericto S.A.S.
-// SPDX-License-Identifier: FSL-1.1-ALv2
+// SPDX-License-Identifier: AGPL-3.0-only
 
 //! The MCP protocol layer (JSON-RPC 2.0), shared by the stdio and the
 //! Streamable HTTP transports: `initialize`, `ping`, `tools/list`,

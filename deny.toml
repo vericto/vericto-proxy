@@ -20,8 +20,8 @@ version = 2
 # The licenses the dependency tree uses today (third-party/about.toml lists the
 # subset that ships in the image). A dependency under any other license fails
 # the check until it has been reviewed and added here. Vericto's own crates are
-# in `exceptions` below, so a third-party dependency under a source-available
-# license still fails.
+# in `exceptions` below, so a third-party dependency under a copyleft or
+# source-available license still fails.
 allow = [
     "Apache-2.0",
     "Apache-2.0 WITH LLVM-exception",
@@ -34,11 +34,12 @@ allow = [
     "Zlib",
 ]
 confidence-threshold = 0.9
-# Vericto's own crates: this one is FSL-1.1-ALv2 since 4.14.0, and
-# vericto-engine since 4.3.0 (the tag Cargo.toml pins).
+# AGPL-3.0-only is accepted only for Vericto's proxy and embedded engine.
+# A third-party copyleft or source-available dependency still fails because
+# Vericto must retain the right to distribute the same code commercially.
 exceptions = [
-    { allow = ["FSL-1.1-ALv2"], crate = "vericto-proxy" },
-    { allow = ["FSL-1.1-ALv2"], crate = "vericto-engine" },
+    { allow = ["AGPL-3.0-only"], crate = "vericto-proxy" },
+    { allow = ["AGPL-3.0-only"], crate = "vericto-engine" },
 ]
 
 [bans]

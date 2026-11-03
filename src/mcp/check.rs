@@ -1,5 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Vericto S.A.S.
-// SPDX-License-Identifier: FSL-1.1-ALv2
+// SPDX-License-Identifier: AGPL-3.0-only
 
 //! `check_sql` in Proxy mode (design "MCP execution modes" §6.1, Q4):
 //! evaluated locally by the same evaluator `execute_sql` uses, under the

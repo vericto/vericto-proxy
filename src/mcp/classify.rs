@@ -1,5 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Vericto S.A.S.
-// SPDX-License-Identifier: FSL-1.1-ALv2
+// SPDX-License-Identifier: AGPL-3.0-only
 
 //! The statement-class check of `execute_sql` (design "MCP execution modes"
 //! §8.4 and §9.1): which permission tier a PostgreSQL statement needs, computed

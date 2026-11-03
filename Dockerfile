@@ -97,11 +97,11 @@ FROM cgr.dev/chainguard/glibc-dynamic:latest@sha256:5bb932663cff4fb276186720e035
 # Owned by root and not writable by the user the proxy runs as.
 COPY --from=builder /app/target/release/vericto-proxy /usr/local/bin/vericto-proxy
 
-# The Functional Source License requires that anyone who receives the software
-# also receives its terms (or a link to them) and its copyright notices, and the
-# dependencies' licenses require their notices to go with binary copies, so all
-# three files ship next to the binary.
+# The AGPL terms, project notice, compiled dependency notices and runtime-base
+# license texts ship next to the binary. The base image also retains package
+# SPDX documents under /var/lib/db/sbom.
 COPY LICENSE NOTICE /usr/share/doc/vericto-proxy/
+COPY third-party/runtime-base.txt /usr/share/doc/vericto-proxy/RUNTIME_BASE_LICENSES
 COPY --from=builder /app/THIRD_PARTY_LICENSES /usr/share/doc/vericto-proxy/
 
 # Chainguard's non-root user (`nonroot`, 65532:65532). Up to 4.15.1 the image ran as

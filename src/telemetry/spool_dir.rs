@@ -1,5 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Vericto S.A.S.
-// SPDX-License-Identifier: FSL-1.1-ALv2
+// SPDX-License-Identifier: AGPL-3.0-only
 
 //! One spool directory per proxy on a shared volume (since 4.12.0,
 //! `VERICTO_TELEMETRY_SPOOL_SUBDIR`).
