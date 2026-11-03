@@ -53,11 +53,11 @@ fn cla_workflow_uses_the_permanent_v1_1_document_and_record() {
     let workflow = root(".github/workflows/cla.yml");
     assert!(workflow.contains("const claPath = \"legal/cla/1.1.md\";"));
     assert!(workflow.contains("signatures/v1.1/cla.json"));
-    assert!(
-        workflow.contains(
-            "const allowedBots = new Set([\"dependabot[bot]\", \"github-actions[bot]\"]);"
-        )
-    );
+    assert!(workflow.contains("const exemptAccounts = new Set([\"vericto\", \"donkan168\"]);"));
+    assert!(workflow.contains(
+        "const allowedBots = new Set([\"vericto-bot[bot]\", \"dependabot[bot]\", \"github-actions[bot]\"]);"
+    ));
+    assert!(workflow.contains("} else if (!exemptAccounts.has(author.login)) {"));
     assert!(workflow.contains("context.payload.comment.body === signatureSentence"));
     assert!(!workflow.contains("contains(github.event.comment.body"));
     assert!(workflow.contains("github.paginate(github.rest.pulls.listCommits"));
@@ -67,7 +67,6 @@ fn cla_workflow_uses_the_permanent_v1_1_document_and_record() {
     assert!(workflow.contains("cla_document_sha256: claDocumentSha256"));
     assert!(workflow.contains("entry.cla_version === claVersion"));
     assert!(!workflow.contains("contributor-assistant/github-action"));
-    assert!(!workflow.contains("allowlist: vericto,donkan168"));
 }
 
 #[test]

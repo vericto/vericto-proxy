@@ -40,7 +40,10 @@ jobs:
             const signatureSentence = "I have read the CLA Document and I hereby sign the CLA";
             const marker = "<!-- vericto-cla-check -->";
             const claDocumentSha256 = "2e68144074fba8c31aeece81011217388467589a9f133aa2271cb76852931f7a";
-            const allowedBots = new Set(["dependabot[bot]", "github-actions[bot]"]);
+            // Exact logins, no wildcards. Maintainer contributions are covered by
+            // the copyright assignment to Vericto S.A.S., not by the CLA.
+            const exemptAccounts = new Set(["vericto", "donkan168"]);
+            const allowedBots = new Set(["vericto-bot[bot]", "dependabot[bot]", "github-actions[bot]"]);
 
             if (!number) {
               core.setFailed("CLA check could not identify the pull request");
@@ -88,9 +91,12 @@ jobs:
                   core.setFailed(`Commit ${commit.sha} is attributed to an unapproved or unverified bot`);
                   return;
                 }
-              } else {
+              } else if (!exemptAccounts.has(author.login)) {
                 humans.set(author.id, { name: author.login, id: author.id });
               }
+            }
+            if (humans.size === 0) {
+              return;
             }
 
             async function readSignatures() {
