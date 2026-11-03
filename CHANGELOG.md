@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [5.0.0] - 2026-11-03
+
 ### Changed
 
 - **License and major version.** Version 5.0.0 and later is available under the
@@ -3126,7 +3128,8 @@ the service now targets the rebranded engine.
 - Optional control-plane link: ruleset hot-sync and telemetry reporting.
 - `/health` and `/metrics` (p50/p99 latency) endpoints.
 
-[Unreleased]: https://github.com/vericto/vericto-proxy/compare/v4.23.0...HEAD
+[Unreleased]: https://github.com/vericto/vericto-proxy/compare/v5.0.0...HEAD
+[5.0.0]: https://github.com/vericto/vericto-proxy/compare/v4.23.0...v5.0.0
 [4.23.0]: https://github.com/vericto/vericto-proxy/compare/v4.22.0...v4.23.0
 [4.7.1]: https://github.com/vericto/vericto-proxy/compare/v4.7.0...v4.7.1
 [4.7.0]: https://github.com/vericto/vericto-proxy/compare/v4.6.0...v4.7.0
