@@ -58,6 +58,7 @@ fn cla_workflow_uses_the_permanent_v1_1_document_and_record() {
         "const allowedBots = new Set([\"vericto-bot[bot]\", \"dependabot[bot]\", \"github-actions[bot]\"]);"
     ));
     assert!(workflow.contains("} else if (!exemptAccounts.has(author.login)) {"));
+    assert!(workflow.contains("All contributors have signed the CLA ✍️ ✅"));
     assert!(workflow.contains("context.payload.comment.body === signatureSentence"));
     assert!(!workflow.contains("contains(github.event.comment.body"));
     assert!(workflow.contains("github.paginate(github.rest.pulls.listCommits"));

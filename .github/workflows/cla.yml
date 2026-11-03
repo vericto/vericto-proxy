@@ -95,9 +95,6 @@ jobs:
                 humans.set(author.id, { name: author.login, id: author.id });
               }
             }
-            if (humans.size === 0) {
-              return;
-            }
 
             async function readSignatures() {
               try {
@@ -155,7 +152,7 @@ jobs:
               comment.user?.login === "github-actions[bot]" && comment.body?.includes(marker));
             const body = unsigned.length
               ? `${marker}\nThe following commit authors must read [Vericto ICLA 1.1](https://github.com/${owner}/${repo}/blob/main/${claPath}) and post this exact comment:\n\n\`${signatureSentence}\`\n\nUnsigned: ${unsigned.map(author => `@${author.name}`).join(", ")}\n\nIf the check does not rerun, comment \`recheck\`.`
-              : `${marker}\nAll human commit authors have signed Vericto ICLA 1.1.`;
+              : `${marker}\nAll contributors have signed the CLA ✍️ ✅<br/><sub>Posted by the CLA Assistant Lite bot.</sub>`;
             if (prior) {
               await github.rest.issues.updateComment({ owner, repo, comment_id: prior.id, body });
             } else {
