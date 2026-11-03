@@ -1,5 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Vericto S.A.S.
-// SPDX-License-Identifier: FSL-1.1-ALv2
+// SPDX-License-Identifier: AGPL-3.0-only
 
 //! A scripted PostgreSQL that records every byte `vericto-proxy mcp` sends
 //! (design §7.6): the exact-bytes, smuggling and property tests assert on what

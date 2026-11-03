@@ -1,5 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Vericto S.A.S.
-// SPDX-License-Identifier: FSL-1.1-ALv2
+// SPDX-License-Identifier: AGPL-3.0-only
 
 //! The `vericto-proxy mcp` binary over stdio, as an MCP client spawns it:
 //! stdout carries JSON-RPC messages only (every log line goes to stderr), the

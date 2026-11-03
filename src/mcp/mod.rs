@@ -1,5 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Vericto S.A.S.
-// SPDX-License-Identifier: FSL-1.1-ALv2
+// SPDX-License-Identifier: AGPL-3.0-only
 
 //! `vericto-proxy mcp`: **Proxy mode** (design "MCP execution modes",
 //! milestone M1, the read tier). An MCP server, in the existing binary, that

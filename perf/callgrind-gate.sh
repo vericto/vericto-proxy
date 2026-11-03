@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # SPDX-FileCopyrightText: 2026 Vericto S.A.S.
-# SPDX-License-Identifier: FSL-1.1-ALv2
+# SPDX-License-Identifier: AGPL-3.0-only
 #
 # Instructions per statement of a vericto-proxy build, under callgrind, on the
 # corpus of examples/perf_gate.rs (docs/PERFORMANCE.md, "CI performance gate").

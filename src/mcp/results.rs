@@ -1,5 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Vericto S.A.S.
-// SPDX-License-Identifier: FSL-1.1-ALv2
+// SPDX-License-Identifier: AGPL-3.0-only
 
 //! Rows to JSON (design "MCP execution modes" §8.5, §8.6): text-format values
 //! converted by type OID, values over the cell cap cut and marked, the result

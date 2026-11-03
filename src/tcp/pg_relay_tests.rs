@@ -1,5 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Vericto S.A.S.
-// SPDX-License-Identifier: FSL-1.1-ALv2
+// SPDX-License-Identifier: AGPL-3.0-only
 
 //! The PostgreSQL backend relay of 4.17.2 (`postgres::relay_server_to_client`),
 //! driven directly: a scripted upstream on one side of an in-memory pipe, a

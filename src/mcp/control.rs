@@ -1,5 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Vericto S.A.S.
-// SPDX-License-Identifier: FSL-1.1-ALv2
+// SPDX-License-Identifier: AGPL-3.0-only
 
 //! The only SQL `vericto-proxy mcp` writes itself (design "MCP execution
 //! modes" §7.3): the transaction around every call, `ROLLBACK`, and the fixed

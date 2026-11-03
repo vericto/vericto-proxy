@@ -1,5 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Vericto S.A.S.
-// SPDX-License-Identifier: FSL-1.1-ALv2
+// SPDX-License-Identifier: AGPL-3.0-only
 
 //! `rewrite_limit` on the wire (4.17.0, engine 4.5.0): a business policy that
 //! bounds the reads of a principal. Under `VERICTO_POLICY_RULES=enforce` the
