@@ -92,7 +92,7 @@ RUN sh third-party/build-notices.sh THIRD_PARTY_LICENSES
 # Only the `latest` tag is free on cgr.dev, so it is pinned by digest and
 # Dependabot (docker, weekly) proposes the new digest; Chainguard does not
 # promise to keep old digests, so a stale pin can stop pulling.
-FROM cgr.dev/chainguard/glibc-dynamic:latest@sha256:671a621016fb33812136dea6182b1db957996d3c8c618187aaf86abd9b14af53 AS runner
+FROM cgr.dev/chainguard/glibc-dynamic:latest@sha256:aab5cd0b4cc5edd9c87b6e7aa9ddaa3fb6ffcec559b9e5473c55bbc937b65399 AS runner
 
 # Owned by root and not writable by the user the proxy runs as.
 COPY --from=builder /app/target/release/vericto-proxy /usr/local/bin/vericto-proxy
