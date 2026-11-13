@@ -41,8 +41,9 @@ pins vericto-engine 5.0.0. What changes is how it is shipped.
 
 ### Changed
 
-- **Runtime base image: `cgr.dev/chainguard/glibc-dynamic:latest@sha256:aab5cd0b…37b65399`**
-  (#105), from `671a6210…9b14af53`: glibc 2.44-r14 (was r10) and
+- **Runtime base image: `cgr.dev/chainguard/glibc-dynamic:latest@sha256:cb7aa468…983409eb`**
+  (after #105's `aab5cd0b…37b65399`), from `671a6210…9b14af53`: glibc 2.44-r16
+  (was r10; r16 fixes CVE-2026-84243), libgcc and libstdc++ 16.2.0-r3 and
   wolfi-baselayout 20230201-r31; same packages and licenses
   (`third-party/runtime-base.txt`, whose digest is now the pinned one; it still
   named `5bb93266…` in 5.0.0). `Dockerfile.local` moves with it.
