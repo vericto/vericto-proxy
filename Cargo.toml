@@ -1,6 +1,6 @@
 [package]
 name = "vericto-proxy"
-version = "5.0.0"
+version = "5.0.1"
 edition = "2024"
 rust-version = "1.88"
 description = "Vericto — database guardrails for AI agents — deterministic TCP wire-protocol proxy for customer infrastructure"
@@ -123,3 +123,9 @@ opt-level = 3
 lto = "thin"
 codegen-units = 1
 panic = "abort"
+
+# The profile that 'dist' builds the release binaries with: the release profile
+# as is (thin LTO, one codegen unit, panic = abort), without the container
+# image's PGO profile (docs/PERFORMANCE.md, "PGO").
+[profile.dist]
+inherits = "release"

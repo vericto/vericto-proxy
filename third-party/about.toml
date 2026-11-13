@@ -1,7 +1,10 @@
-# cargo-about configuration for THIRD_PARTY_LICENSES, generated while building the
-# Docker image (third-party/build-notices.sh). It covers what ships in the binary:
-# build and dev dependencies are left out, and so are crates that only compile for
-# targets the image is not built for (Windows, macOS, WASM).
+# cargo-about configuration for THIRD_PARTY_LICENSES (third-party/build-notices.sh).
+# The file is committed at the repository root and shipped in every release
+# archive (dist-workspace.toml `include`); the Docker image build generates it
+# again from this same configuration. CI fails when the committed file is not
+# current. It covers what ships in the binaries: build and dev dependencies are
+# left out, and so are crates that only compile for targets no release is built
+# for (WASM, for example).
 #
 # `accepted` is the list of licenses a dependency may use. A new dependency under
 # any other license fails the image build instead of shipping without review.
@@ -14,7 +17,14 @@ accepted = [
     "Unicode-3.0",
 ]
 
-targets = ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"]
+# The release targets of dist-workspace.toml (the image uses the two Linux ones).
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-apple-darwin",
+    "aarch64-apple-darwin",
+    "x86_64-pc-windows-msvc",
+]
 ignore-build-dependencies = true
 ignore-dev-dependencies = true
 

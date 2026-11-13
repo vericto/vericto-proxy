@@ -8,7 +8,7 @@ vendors protobuf-c and xxHash. cargo-about only sees the crate's own license
 crate's MIT notice is repeated below with its copyright lines, which the crate
 package does not include.
 
-Refresh this file when pg_query changes version: the image build stops if the
+Refresh this file when pg_query changes version: the notices build stops if the
 version below does not match Cargo.lock.
 
 pg_query version: 6.2.1

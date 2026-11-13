@@ -44,7 +44,7 @@ RUN cargo chef prepare --recipe-path recipe.json
 # ── Optional PGO profile (4.19.0) ─────────────────────────────────────────────
 # Empty unless the build is given one as a named context:
 #   docker buildx build --build-context pgo=<dir holding merged.profdata> .
-# release.yml trains it on the performance gate's corpus (perf/pgo-train.sh,
+# docker.yml trains it on the performance gate's corpus (perf/pgo-train.sh,
 # docs/PERFORMANCE.md "PGO"). Without it the build is the plain release build.
 FROM scratch AS pgo
 
@@ -92,7 +92,7 @@ RUN sh third-party/build-notices.sh THIRD_PARTY_LICENSES
 # Only the `latest` tag is free on cgr.dev, so it is pinned by digest and
 # Dependabot (docker, weekly) proposes the new digest; Chainguard does not
 # promise to keep old digests, so a stale pin can stop pulling.
-FROM cgr.dev/chainguard/glibc-dynamic:latest@sha256:aab5cd0b4cc5edd9c87b6e7aa9ddaa3fb6ffcec559b9e5473c55bbc937b65399 AS runner
+FROM cgr.dev/chainguard/glibc-dynamic:latest@sha256:cb7aa4681bef604e99ad3fb6fb365330a3ca24fcee56df0b60b27ac4983409eb AS runner
 
 # Owned by root and not writable by the user the proxy runs as.
 COPY --from=builder /app/target/release/vericto-proxy /usr/local/bin/vericto-proxy

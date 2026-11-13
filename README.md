@@ -63,7 +63,7 @@ docker network create vericto-demo
 docker run -d --name vericto-demo-db --network vericto-demo \
   -e POSTGRES_PASSWORD=demo postgres:17
 docker run -d --name vericto-demo-proxy --network vericto-demo \
-  -e UPSTREAM_HOST=vericto-demo-db vericto/vericto-proxy:5.0.0
+  -e UPSTREAM_HOST=vericto-demo-db vericto/vericto-proxy:5.0.1
 until docker exec vericto-demo-db pg_isready -q -h localhost -U postgres; do sleep 1; done
 
 docker run --rm --network vericto-demo postgres:17 \
@@ -75,7 +75,7 @@ docker run --rm --network vericto-demo postgres:17 \
   -c "SELECT id, email FROM users"
 ```
 
-The image comes from Docker Hub; `ghcr.io/vericto/vericto-proxy:5.0.0` serves the
+The image comes from Docker Hub; `ghcr.io/vericto/vericto-proxy:5.0.1` serves the
 same digest (see [Docker](#docker)).
 
 The `DELETE` without a `WHERE` never reaches the database; the one with a `WHERE`
@@ -103,6 +103,57 @@ docker rm -f vericto-demo-db vericto-demo-proxy && docker network rm vericto-dem
 For assertion-based coverage of the article's extended protocol, pipelines,
 prepared-policy refresh, TLS/SCRAM, cancellation, COPY and PostgreSQL 18 cases,
 run [`examples/postgres-wire-article/run.sh`](examples/postgres-wire-article/README.md).
+
+---
+
+## Install the native binary
+
+Every release from 5.0.1 on attaches prebuilt `vericto-proxy` binaries to its
+[GitHub Release](https://github.com/vericto/vericto-proxy/releases), so neither
+Docker nor a Rust toolchain is needed: the same binary runs the TCP proxy and
+`vericto-proxy mcp`.
+
+| Platform | Archive |
+|---|---|
+| Linux x86_64 (glibc 2.35 or later) | `vericto-proxy-x86_64-unknown-linux-gnu.tar.xz` |
+| Linux aarch64 (glibc 2.35 or later) | `vericto-proxy-aarch64-unknown-linux-gnu.tar.xz` |
+| macOS Apple silicon | `vericto-proxy-aarch64-apple-darwin.tar.xz` |
+| macOS Intel | `vericto-proxy-x86_64-apple-darwin.tar.xz` |
+| Windows x86_64 | `vericto-proxy-x86_64-pc-windows-msvc.zip` |
+
+On Linux and macOS the installer script picks the archive for the machine, checks
+its SHA-256 and puts `vericto-proxy` in `$CARGO_HOME/bin` (`~/.cargo/bin` by
+default), adding that directory to `PATH` in your shell profile if needed:
+
+```bash
+curl --proto '=https' --tlsv1.2 -LsSf \
+  https://github.com/vericto/vericto-proxy/releases/download/v5.0.1/vericto-proxy-installer.sh | sh
+vericto-proxy mcp --version
+```
+
+Or download an archive yourself. Each one has a `.sha256` file next to it (and
+`sha256.sum` lists them all), and a build provenance attestation (Sigstore,
+GitHub Actions) that ties it to this repository, the release workflow and the
+commit:
+
+```bash
+v=5.0.1 t=x86_64-unknown-linux-gnu
+base=https://github.com/vericto/vericto-proxy/releases/download/v$v
+curl -fL -O "$base/vericto-proxy-$t.tar.xz" -O "$base/vericto-proxy-$t.tar.xz.sha256"
+shasum -a 256 -c "vericto-proxy-$t.tar.xz.sha256"
+gh attestation verify "vericto-proxy-$t.tar.xz" --repo vericto/vericto-proxy
+tar -xJf "vericto-proxy-$t.tar.xz"   # vericto-proxy-$t/vericto-proxy
+```
+
+On Windows, check the `.zip` with `Get-FileHash -Algorithm SHA256` against its
+`.sha256` file (or `gh attestation verify`) and unpack it with `Expand-Archive`.
+There is no PowerShell installer yet. Each archive also carries `LICENSE`,
+`NOTICE` and `THIRD_PARTY_LICENSES`.
+
+The binaries are the plain release build; the container image adds
+profile-guided optimization, which runs a statement in fewer instructions
+([PGO](docs/PERFORMANCE.md#profile-guided-optimization-pgo)). To build from
+source instead, see [CONTRIBUTING.md](CONTRIBUTING.md#run-from-source).
 
 ---
 
@@ -239,7 +290,14 @@ built-in ruleset (the rules the TCP proxy runs standalone) and reports nothing:
 claude mcp add vericto-db -- \
   docker run -i --rm --user "$(id -u):$(id -g)" \
     -v ~/.config/vericto/shop.url:/run/secrets/db.url:ro \
-    vericto/vericto-proxy:5.0.0 /usr/local/bin/vericto-proxy mcp --database-url-file /run/secrets/db.url
+    vericto/vericto-proxy:5.0.1 /usr/local/bin/vericto-proxy mcp --database-url-file /run/secrets/db.url
+```
+
+Without Docker, with the [native binary](#install-the-native-binary):
+
+```bash
+claude mcp add vericto-db -- ~/.cargo/bin/vericto-proxy \
+  mcp --database-url-file ~/.config/vericto/shop.url
 ```
 
 **Connect to Vericto** for custom rules, business policies, sensitive-column masking,
@@ -322,25 +380,25 @@ To run from source and run the tests, see
 Release images are published on Docker Hub as
 [`vericto/vericto-proxy`](https://hub.docker.com/r/vericto/vericto-proxy) (from
 4.14.1 on) and at `ghcr.io/vericto/vericto-proxy`, for `linux/amd64` and
-`linux/arm64`, and pull without credentials. The release workflow copies the
-multi-arch index it pushed to GHCR, so both registries serve the same digest under
-the same tags (`<version>`, `<major>.<minor>`, `<major>` and `latest`): pull from
-whichever your environment allows.
+`linux/arm64`, and pull without credentials. The image workflow (`docker.yml`)
+copies the multi-arch index it pushed to GHCR, so both registries serve the same
+digest under the same tags (`<version>`, `<major>.<minor>`, `<major>` and
+`latest`): pull from whichever your environment allows.
 
 ```bash
 # Postgres. On Linux, add --add-host=host.docker.internal:host-gateway
 docker run --rm -e UPSTREAM_HOST=host.docker.internal -p 5433:5433 \
-  vericto/vericto-proxy:5.0.0
+  vericto/vericto-proxy:5.0.1
 
 # MySQL
 docker run --rm \
   -e VERICTO_WIRE_PROTOCOL=mysql \
   -e UPSTREAM_HOST=host.docker.internal \
   -p 3307:3307 \
-  vericto/vericto-proxy:5.0.0
+  vericto/vericto-proxy:5.0.1
 
 # The same image from GHCR
-docker pull ghcr.io/vericto/vericto-proxy:5.0.0
+docker pull ghcr.io/vericto/vericto-proxy:5.0.1
 ```
 
 Images released from now on carry a build provenance attestation (Sigstore,
@@ -383,7 +441,7 @@ With Docker Compose:
 
 ```yaml
 proxy:
-  image: ${VERICTO_PROXY_IMAGE:-vericto/vericto-proxy:5.0.0}
+  image: ${VERICTO_PROXY_IMAGE:-vericto/vericto-proxy:5.0.1}
   ports:
     - "5433:5433"
   environment:
@@ -438,7 +496,9 @@ licenses of dependencies compiled into the binary) and `RUNTIME_BASE_LICENSES`
 (the pinned base-image packages and their license texts) in
 `/usr/share/doc/vericto-proxy/`. Package SPDX documents remain under
 `/var/lib/db/sbom`, and the image label is
-`org.opencontainers.image.licenses=AGPL-3.0-only`:
+`org.opencontainers.image.licenses=AGPL-3.0-only`. Each native release archive
+(5.0.1 and later) carries `LICENSE`, `NOTICE` and `THIRD_PARTY_LICENSES` next to
+the binary. To read the image's copy:
 
 ```bash
 # The image has no shell or `cat` (4.15.2 and later), so copy the file out:

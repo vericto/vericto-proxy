@@ -3,7 +3,7 @@ name: Weekly image scan
 # New CVEs are published against images that have not changed. Once a week this
 # rebuilds the runtime image from main and scans it, and scans the image last
 # released (`latest` on GHCR), both platforms, with the same gate as ci.yml and
-# release.yml: a Critical or High finding with a fix available fails the run.
+# docker.yml: a Critical or High finding with a fix available fails the run.
 #
 # A failure on the rebuilt image means the pinned base digest is behind (merge the
 # Dependabot `chore(docker)` PR, or bump it by hand); a failure on the released

@@ -114,7 +114,7 @@ difference.
 ### Profile-guided optimization (PGO)
 
 The published images (since 4.19.0) are built with a profile of the proxy
-running the performance gate's corpus. `release.yml` builds this commit with
+running the performance gate's corpus. `docker.yml` builds this commit with
 `-Cprofile-generate` on each architecture's runner, runs every workload of
 `examples/perf_gate.rs` against it natively with PostgreSQL 17 and MySQL 8.0
 service containers (`perf/pgo-train.sh`: a proxy per dialect and control-plane
@@ -124,6 +124,11 @@ context. The Dockerfile passes `-Cprofile-use` to every Rust crate (the
 dependencies and the proxy); the C code (libpg_query, mimalloc) is compiled as
 before. Without the context, `docker build .` is the plain release build, as
 before.
+
+The native binaries attached to each GitHub Release (since 5.0.1, built by
+cargo-dist in `release.yml`) are the plain release build, without PGO: the same
+profile settings (`[profile.dist]` inherits `[profile.release]`), no trained
+profile. For the lowest CPU per statement on Linux, run the image.
 
 Measured with the callgrind gate (2026-10-26, linux/arm64, instructions per
 statement against the same commit without PGO):

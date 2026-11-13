@@ -7,7 +7,7 @@ compiles Microsoft's mimalloc allocator from the sources it bundles
 cargo-about only sees the crate's own license (MIT, Octavian Oncescu), so the
 notice of the C library is kept here and appended by build-notices.sh.
 
-Refresh this file when libmimalloc-sys changes version: the image build stops if
+Refresh this file when libmimalloc-sys changes version: the notices build stops if
 the version below does not match Cargo.lock.
 
 libmimalloc-sys version: 0.1.49
