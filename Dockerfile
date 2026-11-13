@@ -44,7 +44,7 @@ RUN cargo chef prepare --recipe-path recipe.json
 # ── Optional PGO profile (4.19.0) ─────────────────────────────────────────────
 # Empty unless the build is given one as a named context:
 #   docker buildx build --build-context pgo=<dir holding merged.profdata> .
-# release.yml trains it on the performance gate's corpus (perf/pgo-train.sh,
+# docker.yml trains it on the performance gate's corpus (perf/pgo-train.sh,
 # docs/PERFORMANCE.md "PGO"). Without it the build is the plain release build.
 FROM scratch AS pgo
 

@@ -87,7 +87,32 @@ jobs:
       - name: cargo audit
         run: cargo audit --deny warnings
 
-  # Builds the runtime image (linux/amd64; release.yml scans both platforms) and
+  # THIRD_PARTY_LICENSES ships in every release archive (dist-workspace.toml
+  # `include`), so the committed file must match what build-notices.sh writes
+  # for this Cargo.lock: same cargo-about version as the Dockerfile.
+  notices:
+    name: THIRD_PARTY_LICENSES is current
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
+        with:
+          toolchain: "1.88.0"
+
+      - name: Install cargo-about
+        run: cargo install cargo-about --version 0.9.2 --locked --features cli
+
+      - name: Compare with a fresh build
+        run: |
+          sh third-party/build-notices.sh "$RUNNER_TEMP/THIRD_PARTY_LICENSES"
+          if ! diff -u THIRD_PARTY_LICENSES "$RUNNER_TEMP/THIRD_PARTY_LICENSES"; then
+            echo "::error file=THIRD_PARTY_LICENSES::out of date; run: sh third-party/build-notices.sh THIRD_PARTY_LICENSES"
+            exit 1
+          fi
+
+  # Builds the runtime image (linux/amd64; docker.yml scans both platforms) and
   # scans it with Grype. Fails on a Critical or High finding that has a fix
   # available: such a finding means the base digest or a dependency must be bumped
   # before release. Findings with no fix yet are listed in the job log but do not

@@ -1,0 +1,73 @@
+[workspace]
+members = ["cargo:."]
+
+# Config for 'dist' (cargo-dist): the native binaries attached to each GitHub
+# Release, the same way vericto/vericto-cli publishes its own. dist generates
+# .github/workflows/release.yml from this file (`dist generate`); the container
+# image is published by .github/workflows/docker.yml on the same tags.
+[dist]
+# The preferred dist version to use in CI (Cargo.toml SemVer syntax)
+cargo-dist-version = "0.32.0"
+# CI backends to support
+ci = "github"
+# The shell installer (`vericto-proxy-installer.sh`) verifies the SHA-256 of
+# the archive it downloads. No "powershell": cargo-dist 0.32's PowerShell
+# installer does not verify what it downloads, so Windows users take the .zip
+# and its .sha256 from the release instead.
+installers = ["shell"]
+# Target platforms to build apps for (Rust target-triple syntax). Linux uses
+# the glibc targets, like the container image (Chainguard glibc-dynamic):
+# the binary links only libc, libm and libgcc_s, and dist builds it on
+# Ubuntu 22.04, so it runs on glibc 2.35 and later.
+targets = ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu", "x86_64-apple-darwin", "aarch64-apple-darwin", "x86_64-pc-windows-msvc"]
+# Path that installers should place binaries in
+install-path = "CARGO_HOME"
+# Where to host releases
+hosting = "github"
+# Shipped in every archive next to the binary, with the README, LICENSE and
+# CHANGELOG that dist adds on its own: NOTICE (copyright, license, the embedded
+# engine) and THIRD_PARTY_LICENSES (third-party/build-notices.sh; CI checks it
+# is current).
+include = ["NOTICE", "THIRD_PARTY_LICENSES"]
+# On a pull request, build every target and upload the archives as workflow
+# artifacts (nothing is published or released): each PR is a release dry run.
+# The default, "plan", only runs `dist plan`, which never compiles anything, so
+# a toolchain break (libclang, pg_query or mimalloc on one target) would first
+# show up after the tag. Set back to "plan" to save runner time.
+pr-run-mode = "upload"
+# "upload" turns on build caching, which adds an unpinned rust-cache action to
+# release.yml. Release builds stay uncached: every artifact is built from
+# clean, and every action in release.yml stays pinned to a SHA (see below).
+cache-builds = false
+
+# Keyless build provenance: each artifact gets a Sigstore-backed GitHub
+# attestation tying it to this repo, the workflow and the commit, verifiable
+# with `gh attestation verify <artifact> --repo vericto/vericto-proxy`. SHA-256
+# checksums (`sha256.sum` + per-artifact `.sha256`) ship alongside.
+github-attestations = true
+
+# macOS on Apple silicon builds on macos-15, not dist 0.32's default macos-14
+# (GitHub retired the macOS 14 images on 2026-11-02, actions/runner-images#13518).
+# Intel macOS keeps dist's default, macos-15-intel, where it builds natively.
+[dist.github-custom-runners.aarch64-apple-darwin]
+runner = "macos-15"
+
+# pg_query (through the engine and directly) runs bindgen at build time: the
+# Linux runners need libclang and clang's own headers (`stdbool.h`;
+# libclang-dev alone lacks them). macOS runners get both with Xcode, and the
+# Windows runner ships LLVM and MSVC. protoc is optional for pg_query (it only
+# regenerates bindings that are already vendored), so it is not installed.
+[dist.dependencies.apt]
+libclang-dev = { version = "*", targets = ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"] }
+clang = { version = "*", targets = ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"] }
+
+# Every action in the generated release.yml is pinned to a full commit SHA, not
+# a movable tag: dist writes these into the workflow on `dist generate`. Bump
+# them here (same major as dist expects) and regenerate; Dependabot does not
+# touch release.yml (see .github/dependabot.yml), since a hand edit there makes
+# `dist plan` fail on the stale file. Same pins as vericto/vericto-cli.
+[dist.github-action-commits]
+"actions/checkout" = "d23441a48e516b6c34aea4fa41551a30e30af803" # v6.1.0
+"actions/upload-artifact" = "cf430e030ddbb5b0abf93d22962f4752f3646cd9" # v7.0.2
+"actions/download-artifact" = "9000827ccba6bdab643e8b6fd33ac0654aef8333" # v8.0.2
+"actions/attest" = "1e69f48acb82d1966a394da916b4c1698aa569d6" # v4.2.2

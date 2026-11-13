@@ -8,10 +8,17 @@
 # Dependabot security updates are on in the repository settings, and the
 # `supply-chain` CI job (cargo-deny + cargo-audit) fails every PR while a
 # RustSec advisory applies to Cargo.lock.
+#
+# release.yml is excluded: cargo-dist generates it, and a hand edit there makes
+# `dist plan` fail on the stale file. Its action pins live in
+# dist-workspace.toml ([dist.github-action-commits]); bump them there and run
+# `dist generate`.
 version: 2
 updates:
   - package-ecosystem: github-actions
     directory: /
+    exclude-paths:
+      - .github/workflows/release.yml
     schedule:
       interval: weekly
     commit-message:

@@ -47,6 +47,9 @@ The container includes:
   texts at `/usr/share/doc/vericto-proxy/RUNTIME_BASE_LICENSES`; and
 - the runtime packages' SPDX documents under `/var/lib/db/sbom`.
 
+Each native release archive (since v5.0.1) ships LICENSE, this NOTICE and
+`THIRD_PARTY_LICENSES` next to the binary. It contains no runtime base image.
+
 `third-party/build-notices.sh` builds `THIRD_PARTY_LICENSES` for the exact Rust
 and C dependency graph shipped in the binary. `third-party/runtime-base.txt`
 covers the pinned runtime image.

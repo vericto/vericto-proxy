@@ -2,13 +2,13 @@ RUNTIME BASE SOFTWARE NOTICES FOR VERICTO-PROXY
 
 The vericto-proxy container uses the following pinned Chainguard runtime image:
 
-cgr.dev/chainguard/glibc-dynamic:latest@sha256:5bb932663cff4fb276186720e0357af55c5e47f12e4d9f44ea0060fa3e7bca88
+cgr.dev/chainguard/glibc-dynamic:latest@sha256:aab5cd0b4cc5edd9c87b6e7aa9ddaa3fb6ffcec559b9e5473c55bbc937b65399
 
 Its embedded APK database and SPDX documents identify these runtime packages:
 
-- wolfi-baselayout 20230201-r30: MIT
+- wolfi-baselayout 20230201-r31: MIT
 - ca-certificates-bundle 20261020-r0: MPL-2.0 AND MIT
-- glibc-2.44, glibc-2.44-locale-posix and ld-linux-2.44, version 2.44-r10:
+- glibc-2.44, glibc-2.44-locale-posix and ld-linux-2.44, version 2.44-r14:
   LGPL-2.1-or-later
 - libgcc and libstdc++, version 16.2.0-r2:
   GPL-3.0-or-later WITH GCC-exception-3.1

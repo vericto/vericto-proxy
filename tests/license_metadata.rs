@@ -72,7 +72,7 @@ fn cla_workflow_uses_the_permanent_v1_1_document_and_record() {
 
 #[test]
 fn image_and_dependency_notices_use_the_same_license() {
-    let release = root(".github/workflows/release.yml");
+    let release = root(".github/workflows/docker.yml");
     assert!(release.contains("org.opencontainers.image.licenses=AGPL-3.0-only"));
     assert!(
         release.contains(
