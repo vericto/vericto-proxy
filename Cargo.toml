@@ -1,10 +1,15 @@
 [package]
 name = "vericto-proxy"
-version = "5.0.1"
+version = "5.0.2"
 edition = "2024"
 rust-version = "1.88"
-description = "Vericto — database guardrails for AI agents — deterministic TCP wire-protocol proxy for customer infrastructure"
+# Also the `desc` of the Homebrew formula cargo-dist generates (vericto-proxy.rb):
+# under 80 characters, which `brew audit --strict` requires, and not starting
+# with the formula name.
+description = "Database guardrails for AI agents: TCP proxy and MCP server that check SQL"
 license = "AGPL-3.0-only"
+# The formula's `homepage`.
+homepage = "https://vericto.com"
 repository = "https://github.com/vericto/vericto-proxy"
 readme = "README.md"
 

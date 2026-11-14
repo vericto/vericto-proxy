@@ -48,6 +48,14 @@ use crate::tcp::rules_sync::{
 // vericto-engine re-exports through the tcp evaluator module's imports
 
 fn main() {
+    // `vericto-proxy --version` / `-V` (5.0.2): print the version on stdout and
+    // exit, without starting anything (the Homebrew formula's `test do` runs
+    // it). `vericto-proxy mcp --version` keeps printing on stderr.
+    if matches!(std::env::args().nth(1).as_deref(), Some("--version" | "-V")) {
+        println!("vericto-proxy {}", env!("CARGO_PKG_VERSION"));
+        return;
+    }
+
     // `vericto-proxy healthcheck` (4.15.2): the container health check, since the
     // runtime image has no shell. Any other argument is ignored, as before. It
     // needs no runtime (4.16.2: none is started for it).

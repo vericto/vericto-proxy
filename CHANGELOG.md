@@ -7,6 +7,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [5.0.2] - 2026-11-14
+
+**Maintenance release: Homebrew formula `vericto/tap/vericto-proxy`.** The
+proxy's rules, configuration, protocols and telemetry are 5.0.1's, and it still
+pins vericto-engine 5.0.0. No other change was merged after v5.0.1.
+
+### Added
+
+- **Homebrew formula `vericto-proxy`** in the
+  [vericto/homebrew-tap](https://github.com/vericto/homebrew-tap) tap, next to
+  the CLI's `vericto`: `brew install vericto/tap/vericto-proxy` on macOS
+  (Apple silicon and Intel) and Linux (arm64 and x86_64, the glibc archives).
+  cargo-dist generates it with every release (`installers = ["shell",
+  "homebrew"]`, `formula = "vericto-proxy"`), pinned to the SHA-256 of the four
+  archives. A custom publish job (`.github/workflows/homebrew-publish.yml`, as
+  in vericto-cli) adds a `test do` block, checks every URL and SHA-256 against
+  the release's `sha256.sum` and pushes the formula to the tap. It runs in the
+  reviewer-gated `prod` environment, which holds `HOMEBREW_TAP_TOKEN`; the
+  GitHub release is announced only after it succeeds.
+- **`vericto-proxy --version`** (and `-V`) prints `vericto-proxy <version>` on
+  stdout and exits without starting the proxy (the formula's test runs it).
+  Before, any argument other than `healthcheck` and `mcp` was ignored and the
+  proxy started. `vericto-proxy mcp --version` is unchanged (stderr).
+- README "Install the native binary" and docs/MCP.md install with Homebrew.
+  There is no npm package.
+
+### Changed
+
+- `Cargo.toml` metadata, which the formula takes its `desc` and `homepage`
+  from: `description` is "Database guardrails for AI agents: TCP proxy and MCP
+  server that check SQL" (under Homebrew's 80 characters) and `homepage` is
+  `https://vericto.com`.
+
 ## [5.0.1] - 2026-11-12
 
 **Maintenance release: native binaries in every GitHub Release.** The proxy's
@@ -3186,7 +3219,8 @@ the service now targets the rebranded engine.
 - Optional control-plane link: ruleset hot-sync and telemetry reporting.
 - `/health` and `/metrics` (p50/p99 latency) endpoints.
 
-[Unreleased]: https://github.com/vericto/vericto-proxy/compare/v5.0.1...HEAD
+[Unreleased]: https://github.com/vericto/vericto-proxy/compare/v5.0.2...HEAD
+[5.0.2]: https://github.com/vericto/vericto-proxy/compare/v5.0.1...v5.0.2
 [5.0.1]: https://github.com/vericto/vericto-proxy/compare/v5.0.0...v5.0.1
 [5.0.0]: https://github.com/vericto/vericto-proxy/compare/v4.23.0...v5.0.0
 [4.23.0]: https://github.com/vericto/vericto-proxy/compare/v4.22.0...v4.23.0

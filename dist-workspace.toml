@@ -14,7 +14,25 @@ ci = "github"
 # the archive it downloads. No "powershell": cargo-dist 0.32's PowerShell
 # installer does not verify what it downloads, so Windows users take the .zip
 # and its .sha256 from the release instead.
-installers = ["shell"]
+# `homebrew` builds a `vericto-proxy.rb` formula (macOS arm64/x86_64 and Linux
+# arm64/x86_64, the glibc archives) pinned to the release's SHA-256 checksums:
+# `brew install vericto/tap/vericto-proxy`. Its desc, homepage and license come
+# from Cargo.toml.
+installers = ["shell", "homebrew"]
+# The tap the formula is published to (github.com/vericto/homebrew-tap, tapped
+# as `vericto/tap`), next to the CLI's `vericto.rb`. The formula is named after
+# the installed command, `vericto-proxy` (also the crate name).
+tap = "vericto/homebrew-tap"
+formula = "vericto-proxy"
+# The formula is pushed to the tap by a CUSTOM publish job
+# (.github/workflows/homebrew-publish.yml), as in vericto/vericto-cli, rather
+# than the built-in "homebrew" one: HOMEBREW_TAP_TOKEN, which can write to the
+# tap, lives in the reviewer-gated `prod` GitHub Environment, and the built-in
+# job declares no environment, so it could only read a repository secret that
+# any workflow in this public repo can reach. (With the tap set and the
+# built-in job off, `dist plan` warns that the Homebrew publish job is
+# disabled; that is expected.)
+publish-jobs = ["./homebrew-publish"]
 # Target platforms to build apps for (Rust target-triple syntax). Linux uses
 # the glibc targets, like the container image (Chainguard glibc-dynamic):
 # the binary links only libc, libm and libgcc_s, and dist builds it on
@@ -60,6 +78,12 @@ runner = "macos-15"
 [dist.dependencies.apt]
 libclang-dev = { version = "*", targets = ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"] }
 clang = { version = "*", targets = ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"] }
+
+# The custom Homebrew job (.github/workflows/homebrew-publish.yml) only reads
+# this run's artifacts and pushes to the tap with HOMEBREW_TAP_TOKEN; it needs
+# nothing from the workflow's GITHUB_TOKEN beyond contents: read.
+[dist.github-custom-job-permissions]
+"homebrew-publish" = { contents = "read" }
 
 # Every action in the generated release.yml is pinned to a full commit SHA, not
 # a movable tag: dist writes these into the workflow on `dist generate`. Bump

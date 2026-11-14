@@ -15,7 +15,7 @@ Vericto workspace it applies the workspace's rules instead
 
 It is the same binary and image as the TCP proxy, in a second mode, and it reuses the
 proxy's evaluator, masks, agent-access allowlists, business policies, signed rule sync,
-kill switch and telemetry. This release (5.0.1) is **read-only**: `execute_sql` runs
+kill switch and telemetry. This release (5.0.2) is **read-only**: `execute_sql` runs
 reads only (the "read tier").
 
 > **The guarantee holds only if the agent has no other database credential.** If the
@@ -79,8 +79,18 @@ puts `vericto-proxy` in `~/.cargo/bin`; Windows and manual downloads are in the
 
 ```bash
 curl --proto '=https' --tlsv1.2 -LsSf \
-  https://github.com/vericto/vericto-proxy/releases/download/v5.0.1/vericto-proxy-installer.sh | sh
+  https://github.com/vericto/vericto-proxy/releases/download/v5.0.2/vericto-proxy-installer.sh | sh
 claude mcp add vericto-db -- ~/.cargo/bin/vericto-proxy \
+  mcp --database-url-file ~/.config/vericto/shop.url
+```
+
+Or with Homebrew (5.0.2 and later), on macOS (Apple silicon and Intel) and Linux (arm64
+and x86_64). The formula pins each archive's SHA-256, and `brew upgrade` follows the
+releases; the command is then `$(brew --prefix)/bin/vericto-proxy`:
+
+```bash
+brew install vericto/tap/vericto-proxy
+claude mcp add vericto-db -- "$(brew --prefix)/bin/vericto-proxy" \
   mcp --database-url-file ~/.config/vericto/shop.url
 ```
 
@@ -112,7 +122,7 @@ user, so the container runs as you):
 claude mcp add vericto-db -- \
   docker run -i --rm --user "$(id -u):$(id -g)" \
     -v ~/.config/vericto/shop.url:/run/secrets/db.url:ro \
-    vericto/vericto-proxy:5.0.1 /usr/local/bin/vericto-proxy mcp --database-url-file /run/secrets/db.url
+    vericto/vericto-proxy:5.0.2 /usr/local/bin/vericto-proxy mcp --database-url-file /run/secrets/db.url
 ```
 
 Cursor (`.cursor/mcp.json`) or any client that takes a command:
@@ -124,7 +134,7 @@ Cursor (`.cursor/mcp.json`) or any client that takes a command:
       "command": "docker",
       "args": ["run", "-i", "--rm", "--user", "501:20",
                "-v", "/Users/me/.config/vericto/shop.url:/run/secrets/db.url:ro",
-               "vericto/vericto-proxy:5.0.1", "/usr/local/bin/vericto-proxy", "mcp",
+               "vericto/vericto-proxy:5.0.2", "/usr/local/bin/vericto-proxy", "mcp",
                "--database-url-file", "/run/secrets/db.url"]
     }
   }
@@ -166,8 +176,8 @@ args = ["mcp", "--database-url-file", "/Users/me/.config/vericto/shop.url"]
 
 In stdio mode stdout carries protocol messages only; every log line goes to stderr,
 which MCP clients show in their server log. The process exits when the client closes
-stdin. Homebrew and npm packages are planned; until then use the release binary (and
-its installer script), the image or a source build.
+stdin. Install it with Homebrew, the release binary (and its installer script), the
+image or a source build; there is no npm package.
 
 **4. Ask the agent to call `whoami`**, then `describe_schema`. `whoami` reports the local
 mode: `control_plane.mode: "none"`, `control_plane.ruleset: "built-in"`,
@@ -219,7 +229,7 @@ claude mcp add vericto-db \
   -e VERICTO_API_KEY=vtro_... -e VERICTO_DATABASE_ID=<database id> -- \
   docker run -i --rm --user "$(id -u):$(id -g)" -e VERICTO_API_KEY -e VERICTO_DATABASE_ID \
     -v ~/.config/vericto/shop.url:/run/secrets/db.url:ro \
-    vericto/vericto-proxy:5.0.1 /usr/local/bin/vericto-proxy mcp --database-url-file /run/secrets/db.url
+    vericto/vericto-proxy:5.0.2 /usr/local/bin/vericto-proxy mcp --database-url-file /run/secrets/db.url
 ```
 
 Cursor (`.cursor/mcp.json`):
@@ -232,7 +242,7 @@ Cursor (`.cursor/mcp.json`):
       "args": ["run", "-i", "--rm", "--user", "501:20",
                "-e", "VERICTO_API_KEY", "-e", "VERICTO_DATABASE_ID",
                "-v", "/Users/me/.config/vericto/shop.url:/run/secrets/db.url:ro",
-               "vericto/vericto-proxy:5.0.1", "/usr/local/bin/vericto-proxy", "mcp",
+               "vericto/vericto-proxy:5.0.2", "/usr/local/bin/vericto-proxy", "mcp",
                "--database-url-file", "/run/secrets/db.url"],
       "env": { "VERICTO_API_KEY": "vtro_...", "VERICTO_DATABASE_ID": "<database id>" }
     }
@@ -306,7 +316,7 @@ docker run -d --name vericto-mcp -p 8808:8808 \
   -e VERICTO_MCP_ALLOWED_HOSTS=vericto-mcp.internal \
   -e PROXY_TLS_MODE=require -e PROXY_TLS_CERT=/run/secrets/tls.crt -e PROXY_TLS_KEY=/run/secrets/tls.key \
   -v /srv/secrets:/run/secrets:ro \
-  vericto/vericto-proxy:5.0.1 /usr/local/bin/vericto-proxy mcp --database-url-file /run/secrets/db.url
+  vericto/vericto-proxy:5.0.2 /usr/local/bin/vericto-proxy mcp --database-url-file /run/secrets/db.url
 ```
 
 Clients connect with the URL and their own key:
@@ -558,5 +568,4 @@ run a second container from the same image for the TCP proxy.
   them on.
 - **Trust labels and taint**: `taint` is `null` in every answer and in `whoami`.
 - **HTTP sessions** (`Mcp-Session-Id`): the HTTP transport is stateless.
-- **The hosted Gateway**, Gateway with connector, MySQL, and the Homebrew and npm
-  packages.
+- **The hosted Gateway**, Gateway with connector, MySQL, and an npm package.
