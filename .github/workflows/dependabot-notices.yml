@@ -1,0 +1,77 @@
+# Regenerates THIRD_PARTY_LICENSES on Dependabot pull requests.
+#
+# The CI job "THIRD_PARTY_LICENSES is current" (ci.yml, `notices`) fails whenever
+# Cargo.lock changes, because the file lists every crate with its version, and
+# Dependabot only edits Cargo.lock. This workflow rebuilds the file with the same
+# script and cargo-about version as CI and the Dockerfile, and commits it to the
+# Dependabot branch.
+#
+# Token: a commit pushed with GITHUB_TOKEN does not start new workflow runs, so the
+# required checks would never run on the new head. The push therefore uses the
+# Dependabot secret NOTICES_PUSH_TOKEN (Settings → Secrets and variables →
+# Dependabot): a fine-grained token limited to vericto/vericto-proxy with
+# Contents: read and write. Without that secret the job fails with a clear
+# message instead of pushing a commit that CI would not check.
+#
+# Safety: runs only for dependabot[bot] on branches of this repository (never a
+# fork), and only commits THIRD_PARTY_LICENSES.
+name: Dependabot notices
+
+on:
+  pull_request:
+    paths:
+      - Cargo.lock
+      - Cargo.toml
+      - third-party/**
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dependabot-notices-${{ github.head_ref }}
+  cancel-in-progress: true
+
+jobs:
+  regenerate:
+    name: Regenerate THIRD_PARTY_LICENSES
+    if: >-
+      github.actor == 'dependabot[bot]' &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      startsWith(github.head_ref, 'dependabot/')
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Require the push token
+        env:
+          NOTICES_PUSH_TOKEN: ${{ secrets.NOTICES_PUSH_TOKEN }}
+        run: |
+          if [ -z "$NOTICES_PUSH_TOKEN" ]; then
+            echo "::error::Dependabot secret NOTICES_PUSH_TOKEN is not set; run 'sh third-party/build-notices.sh THIRD_PARTY_LICENSES' on this branch by hand."
+            exit 1
+          fi
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.head_ref }}
+          token: ${{ secrets.NOTICES_PUSH_TOKEN }}
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
+        with:
+          toolchain: "1.88.0"
+
+      - name: Install cargo-about
+        run: cargo install cargo-about --version 0.9.2 --locked --features cli
+
+      - name: Rebuild and commit
+        run: |
+          sh third-party/build-notices.sh THIRD_PARTY_LICENSES
+          if git diff --quiet -- THIRD_PARTY_LICENSES; then
+            echo "THIRD_PARTY_LICENSES is already current."
+            exit 0
+          fi
+          git config user.name "dependabot[bot]"
+          git config user.email "49699333+dependabot[bot]@users.noreply.github.com"
+          git add THIRD_PARTY_LICENSES
+          git commit -m "chore: regenerate THIRD_PARTY_LICENSES for ${GITHUB_HEAD_REF#dependabot/}"
+          git push origin "HEAD:${GITHUB_HEAD_REF}"
