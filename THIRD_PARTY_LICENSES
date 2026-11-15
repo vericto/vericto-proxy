@@ -2866,7 +2866,7 @@ limitations under the License.
 Apache License 2.0 (Apache-2.0)
 
 Used by:
-  - arc-swap 1.9.3
+  - arc-swap 1.9.5
   - atomic-waker 1.1.2
   - base64 0.22.1
   - base64 0.23.1
@@ -2877,7 +2877,7 @@ Used by:
   - either 1.19.0
   - equivalent 1.0.3
   - errno 0.3.14
-  - flate2 1.1.10
+  - flate2 1.1.11
   - form_urlencoded 1.2.2
   - hashbrown 0.17.1
   - httparse 1.10.1
