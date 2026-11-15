@@ -1,0 +1,117 @@
+# Custom cargo-dist publish job: push the Homebrew formula to the tap.
+#
+# Copied from vericto/vericto-cli (.github/workflows/homebrew-publish.yml) and
+# adapted to this repository.
+#
+# Why a custom job instead of the built-in `publish-jobs = ["homebrew"]`? The
+# token that can write to the tap (HOMEBREW_TAP_TOKEN) lives in the `prod`
+# GitHub Environment, which is required-reviewer gated because this is a
+# public repo. The built-in job runs without an `environment:`, so it could
+# only read a repository secret, and a repository secret is readable by any
+# workflow in the repo. A reusable workflow that declares `environment: prod`
+# at the job level reads the environment secret itself. Referenced from
+# dist-workspace.toml as `publish-jobs = ["./homebrew-publish"]`; wired into
+# release.yml by `dist generate`, so it survives regeneration.
+#
+# The formula is the one cargo-dist generated (`installers = [..., "homebrew"]`,
+# `formula = "vericto-proxy"`): URLs and SHA-256 of the four macOS/Linux
+# archives of this release (the glibc ones on Linux). Before pushing it, this
+# job adds the `test do` block the cargo-dist 0.32 template doesn't have
+# (`vericto-proxy --version`) and checks every pinned SHA-256 against the
+# release's sha256.sum.
+name: Publish Homebrew formula
+
+on:
+  workflow_call:
+    # cargo-dist passes the release plan (same JSON as dist-manifest.json) so we
+    # can find the formula(s) it built.
+    inputs:
+      plan:
+        required: true
+        type: string
+
+jobs:
+  homebrew-publish:
+    runs-on: ubuntu-22.04
+    # Gates the publish behind the `prod` environment (required reviewer) and
+    # makes the environment-scoped HOMEBREW_TAP_TOKEN available to this job.
+    environment: prod
+    # The workflow's GITHUB_TOKEN is not used to push (HOMEBREW_TAP_TOKEN is).
+    # Granted by the caller (dist-workspace.toml, github-custom-job-permissions).
+    permissions:
+      contents: read
+    env:
+      PLAN: ${{ inputs.plan }}
+      TAP: vericto/homebrew-tap
+    steps:
+      # The token is not persisted in the checkout (the next step runs brew,
+      # which is not given it); the final `git push` passes it explicitly.
+      # It is used for the fetch too, so this also works while the tap is
+      # private.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ env.TAP }}
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          path: tap
+          persist-credentials: false
+      # Into its own directory, not the tap checkout: only the .rb is copied over.
+      - name: Fetch the formula and the release checksums
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: artifacts-*
+          path: dist-artifacts/
+          merge-multiple: true
+      - name: Finish and check the formula
+        run: |
+          set -euo pipefail
+          export PATH="/home/linuxbrew/.linuxbrew/bin:$PATH"
+          test -s dist-artifacts/sha256.sum || { echo "::error::sha256.sum missing from the release artifacts"; exit 1; }
+          mkdir -p tap/Formula
+          for release in $(echo "$PLAN" | jq --compact-output '.releases[] | select([.artifacts[] | endswith(".rb")] | any)'); do
+            filename=$(echo "$release" | jq '.artifacts[] | select(endswith(".rb"))' --raw-output)
+            name="${filename%.rb}"
+            version=$(echo "$release" | jq .app_version --raw-output)
+            formula="tap/Formula/${filename}"
+            cp "dist-artifacts/${filename}" "$formula"
+
+            # cargo-dist's template has no test block: add one, so `brew test`
+            # and `brew audit --strict` in the tap exercise the installed binary.
+            if ! grep -q '^  test do' "$formula"; then
+              [ "$(tail -n 1 "$formula")" = "end" ] || { echo "::error::unexpected end of ${filename}"; exit 1; }
+              sed -i '$ d' "$formula"
+              printf '\n  test do\n    assert_match version.to_s, shell_output("#{bin}/%s --version")\n  end\nend\n' "$name" >> "$formula"
+            fi
+
+            # Every archive the formula points at must be one of this release's
+            # four macOS/Linux archives, pinned by the SHA-256 in sha256.sum.
+            urls=$(grep -c "^ *url \"https://github.com/vericto/vericto-proxy/releases/download/v${version}/" "$formula" || true)
+            [ "$urls" -eq 4 ] || { echo "::error::${filename} has ${urls} v${version} release URLs, expected 4"; exit 1; }
+            [ "$(grep -c '^ *url "' "$formula")" -eq 4 ] || { echo "::error::${filename} has URLs outside the v${version} release"; exit 1; }
+            while read -r sum; do
+              grep -q "^${sum} " dist-artifacts/sha256.sum || { echo "::error::${filename}: ${sum} is not in sha256.sum"; exit 1; }
+            done < <(sed -n 's/^ *sha256 "\([0-9a-f]\{64\}\)"$/\1/p' "$formula")
+            [ "$(grep -c '^ *sha256 "' "$formula")" -eq 4 ] || { echo "::error::${filename} must pin 4 SHA-256"; exit 1; }
+
+            # Homebrew reads the version from the /vX.Y.Z/ of every URL (checked
+            # above), and `brew audit --strict` rejects the `version` line
+            # cargo-dist writes as redundant with it.
+            sed -i "/^  version \"${version}\"$/d" "$formula"
+
+            brew style --fix "$formula" || true
+            ruby -c "$formula"
+          done
+      - name: Push the formula to the tap
+        working-directory: tap
+        run: |
+          set -euo pipefail
+          git config user.name "Vericto"
+          git config user.email "295450070+vericto@users.noreply.github.com"
+          for release in $(echo "$PLAN" | jq --compact-output '.releases[] | select([.artifacts[] | endswith(".rb")] | any)'); do
+            filename=$(echo "$release" | jq '.artifacts[] | select(endswith(".rb"))' --raw-output)
+            version=$(echo "$release" | jq .app_version --raw-output)
+            git add "Formula/${filename}"
+            git diff --cached --quiet || git commit -m "${filename%.rb} ${version}"
+          done
+          git push "https://x-access-token:${HOMEBREW_TAP_TOKEN}@github.com/${TAP}.git" HEAD:main
+        env:
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
