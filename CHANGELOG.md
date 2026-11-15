@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Dependabot keeps `THIRD_PARTY_LICENSES` current.** A new workflow
+  (`.github/workflows/dependabot-notices.yml`) rebuilds the file on Dependabot
+  pull requests that change `Cargo.lock`, with the same script and cargo-about
+  0.9.2 as CI, and commits it to the Dependabot branch, so the
+  "THIRD_PARTY_LICENSES is current" check passes without a manual step. It pushes
+  with the Dependabot secret `NOTICES_PUSH_TOKEN` (a fine-grained token limited
+  to this repository, Contents: read and write), because a commit pushed with
+  `GITHUB_TOKEN` would not start the required checks.
+
 ## [5.0.2] - 2026-11-14
 
 **Maintenance release: Homebrew formula `vericto/tap/vericto-proxy`.** The
