@@ -70,8 +70,11 @@ jobs:
             echo "THIRD_PARTY_LICENSES is already current."
             exit 0
           fi
-          git config user.name "dependabot[bot]"
-          git config user.email "49699333+dependabot[bot]@users.noreply.github.com"
+          # Authored as the maintainer account that owns NOTICES_PUSH_TOKEN: the CLA
+          # check exempts it, and accepts a bot author only on a verified (signed)
+          # commit, which a plain git push cannot produce.
+          git config user.name "Vericto"
+          git config user.email "295450070+vericto@users.noreply.github.com"
           git add THIRD_PARTY_LICENSES
           git commit -m "chore: regenerate THIRD_PARTY_LICENSES for ${GITHUB_HEAD_REF#dependabot/}"
           git push origin "HEAD:${GITHUB_HEAD_REF}"

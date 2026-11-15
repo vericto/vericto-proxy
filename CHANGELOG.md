@@ -18,6 +18,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   to this repository, Contents: read and write), because a commit pushed with
   `GITHUB_TOKEN` would not start the required checks.
 
+### Changed
+
+- **Dependencies:** `flate2` 1.1.10 → 1.1.11 and `arc-swap` 1.9.3 → 1.9.5
+  (`Cargo.lock` only), with `THIRD_PARTY_LICENSES` regenerated.
+
+### Fixed
+
+- **The regenerated `THIRD_PARTY_LICENSES` commit passes the CLA check.** The
+  Dependabot notices workflow now authors it as the maintainer account that owns
+  `NOTICES_PUSH_TOKEN`. As `dependabot[bot]` it was an unsigned bot commit, which
+  the CLA check rejects.
+
 ## [5.0.2] - 2026-11-14
 
 **Maintenance release: Homebrew formula `vericto/tap/vericto-proxy`.** The
