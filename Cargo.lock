@@ -2809,8 +2809,8 @@ checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
 
 [[package]]
 name = "vericto-engine"
-version = "5.0.0"
-source = "git+https://github.com/vericto/vericto-engine?tag=v5.0.0#df2860710386aa765dfc75260cbb3abcbc841ff7"
+version = "5.1.0"
+source = "git+https://github.com/vericto/vericto-engine?tag=v5.1.0#ec34a2714aef7d9d075dd061c28ab6b92a28baa9"
 dependencies = [
  "pg_query",
  "regex",
@@ -2824,7 +2824,7 @@ dependencies = [
 
 [[package]]
 name = "vericto-proxy"
-version = "5.0.2"
+version = "5.1.0"
 dependencies = [
  "arc-swap",
  "async-trait",

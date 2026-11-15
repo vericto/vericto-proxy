@@ -1753,4 +1753,75 @@ mod tests {
                 if rule_code == "VERICTO-PARSE-ERROR"
         ));
     }
+
+    /// Engine 5.1.0 on the wire dialects, under the runtime policy the proxy
+    /// uses (no `schema_migration_cap`). A DELETE / UPDATE whose WHERE keeps
+    /// every row of its own target is now blocked like a WHERE-less one
+    /// (VERICTO-003 / 030 + 042); narrower filters are still forwarded.
+    /// TRUNCATE, DROP SCHEMA and DROP DATABASE were already blocked; DROP
+    /// DATABASE now also reports VERICTO-012, after the winner VERICTO-010.
+    #[test]
+    fn engine_5_1_0_verdicts_on_the_wire_dialects() {
+        let rules = default_ruleset();
+        let policy = EnforcementPolicy::default();
+        let blocked: &[(&str, &[&str])] = &[
+            (
+                "DELETE FROM users WHERE id IN (SELECT id FROM users)",
+                &["VERICTO-003"],
+            ),
+            (
+                "DELETE FROM users WHERE email IS NOT NULL OR email IS NULL",
+                &["VERICTO-003"],
+            ),
+            (
+                "DELETE FROM users WHERE EXISTS (SELECT 1 FROM users)",
+                &["VERICTO-003"],
+            ),
+            (
+                "UPDATE users SET a = 1 WHERE id IN (SELECT id FROM users)",
+                &["VERICTO-030", "VERICTO-042"],
+            ),
+            (
+                "UPDATE users SET a = 1 WHERE a IS NULL OR a IS NOT NULL",
+                &["VERICTO-030", "VERICTO-042"],
+            ),
+            ("TRUNCATE users", &["VERICTO-011"]),
+            ("DROP SCHEMA analytics CASCADE", &["VERICTO-012"]),
+            ("DROP DATABASE shop", &["VERICTO-010", "VERICTO-012"]),
+        ];
+        let forwarded = [
+            "DELETE FROM users WHERE id IN (SELECT id FROM users WHERE banned)",
+            "DELETE FROM users WHERE id IN (SELECT user_id FROM orders)",
+            "DELETE FROM users WHERE a IS NULL OR b IS NOT NULL",
+        ];
+        for d in [Dialect::Postgres, Dialect::Mysql] {
+            for (sql, codes) in blocked {
+                match evaluate(sql, d, &rules, &policy) {
+                    TcpDecision::Block {
+                        rule_code,
+                        violations,
+                        ..
+                    } => {
+                        assert_eq!(rule_code, codes[0], "{d:?} {sql}");
+                        let got: Vec<&str> =
+                            violations.iter().map(|v| v.rule_code.as_str()).collect();
+                        assert_eq!(&got, codes, "{d:?} {sql}");
+                    }
+                    TcpDecision::Forward { violations, .. } => {
+                        panic!("{d:?} {sql}: forwarded, {violations:?}")
+                    }
+                }
+            }
+            for sql in forwarded {
+                match evaluate(sql, d, &rules, &policy) {
+                    TcpDecision::Forward { violations, .. } => {
+                        assert!(violations.is_empty(), "{d:?} {sql}: {violations:?}");
+                    }
+                    TcpDecision::Block { rule_code, .. } => {
+                        panic!("{d:?} {sql}: blocked by {rule_code}")
+                    }
+                }
+            }
+        }
+    }
 }

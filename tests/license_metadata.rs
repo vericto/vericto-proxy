@@ -22,7 +22,7 @@ fn version_5_is_the_first_agpl_release_everywhere() {
 
     let manifest = root("Cargo.toml");
     assert!(manifest.contains("license = \"AGPL-3.0-only\""));
-    assert!(manifest.contains("tag = \"v5.0.0\""));
+    assert!(manifest.contains("tag = \"v5.1.0\""));
 
     let readme = root("README.md");
     assert!(readme.contains(&format!("vericto-proxy:{version}")));
@@ -87,7 +87,7 @@ fn image_and_dependency_notices_use_the_same_license() {
     assert!(about.contains("[vericto-engine]\naccepted = [\"AGPL-3.0-only\"]"));
 
     let notice = root("NOTICE");
-    assert!(notice.contains("Version 5.0.0 of\n  the proxy pins version 5.0.0 of the engine"));
+    assert!(notice.contains("Version 5.1.0 of\n  the proxy pins version 5.1.0 of the engine"));
     assert!(notice.contains("RUNTIME_BASE_LICENSES"));
     assert!(
         root("third-party/runtime-base.txt")

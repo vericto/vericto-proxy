@@ -7,6 +7,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [5.1.0] - 2026-11-15
+
+**Engine 5.1.0: whole-table `WHERE` clauses are blocked like a missing `WHERE`.**
+The proxy pins vericto-engine v5.1.0 (from v5.0.0). Its own code, settings,
+protocols and telemetry format are unchanged, but some `DELETE` and `UPDATE`
+statements that 5.0.2 forwarded are now rejected at the wire and by the MCP
+server's `check_sql`. Minor release because verdicts change (as 4.2.0 and
+4.23.0).
+
+### Behaviour changes
+
+- **A `DELETE` / `UPDATE` whose `WHERE` keeps every row of its own target is
+  now blocked**, by the rules that already block a missing or always-true
+  `WHERE`: VERICTO-003 for `DELETE`, VERICTO-030 (and VERICTO-042) for
+  `UPDATE`, all Critical / Block in the built-in ruleset. On PostgreSQL and
+  MySQL, simple and prepared statements:
+  - `c IN (SELECT c FROM <same table>)` and `c = ANY (SELECT c FROM <same table>)`;
+  - `EXISTS (SELECT … FROM <same table>)`;
+  - complementary `IS` tests on one column, such as
+    `email IS NULL OR email IS NOT NULL`.
+
+  The engine decides this only for a single plain target whose subquery reads
+  the same table with no filter, grouping, limit, join or CTE, so
+  `id IN (SELECT id FROM users WHERE banned)`,
+  `id IN (SELECT user_id FROM orders)` and `a IS NULL OR b IS NOT NULL` are
+  still forwarded. A workload that relies on such a statement to empty a table
+  on purpose now gets the protocol's native error; trial 5.1.0 with
+  `monitor_mode`, or approve the operation through the workspace policy rather
+  than through a filter that filters nothing.
+- **`DROP DATABASE` also reports VERICTO-012.** Engine 5.1.0 renames
+  VERICTO-012 "DROP SCHEMA / DATABASE" and extends it to `DROP DATABASE`, which
+  still matches VERICTO-010. The statement was already blocked (VERICTO-010 is
+  still the winner and the reported `rule_code`); its violation list, telemetry
+  event and `check_sql` findings now carry both codes. A workspace that disabled
+  VERICTO-010 but keeps VERICTO-012 now blocks `DROP DATABASE`.
+- **No change for `TRUNCATE`, `DROP SCHEMA` and `DROP DATABASE` otherwise.**
+  Engine 5.1.0 moves VERICTO-011 and VERICTO-012 from the `SchemaMigration`
+  class to `DataMutation`, so a CI channel's `schema_migration_cap` no longer
+  softens them. The proxy never sets that cap (the TCP proxy and the MCP
+  server are runtime channels), so these statements were already blocked and
+  still are.
+- SQL Server `DELETE TOP (n)` / `UPDATE TOP (n)` now parse in the engine. The
+  proxy serves the PostgreSQL and MySQL wire protocols only, so it never
+  evaluates T-SQL; nothing changes here.
+
 ### Added
 
 - **Dependabot keeps `THIRD_PARTY_LICENSES` current.** A new workflow
@@ -20,8 +65,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **vericto-engine v5.0.0 → v5.1.0** (`Cargo.toml`, `Cargo.lock`). The built-in
+  ruleset is still the engine's `standard_rules()`: same codes, severities and
+  default actions, so the proxy keeps no rule titles of its own to rename. A
+  new test (`engine_5_1_0_verdicts_on_the_wire_dialects`) pins the verdicts
+  above on both wire dialects.
+- README "What it blocks" names whole-table `WHERE` clauses and
+  `DROP DATABASE`; README, docs/MCP.md, NOTICE and LICENSING.md name 5.1.0
+  (image tags, installer URLs, the pinned engine version).
 - **Dependencies:** `flate2` 1.1.10 → 1.1.11 and `arc-swap` 1.9.3 → 1.9.5
-  (`Cargo.lock` only), with `THIRD_PARTY_LICENSES` regenerated.
+  (`Cargo.lock` only), with `THIRD_PARTY_LICENSES` regenerated. The engine bump
+  changes no other crate; `THIRD_PARTY_LICENSES` is regenerated for the engine
+  and proxy versions.
 
 ### Fixed
 
@@ -3242,7 +3297,8 @@ the service now targets the rebranded engine.
 - Optional control-plane link: ruleset hot-sync and telemetry reporting.
 - `/health` and `/metrics` (p50/p99 latency) endpoints.
 
-[Unreleased]: https://github.com/vericto/vericto-proxy/compare/v5.0.2...HEAD
+[Unreleased]: https://github.com/vericto/vericto-proxy/compare/v5.1.0...HEAD
+[5.1.0]: https://github.com/vericto/vericto-proxy/compare/v5.0.2...v5.1.0
 [5.0.2]: https://github.com/vericto/vericto-proxy/compare/v5.0.1...v5.0.2
 [5.0.1]: https://github.com/vericto/vericto-proxy/compare/v5.0.0...v5.0.1
 [5.0.0]: https://github.com/vericto/vericto-proxy/compare/v4.23.0...v5.0.0
