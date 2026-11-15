@@ -1,6 +1,6 @@
 [package]
 name = "vericto-proxy"
-version = "5.0.2"
+version = "5.1.0"
 edition = "2024"
 rust-version = "1.88"
 # Also the `desc` of the Homebrew formula cargo-dist generates (vericto-proxy.rb):
@@ -20,7 +20,7 @@ path = "src/main.rs"
 [dependencies]
 # AST engine, Vericto's own AGPL-3.0-only library. Keep the proxy and engine
 # major release aligned so the public binary has one Vericto license path.
-vericto-engine = { git = "https://github.com/vericto/vericto-engine", tag = "v5.0.0" }
+vericto-engine = { git = "https://github.com/vericto/vericto-engine", tag = "v5.1.0" }
 
 # PostgreSQL query normalization for sanitized telemetry (literals → $1, $2…).
 # Same major version the engine uses, so libpg_query resolves to a single build.
