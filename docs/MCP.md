@@ -71,7 +71,7 @@ printf '%s' 'postgres://vericto_agent_ro:…@db.example.com:5432/shop?sslmode=ve
 chmod 600 ~/.config/vericto/shop.url
 ```
 
-TLS is `verify-full` by default for any host that is not loopback; `sslrootcert=` in the
+TLS is `verify-full` by default for any host that is not loopback (`sslmode=require`, `prefer` or `allow`, and MySQL's `REQUIRED`/`PREFERRED`, encrypt without checking the certificate, as in libpq and the MySQL clients; off loopback the server says so at startup with the `database_tls_unverified` warning); `sslrootcert=` in the
 URL (or `UPSTREAM_SSLROOTCERT`) names a CA bundle when the provider's certificate is not
 publicly trusted. A database on your own machine (`localhost`, `127.0.0.1`) needs no TLS.
 

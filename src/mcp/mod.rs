@@ -255,6 +255,14 @@ pub async fn run(args: Vec<String>) {
     let shared = Shared::built_in();
     let mut warnings = Vec::new();
 
+    // sslmode=require/prefer/allow (and MySQL REQUIRED/PREFERRED) encrypt but,
+    // as in libpq and the MySQL clients, do not check the server's
+    // certificate. Fine on a local socket or loopback; elsewhere say so.
+    if let Some(message) = unverified_tls_warning(t.tls, &t.host) {
+        tracing::warn!(alert = "database_tls_unverified", "{message}");
+        warnings.push(json!({ "code": "database_tls_unverified", "message": message }));
+    }
+
     // The agent's environment (design §12.1).
     let exposure = env_warning::inspect(
         std::env::vars(),
@@ -800,6 +808,29 @@ fn http_tls(
     }
 }
 
+/// A warning when TLS to a non-local database host skips certificate checks.
+fn unverified_tls_warning(
+    tls: crate::tcp::upstream::UpstreamTlsMode,
+    host: &str,
+) -> Option<String> {
+    if tls != crate::tcp::upstream::UpstreamTlsMode::Require {
+        return None;
+    }
+    let h = host.trim_matches(['[', ']']);
+    let local = h.is_empty()
+        || h.starts_with('/')
+        || h.eq_ignore_ascii_case("localhost")
+        || h.parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback());
+    (!local).then(|| {
+        format!(
+            "TLS to {host} encrypts but does not verify the server's certificate \
+             (sslmode=require/prefer/allow); use sslmode=verify-full so a man in the middle \
+             cannot read the database password"
+        )
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -890,5 +921,31 @@ mod tests {
         let e = check_local_mode(Transport::Stdio, Some(true), 0).unwrap_err();
         assert!(e.contains("VERICTO_MCP_REQUIRE_CONTROL_PLANE"), "{e}");
         assert!(check_local_mode(Transport::Http, Some(true), 3).is_err());
+    }
+}
+
+#[cfg(test)]
+mod tls_warning_tests {
+    use super::unverified_tls_warning;
+    use crate::tcp::upstream::UpstreamTlsMode;
+
+    #[test]
+    fn unverified_tls_is_flagged_only_for_remote_hosts() {
+        let w = unverified_tls_warning(UpstreamTlsMode::Require, "db.example.com").unwrap();
+        assert!(w.contains("verify-full"), "{w}");
+        for local in [
+            "localhost",
+            "127.0.0.1",
+            "::1",
+            "[::1]",
+            "/var/run/postgresql",
+            "",
+        ] {
+            assert!(
+                unverified_tls_warning(UpstreamTlsMode::Require, local).is_none(),
+                "{local}"
+            );
+        }
+        assert!(unverified_tls_warning(UpstreamTlsMode::default(), "db.example.com").is_none());
     }
 }

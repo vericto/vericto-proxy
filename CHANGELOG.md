@@ -63,6 +63,8 @@ database; nothing that ran before changes.
   `MYSQL_URL*`, `MARIADB_PASSWORD`, `PLANETSCALE_*`, `~/.my.cnf` and
   `~/.mylogin.cnf`.
 
+- **`database_tls_unverified` warning**: with `sslmode=require`/`prefer`/`allow` (or MySQL `REQUIRED`/`PREFERRED`) to a host that is not loopback, `mcp` logs at startup and reports in `whoami` that the certificate is not verified, and points to `sslmode=verify-full`.
+
 ### Dependencies
 
 - `mysql_async` 0.37 (already the MySQL driver of the tests) and its

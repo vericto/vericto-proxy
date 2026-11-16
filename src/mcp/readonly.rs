@@ -220,6 +220,8 @@ pub fn parse_grant(line: &str) -> Option<(Vec<String>, bool)> {
 
 /// The MySQL check from `SHOW GRANTS` and the settings row (`CURRENT_USER()`,
 /// `read_only`, `super_read_only`).
+const GRANT_OPTION: &str = "WITH GRANT OPTION";
+
 pub fn from_mysql(grants: &[String], settings: &[Option<String>]) -> RoleCheck {
     let get = |i: usize| settings.get(i).and_then(|v| v.as_deref());
     let mut c = RoleCheck {
@@ -238,8 +240,13 @@ pub fn from_mysql(grants: &[String], settings: &[Option<String>]) -> RoleCheck {
     for line in grants {
         match parse_grant(line) {
             Some((privs, grant_option)) => {
-                if grant_option && !c.reasons.iter().any(|r| r == "WITH GRANT OPTION") {
-                    c.reasons.push("WITH GRANT OPTION".to_string());
+                // Deliberately a writer: GRANT OPTION lets the user grant
+                // privileges to other users, which changes the server's grant
+                // tables even when the user itself only has SELECT.
+                if grant_option && !c.reasons.iter().any(|r| r.starts_with(GRANT_OPTION)) {
+                    c.reasons.push(format!(
+                        "{GRANT_OPTION} (can grant privileges to other users; re-grant without it)"
+                    ));
                 }
                 all.extend(privs);
             }
@@ -486,6 +493,17 @@ mod tests {
             )
             .can_write,
             Some(true)
+        );
+
+        // SELECT with GRANT OPTION is not read-only: it can grant privileges.
+        let grantor = from_mysql(
+            &["GRANT SELECT ON `shop`.* TO `ro`@`%` WITH GRANT OPTION".into()],
+            &row(&["ro@%", "0", "0"]),
+        );
+        assert_eq!(grantor.can_write, Some(true));
+        assert!(
+            grantor.reasons[0].contains("can grant privileges to other users"),
+            "{grantor:?}"
         );
 
         // Role grants cannot be verified.

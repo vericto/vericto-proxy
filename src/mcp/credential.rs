@@ -237,6 +237,7 @@ impl SecretTool {
     }
 
     /// A given program (the tests' stand-in).
+    #[cfg(test)]
     pub fn at(program: impl Into<std::path::PathBuf>) -> Self {
         Self {
             program: program.into(),
@@ -466,6 +467,13 @@ pub fn read_secret_from_stdin() -> Result<String, String> {
             .map_err(|e| format!("cannot read the URL from stdin ({})", e.kind()))?;
         buf
     };
+    clean_secret(&raw)
+}
+
+/// The URL as read from stdin: surrounding whitespace and the final newline
+/// go, but a line break inside it means more than one line was sent, which is
+/// refused (`trim` only touches the ends, so an inner `\n` survives it).
+fn clean_secret(raw: &str) -> Result<String, String> {
     let s = raw.trim_end_matches(['\n', '\r']).trim().to_string();
     if s.is_empty() {
         return Err("no URL on stdin".to_string());
@@ -473,7 +481,7 @@ pub fn read_secret_from_stdin() -> Result<String, String> {
     if s.len() > MAX_SECRET_BYTES {
         return Err(format!("the URL is longer than {MAX_SECRET_BYTES} bytes"));
     }
-    if s.contains('\n') {
+    if s.contains(['\n', '\r']) {
         return Err("stdin holds more than one line; send the URL alone".to_string());
     }
     Ok(s)
@@ -482,6 +490,27 @@ pub fn read_secret_from_stdin() -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stdin_secret_keeps_one_line_and_refuses_more() {
+        assert_eq!(
+            clean_secret("postgres://u:p@h/db\n").unwrap(),
+            "postgres://u:p@h/db"
+        );
+        assert_eq!(
+            clean_secret("  postgres://u:p@h/db\r\n").unwrap(),
+            "postgres://u:p@h/db"
+        );
+        for raw in ["url1\nurl2\n", "url1\r\nurl2", "url1\rurl2"] {
+            assert!(
+                clean_secret(raw)
+                    .unwrap_err()
+                    .contains("more than one line"),
+                "{raw:?}"
+            );
+        }
+        assert!(clean_secret("\n\n").unwrap_err().contains("no URL"));
+    }
 
     #[test]
     fn names_default_to_the_vericto_service() {
