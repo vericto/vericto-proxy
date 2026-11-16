@@ -586,6 +586,9 @@ pub fn sqlstate_name(code: &str) -> Option<&'static str> {
     Some(match code {
         "42P01" => "undefined_table",
         "42703" => "undefined_column",
+        // MySQL and MariaDB.
+        "42S02" => "base_table_not_found",
+        "42S22" => "column_not_found",
         "42883" => "undefined_function",
         "42P02" => "undefined_parameter",
         "3F000" => "invalid_schema_name",
@@ -788,7 +791,10 @@ fn invalid_message(r: &InvalidReason) -> String {
 
 fn database_error_step(sqlstate: &str, ctx: &ExecuteContext<'_>) -> NextStep {
     let label = sqlstate_label(sqlstate);
-    if matches!(sqlstate, "42P01" | "42703" | "42883" | "3F000") {
+    if matches!(
+        sqlstate,
+        "42P01" | "42703" | "42883" | "3F000" | "42S02" | "42S22"
+    ) {
         let describe = call_hint(ctx.access, "describe_schema", None);
         let tool =
             (describe.is_some() && ctx.access.has("describe_schema")).then_some("describe_schema");

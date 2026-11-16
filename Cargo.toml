@@ -1,6 +1,6 @@
 [package]
 name = "vericto-proxy"
-version = "5.1.0"
+version = "5.2.0"
 edition = "2024"
 rust-version = "1.88"
 # Also the `desc` of the Homebrew formula cargo-dist generates (vericto-proxy.rb):
@@ -32,7 +32,7 @@ pg_query = "6.2"
 # (src/tcp/evaluator.rs) and sanitized telemetry of MySQL text (src/tcp/postgres.rs).
 # The engine parses MySQL with this same crate, so it adds no code; keep the
 # version the engine's: bump this line and the engine tag together.
-sqlparser = "0.63"
+sqlparser = { version = "0.63", features = ["visitor"] }
 
 # Async runtime
 tokio = { version = "1.38", features = ["full"] }
@@ -98,9 +98,39 @@ http-body-util = "0.1"
 # library. `--no-default-features` builds with the system allocator.
 mimalloc = { version = "0.1", optional = true, default-features = false }
 
+# MySQL and MariaDB in `vericto-proxy mcp` (5.2.0): the client of `execute_sql`
+# on a `mysql://` or `mariadb://` URL. The same crate and features the
+# sensitive-column tests already used (MIT OR Apache-2.0; rustls on ring, which
+# is in the tree; no C zlib). Configured so it sends no SQL of its own (no
+# `SELECT @@…` settings read, no socket switch, no statement cache): every
+# statement it carries is a control statement of src/mcp/control.rs or the
+# agent's own, prepared with COM_STMT_PREPARE (src/mcp/mysql.rs).
+mysql_async = { version = "0.37", default-features = false, features = ["default-rustls-ring"] }
+# mysql_async's own protocol crate, for its named-parameter scanner: a text
+# the driver would rewrite (`:name` to `?`) is never sent (src/mcp/mysql.rs).
+mysql_common = { version = "0.37", default-features = false }
+
+# The OS credential store for `--database-url-keychain` and `vericto-proxy mcp
+# credential` (5.2.0, the default `keychain` feature) on macOS (Keychain) and
+# Windows (Credential Manager). MIT OR Apache-2.0. On Linux the store is the
+# Secret Service through libsecret's own `secret-tool` command (GNOME Keyring,
+# KWallet), so the Linux binary links no libdbus and the tree gains no D-Bus
+# crate (zbus 4's zvariant is unmaintained, RUSTSEC-2026-0370, and zbus 6 needs
+# Rust 1.89): src/mcp/credential.rs.
+keyring = { version = "3.6", optional = true, default-features = false, features = [
+    "apple-native",
+    "windows-native",
+] }
+# Reads the database URL for `vericto-proxy mcp credential set` from the
+# terminal without echoing it. Apache-2.0.
+rpassword = "7"
+
 [features]
-default = ["mimalloc"]
+default = ["mimalloc", "keychain"]
 mimalloc = ["dep:mimalloc"]
+# The OS keychain backend of `--database-url-keychain` (`--no-default-features`
+# builds without it; the flag then fails with a message naming the feature).
+keychain = ["dep:keyring"]
 
 [dev-dependencies]
 tempfile = "3"
@@ -110,11 +140,8 @@ axum = "0.7"
 # (src/tcp/sensitive_tests.rs), run against a live database when
 # VERICTO_TEST_PG_URL is set. Dev-only: nothing of it ships in the binary.
 tokio-postgres = "0.7"
-# A real MySQL driver for the same tests, over COM_QUERY and prepared
-# statements (COM_STMT_PREPARE / COM_STMT_EXECUTE), run when
-# VERICTO_TEST_MYSQL_URL is set. rustls on ring (already in the tree) for the
-# both-hops-TLS run; no C zlib.
-mysql_async = { version = "0.37", default-features = false, features = ["default-rustls-ring"] }
+# mysql_async (a regular dependency since 5.2.0) is also the real MySQL driver
+# of the sensitive-column tests, run when VERICTO_TEST_MYSQL_URL is set.
 # Throwaway CAs and server/client certificates for the upstream TLS handshake
 # tests (src/tcp/upstream.rs): a private CA, verify-ca against a certificate for
 # another name, mutual TLS on the MySQL path. Generated per test run, so no

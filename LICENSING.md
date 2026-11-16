@@ -63,8 +63,8 @@ non-compete restriction.
 
 ## Embedded engine
 
-Version 5.1.0 pins `vericto-engine` version 5.1.0 (5.0.0 to 5.0.2 pinned engine
-5.0.0). Both public components use `AGPL-3.0-only`, so the public binary and its
+Versions 5.1.0 and 5.2.0 pin `vericto-engine` version 5.1.0 (5.0.0 to 5.0.2 pinned
+engine 5.0.0). Both public components use `AGPL-3.0-only`, so the public binary and its
 Vericto source components have a single compatible public-license path. Third-party components keep their own
 licenses.
 

@@ -15,6 +15,9 @@ accepted = [
     "ISC",
     "MIT",
     "Unicode-3.0",
+    # foldhash (hashbrown's default hasher, through mysql_async's lru), 5.2.0.
+    # Already allowed by deny.toml; the first shipped crate under it.
+    "Zlib",
 ]
 
 # The release targets of dist-workspace.toml (the image uses the two Linux ones).

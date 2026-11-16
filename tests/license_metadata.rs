@@ -87,7 +87,7 @@ fn image_and_dependency_notices_use_the_same_license() {
     assert!(about.contains("[vericto-engine]\naccepted = [\"AGPL-3.0-only\"]"));
 
     let notice = root("NOTICE");
-    assert!(notice.contains("Version 5.1.0 of\n  the proxy pins version 5.1.0 of the engine"));
+    assert!(notice.contains("Version 5.2.0 of\n  the proxy pins version 5.1.0 of the engine"));
     assert!(notice.contains("RUNTIME_BASE_LICENSES"));
     assert!(
         root("third-party/runtime-base.txt")

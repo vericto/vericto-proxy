@@ -451,6 +451,482 @@ fn explain_option_executes(opt: &Value) -> bool {
     !matches!(text.as_deref(), Some("false" | "off" | "0" | "no"))
 }
 
+/// Classifies `sql` in the database's dialect.
+pub fn classify_for(
+    dialect: crate::mcp::config::DbDialect,
+    sql: &str,
+) -> Result<Classified, Unclassifiable> {
+    if dialect.is_mysql() {
+        mysql::classify(sql)
+    } else {
+        classify(sql)
+    }
+}
+
+/// [`statement_count`] in the database's dialect.
+pub fn statement_count_for(dialect: crate::mcp::config::DbDialect, sql: &str) -> usize {
+    if dialect.is_mysql() {
+        mysql::statement_count(sql)
+    } else {
+        statement_count(sql)
+    }
+}
+
+/// The statement-class check for MySQL and MariaDB (5.2.0), from sqlparser's
+/// MySQL tree (the parser the engine reads MySQL with), with the same tiers
+/// and the same fail-closed rule as PostgreSQL's: what it does not know is
+/// never run.
+///
+/// * `read`: `SELECT` (without `FOR UPDATE`, `FOR SHARE`, `LOCK IN SHARE
+///   MODE` or `INTO`), `VALUES`, `TABLE`, `EXPLAIN`/`DESCRIBE` of a read
+///   (never `EXPLAIN ANALYZE`, which runs it), `DESCRIBE <table>`, `SHOW`.
+/// * Refused whatever the statement: text the server would read differently
+///   from the parser, namely executable comments (`/*! … */`, MariaDB's
+///   `/*M! … */`) and optimizer hints (`/*+ … */`, which can raise
+///   `MAX_EXECUTION_TIME` or set session variables for the statement); named
+///   parameters (`:name`, which the driver would rewrite); user-variable
+///   assignment (`:=`, state that would outlive the call on a pooled
+///   connection).
+/// * The side-effect functions of [`MYSQL_DENIED_FUNCTIONS`].
+pub mod mysql {
+    use std::ops::ControlFlow;
+
+    use sqlparser::ast::{
+        Expr, Query, Select, SetExpr, Statement, Value, ValueWithSpan, Visit, Visitor,
+    };
+    use sqlparser::dialect::MySqlDialect;
+    use sqlparser::parser::Parser;
+    use sqlparser::tokenizer::{Token, Tokenizer, Whitespace};
+
+    use super::{Class, Classified, Tier, Unclassifiable};
+
+    /// Functions a MySQL or MariaDB read could call that lock, wait on the
+    /// server, read files, run commands (the common UDFs) or advance
+    /// sequences. A trailing `*` is a prefix. Versioned like
+    /// [`super::DENIED_FUNCTIONS`].
+    pub const MYSQL_DENIED_FUNCTIONS: &[&str] = &[
+        // Locks and waits.
+        "get_lock",
+        "release_lock",
+        "release_all_locks",
+        "master_pos_wait",
+        "source_pos_wait",
+        "wait_for_executed_gtid_set",
+        "wait_until_sql_thread_after_gtids",
+        "benchmark",
+        // Files and commands.
+        "load_file",
+        "sys_exec",
+        "sys_eval",
+        "sys_get",
+        "sys_set",
+        "lib_mysqludf_*",
+        // Sequences (MariaDB; allowed from `write` up).
+        "nextval",
+        "setval",
+    ];
+
+    const WRITE_FUNCTIONS: &[&str] = &["nextval", "setval"];
+
+    fn denied(name: &str) -> bool {
+        MYSQL_DENIED_FUNCTIONS
+            .iter()
+            .any(|d| match d.strip_suffix('*') {
+                Some(prefix) => name.starts_with(prefix),
+                None => name == *d,
+            })
+    }
+
+    /// Lexical refusals, before parsing: what the server would read
+    /// differently from the parser, or what would change the bytes sent.
+    fn lexical_refusal(sql: &str) -> Option<&'static str> {
+        // Anywhere in the text, string literals included: a false refusal
+        // costs a param, a missed one would run code the evaluator never saw.
+        if sql.contains("/*!") || sql.contains("/*M!") || sql.contains("/*m!") {
+            return Some("a MySQL executable comment (/*! … */), which the server runs as SQL");
+        }
+        if sql.contains("/*+") {
+            return Some(
+                "an optimizer hint (/*+ … */), which can change the statement's limits and session variables",
+            );
+        }
+        match mysql_common::named_params::ParsedNamedParams::parse(sql.as_bytes()) {
+            Ok(p) if p.params().is_empty() => {}
+            _ => return Some("a named parameter (:name); use ? placeholders and params"),
+        }
+        let tokens = Tokenizer::new(&MySqlDialect {}, sql).tokenize().ok()?;
+        if tokens.iter().any(|t| matches!(t, Token::Assignment)) {
+            return Some("a user-variable assignment (:=)");
+        }
+        None
+    }
+
+    #[derive(Default)]
+    struct Facts {
+        locking: bool,
+        into: bool,
+        write: bool,
+        functions: Vec<String>,
+        placeholders: usize,
+        other_placeholder: bool,
+    }
+
+    impl Visitor for Facts {
+        type Break = ();
+
+        fn pre_visit_query(&mut self, q: &Query) -> ControlFlow<()> {
+            self.locking |= !q.locks.is_empty();
+            if matches!(
+                *q.body,
+                SetExpr::Insert(_) | SetExpr::Update(_) | SetExpr::Delete(_) | SetExpr::Merge(_)
+            ) {
+                self.write = true;
+            }
+            ControlFlow::Continue(())
+        }
+
+        fn pre_visit_select(&mut self, s: &Select) -> ControlFlow<()> {
+            if s.into.is_some() {
+                self.into = true;
+            }
+            ControlFlow::Continue(())
+        }
+
+        fn pre_visit_expr(&mut self, e: &Expr) -> ControlFlow<()> {
+            if let Expr::Function(f) = e
+                && let Some(last) = f.name.0.last()
+            {
+                let name = last.to_string();
+                let name = name.trim_matches('`').to_ascii_lowercase();
+                self.functions.push(name);
+            }
+            ControlFlow::Continue(())
+        }
+
+        fn pre_visit_value(&mut self, v: &ValueWithSpan) -> ControlFlow<()> {
+            if let Value::Placeholder(p) = &v.value {
+                if p == "?" {
+                    self.placeholders += 1;
+                } else {
+                    self.other_placeholder = true;
+                }
+            }
+            ControlFlow::Continue(())
+        }
+    }
+
+    /// Classifies `sql` (one MySQL statement, the text that would run).
+    pub fn classify(sql: &str) -> Result<Classified, Unclassifiable> {
+        let stmts = Parser::parse_sql(&MySqlDialect {}, sql)
+            .map_err(|e| Unclassifiable::Parse(e.to_string()))?;
+        let stmt = match stmts.len() {
+            0 => return Err(Unclassifiable::Empty),
+            1 => &stmts[0],
+            n => return Err(Unclassifiable::MultipleStatements(n)),
+        };
+        let mut facts = Facts::default();
+        let _ = stmt.visit(&mut facts);
+        let (mut class, command) = top_level(stmt);
+        if let Some(why) = lexical_refusal(sql) {
+            class = Class::Never(why.to_string());
+        }
+        if facts.other_placeholder {
+            class = Class::Never(
+                "a placeholder other than ? ($1 and :name are not MySQL's)".to_string(),
+            );
+        }
+        if let Class::Tier(t) = &mut class
+            && facts.write
+        {
+            *t = (*t).max(Tier::Write);
+        }
+        if facts.into && matches!(class, Class::Tier(Tier::Read)) {
+            class = Class::Never("SELECT … INTO (a file or variables)".to_string());
+        }
+        if facts.locking && matches!(class, Class::Tier(Tier::Read)) {
+            class = Class::Never(
+                "SELECT … FOR UPDATE/SHARE (a row lock has no effect in a one-statement call)"
+                    .to_string(),
+            );
+        }
+        let mut denied_functions: Vec<String> =
+            facts.functions.into_iter().filter(|f| denied(f)).collect();
+        denied_functions.sort();
+        denied_functions.dedup();
+        if let Some(never) = denied_functions
+            .iter()
+            .find(|f| !WRITE_FUNCTIONS.contains(&f.as_str()))
+        {
+            class = Class::Never(format!(
+                "a call to {never}, which locks, waits, or reads files or runs commands on the server"
+            ));
+        } else if !denied_functions.is_empty()
+            && let Class::Tier(t) = &mut class
+        {
+            *t = (*t).max(Tier::Write);
+        }
+        Ok(Classified {
+            class,
+            command,
+            // `?` placeholders are positional: the n-th binds params[n-1].
+            placeholders: (1..=facts.placeholders as i32).collect(),
+            denied_functions,
+        })
+    }
+
+    fn top_level(stmt: &Statement) -> (Class, String) {
+        let tier = |t: Tier, cmd: &str| (Class::Tier(t), cmd.to_string());
+        let never = |cmd: &str| (Class::Never(cmd.to_string()), cmd.to_string());
+        match stmt {
+            Statement::Query(q) => match &*q.body {
+                SetExpr::Values(_) => tier(Tier::Read, "VALUES"),
+                SetExpr::Table(_) => tier(Tier::Read, "TABLE"),
+                SetExpr::Insert(_)
+                | SetExpr::Update(_)
+                | SetExpr::Delete(_)
+                | SetExpr::Merge(_) => tier(Tier::Write, "WITH"),
+                _ => tier(Tier::Read, "SELECT"),
+            },
+            Statement::Explain {
+                analyze, statement, ..
+            } => {
+                if *analyze {
+                    return never("EXPLAIN ANALYZE (it executes the statement)");
+                }
+                let (inner, cmd) = top_level(statement);
+                match inner {
+                    Class::Tier(Tier::Read) => tier(Tier::Read, "EXPLAIN"),
+                    other => (other, format!("EXPLAIN {cmd}")),
+                }
+            }
+            Statement::ExplainTable { .. } => tier(Tier::Read, "DESCRIBE"),
+            Statement::ShowFunctions { .. }
+            | Statement::ShowVariable { .. }
+            | Statement::ShowStatus { .. }
+            | Statement::ShowVariables { .. }
+            | Statement::ShowCreate { .. }
+            | Statement::ShowColumns { .. }
+            | Statement::ShowDatabases { .. }
+            | Statement::ShowSchemas { .. }
+            | Statement::ShowCharset { .. }
+            | Statement::ShowTables { .. }
+            | Statement::ShowViews { .. }
+            | Statement::ShowCollation { .. } => tier(Tier::Read, "SHOW"),
+            Statement::Insert(_) => tier(Tier::Write, "INSERT"),
+            Statement::Update(_) => tier(Tier::Write, "UPDATE"),
+            Statement::Delete(_) => tier(Tier::Delete, "DELETE"),
+            Statement::Merge(_) => tier(Tier::Write, "MERGE"),
+            Statement::CreateTable(_) => tier(Tier::Ddl, "CREATE TABLE"),
+            Statement::CreateView(_) => tier(Tier::Ddl, "CREATE VIEW"),
+            Statement::CreateIndex(_) => tier(Tier::Ddl, "CREATE INDEX"),
+            Statement::AlterTable(_) => tier(Tier::Ddl, "ALTER TABLE"),
+            Statement::Drop { .. } => tier(Tier::Ddl, "DROP"),
+            Statement::Truncate(_) => tier(Tier::Ddl, "TRUNCATE"),
+            Statement::RenameTable(_) => tier(Tier::Ddl, "RENAME TABLE"),
+            Statement::CreateSchema { .. } | Statement::CreateDatabase { .. } => {
+                tier(Tier::Ddl, "CREATE DATABASE")
+            }
+            Statement::CreateSequence { .. } => tier(Tier::Ddl, "CREATE SEQUENCE"),
+            Statement::Comment { .. } => tier(Tier::Ddl, "COMMENT"),
+            Statement::Set(_) => never("SET"),
+            Statement::Use(_) => never("USE"),
+            Statement::Call(_) => never("CALL"),
+            Statement::Kill { .. } => never("KILL"),
+            Statement::LockTables { .. } | Statement::UnlockTables => never("LOCK TABLES"),
+            Statement::LoadData { .. } => never("LOAD DATA"),
+            Statement::StartTransaction { .. }
+            | Statement::Commit { .. }
+            | Statement::Rollback { .. }
+            | Statement::Savepoint { .. }
+            | Statement::ReleaseSavepoint { .. } => {
+                never("transaction control (START TRANSACTION, COMMIT, ROLLBACK, SAVEPOINT)")
+            }
+            Statement::Prepare { .. }
+            | Statement::Execute { .. }
+            | Statement::Deallocate { .. } => never("PREPARE / EXECUTE"),
+            Statement::Grant { .. } | Statement::Revoke { .. } => never("GRANT / REVOKE"),
+            Statement::CreateUser(_) | Statement::AlterUser(_) | Statement::CreateRole { .. } => {
+                never("users and roles")
+            }
+            Statement::CreateFunction(_) | Statement::CreateProcedure { .. } => {
+                never("functions and procedures")
+            }
+            Statement::CreateTrigger(_) => never("triggers"),
+            Statement::Flush { .. } => never("FLUSH"),
+            Statement::OptimizeTable { .. } | Statement::Analyze(_) => {
+                never("OPTIMIZE / ANALYZE TABLE")
+            }
+            other => {
+                let name = format!("{other:?}");
+                let name = name
+                    .split(|c: char| !c.is_ascii_alphanumeric())
+                    .next()
+                    .unwrap_or("statement")
+                    .to_string();
+                (
+                    Class::Never(format!("{name} (not a statement execute_sql runs)")),
+                    name,
+                )
+            }
+        }
+    }
+
+    /// The number of statements in `sql`: the parser's count when it parses,
+    /// otherwise the tokenizer's segments between `;` that hold anything but
+    /// whitespace and comments. Text the tokenizer cannot read counts as one.
+    pub fn statement_count(sql: &str) -> usize {
+        if let Ok(stmts) = Parser::parse_sql(&MySqlDialect {}, sql) {
+            return stmts.len();
+        }
+        let Ok(tokens) = Tokenizer::new(&MySqlDialect {}, sql).tokenize() else {
+            return 1;
+        };
+        let mut count = 0;
+        let mut segment_has_code = false;
+        for t in &tokens {
+            match t {
+                Token::SemiColon => {
+                    count += usize::from(segment_has_code);
+                    segment_has_code = false;
+                }
+                Token::Whitespace(
+                    Whitespace::Space
+                    | Whitespace::Newline
+                    | Whitespace::Tab
+                    | Whitespace::SingleLineComment { .. }
+                    | Whitespace::MultiLineComment(_),
+                ) => {}
+                _ => segment_has_code = true,
+            }
+        }
+        (count + usize::from(segment_has_code)).max(1)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn tier(sql: &str) -> Class {
+            classify(sql)
+                .unwrap_or_else(|e| panic!("{sql}: {e:?}"))
+                .class
+        }
+
+        #[test]
+        fn reads_are_read() {
+            for sql in [
+                "SELECT 1",
+                "SELECT id, email FROM users WHERE id = ? LIMIT 10",
+                "SELECT * FROM shop.orders o JOIN users u ON u.id = o.user_id",
+                "WITH t AS (SELECT 1 AS a) SELECT a FROM t",
+                "SELECT a FROM t UNION ALL SELECT b FROM u",
+                "EXPLAIN SELECT * FROM t",
+                "DESCRIBE t",
+                "SHOW TABLES",
+                "SHOW COLUMNS FROM t",
+                "SHOW CREATE TABLE t",
+                "SELECT `select` FROM `from`",
+                "SELECT 'it''s', \"double\", 'a\\'b' FROM t",
+                "SELECT 1 -- trailing\n",
+                "SELECT 1;",
+            ] {
+                assert_eq!(tier(sql), Class::Tier(Tier::Read), "{sql}");
+            }
+        }
+
+        #[test]
+        fn writes_and_ddl_get_their_tier() {
+            assert_eq!(tier("INSERT INTO t VALUES (1)"), Class::Tier(Tier::Write));
+            assert_eq!(tier("REPLACE INTO t VALUES (1)"), Class::Tier(Tier::Write));
+            assert_eq!(
+                tier("UPDATE t SET a = 1 WHERE id = 2"),
+                Class::Tier(Tier::Write)
+            );
+            assert_eq!(
+                tier("DELETE FROM t WHERE id = 1"),
+                Class::Tier(Tier::Delete)
+            );
+            assert_eq!(tier("DROP TABLE t"), Class::Tier(Tier::Ddl));
+            assert_eq!(
+                tier("CREATE TEMPORARY TABLE x (a int)"),
+                Class::Tier(Tier::Ddl)
+            );
+            assert_eq!(tier("TRUNCATE TABLE t"), Class::Tier(Tier::Ddl));
+            assert_eq!(
+                tier("ALTER TABLE t ADD COLUMN b int"),
+                Class::Tier(Tier::Ddl)
+            );
+            assert_eq!(tier("SELECT nextval(s)"), Class::Tier(Tier::Write));
+        }
+
+        #[test]
+        fn never_through_execute_sql() {
+            for sql in [
+                "SET autocommit = 0",
+                "SET SESSION transaction_read_only = OFF",
+                "START TRANSACTION",
+                "COMMIT",
+                "USE other",
+                "CALL p()",
+                "LOCK TABLES t READ",
+                "GRANT ALL ON *.* TO x",
+                "SELECT * FROM t FOR UPDATE",
+                "SELECT * FROM t LOCK IN SHARE MODE",
+                "SELECT * FROM t INTO OUTFILE '/tmp/x'",
+                "SELECT a INTO @v FROM t",
+                "EXPLAIN ANALYZE SELECT * FROM t",
+                "SELECT load_file('/etc/passwd')",
+                "SELECT GET_LOCK('x', 10)",
+                "SELECT benchmark(100000000, md5('a'))",
+                "SELECT 1 /*! , (SELECT 1) */",
+                "SELECT /*!50000 1 */",
+                "SELECT 1 /*M! , 2 */",
+                "SELECT /*+ MAX_EXECUTION_TIME(100000) */ * FROM t",
+                "SELECT @a := 1",
+                "SELECT * FROM t WHERE id = :id",
+                "KILL 5",
+                "PREPARE s FROM 'SELECT 1'",
+            ] {
+                match classify(sql) {
+                    Ok(c) => assert!(matches!(c.class, Class::Never(_)), "{sql}: {:?}", c.class),
+                    // A form the parser does not read is refused too.
+                    Err(Unclassifiable::Parse(_)) => {}
+                    Err(e) => panic!("{sql}: {e:?}"),
+                }
+            }
+        }
+
+        #[test]
+        fn placeholders_are_counted_in_order() {
+            let c = classify("SELECT * FROM t WHERE a = ? AND b IN (?, ?)").unwrap();
+            assert_eq!(c.placeholders, vec![1, 2, 3]);
+            assert!(
+                classify("SELECT '?' FROM t")
+                    .unwrap()
+                    .placeholders
+                    .is_empty()
+            );
+        }
+
+        #[test]
+        fn statements_are_counted_also_when_they_do_not_parse() {
+            assert_eq!(statement_count("SELECT 1; SELECT 2"), 2);
+            assert_eq!(statement_count("SELECT 1;"), 1);
+            assert_eq!(statement_count("SELECT ';' FROM t"), 1);
+            assert_eq!(statement_count("SELEKT 1; DROP TABLE t"), 2);
+            assert_eq!(statement_count("SELEKT 1 -- ; x"), 1);
+            assert!(matches!(
+                classify("SELECT 1; SELECT 2"),
+                Err(Unclassifiable::MultipleStatements(2))
+            ));
+            assert!(matches!(
+                classify("  -- nothing"),
+                Err(Unclassifiable::Empty)
+            ));
+        }
+    }
+}
+
 /// The number of statements in `sql` for the "one statement per call" check,
 /// also for text the parser cannot read: the parser's split when it parses,
 /// otherwise the scanner's tokens (strings, quoted identifiers, dollar quotes

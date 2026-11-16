@@ -13,7 +13,8 @@ use std::time::{Duration, Instant};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::mcp::config::DatabaseTarget;
-use crate::mcp::pg::{ConnectError, PgConn, connect};
+use crate::mcp::db::Conn;
+use crate::mcp::pg::ConnectError;
 
 /// How long a call waits for a free connection before `DATABASE_UNAVAILABLE`
 /// (retry later).
@@ -23,14 +24,14 @@ pub struct Pool {
     target: DatabaseTarget,
     allow_md5: bool,
     idle_for: Duration,
-    idle: Mutex<Vec<PgConn>>,
+    idle: Mutex<Vec<Conn>>,
     permits: Arc<Semaphore>,
     size: usize,
 }
 
 /// A connection out of the pool; back into it with [`Pool::put`].
 pub struct Checkout {
-    pub conn: PgConn,
+    pub conn: Conn,
     _permit: OwnedSemaphorePermit,
 }
 
@@ -63,12 +64,12 @@ impl Pool {
         let reused = {
             let mut idle = self.idle.lock().unwrap_or_else(|e| e.into_inner());
             let now = Instant::now();
-            idle.retain(|c| now.duration_since(c.last_used) < self.idle_for);
+            idle.retain(|c| now.duration_since(c.last_used()) < self.idle_for);
             idle.pop()
         };
         let conn = match reused {
             Some(c) => c,
-            None => connect(&self.target, self.allow_md5)
+            None => Conn::connect(&self.target, self.allow_md5)
                 .await
                 .map_err(CheckoutError::Connect)?,
         };
@@ -78,12 +79,16 @@ impl Pool {
         })
     }
 
-    /// Returns a connection that is healthy and idle; drops any other.
+    /// Returns a connection that is healthy and idle; closes any other.
     pub fn put(&self, mut c: Checkout) {
-        if c.conn.broken || c.conn.status != b'I' {
+        if !c.conn.reusable() {
+            let Checkout { conn, _permit } = c;
+            if let Ok(rt) = tokio::runtime::Handle::try_current() {
+                rt.spawn(conn.close());
+            }
             return;
         }
-        c.conn.last_used = Instant::now();
+        c.conn.touch();
         let mut idle = self.idle.lock().unwrap_or_else(|e| e.into_inner());
         if idle.len() < self.size {
             idle.push(c.conn);
@@ -95,6 +100,6 @@ impl Pool {
     pub fn sweep(&self) {
         let mut idle = self.idle.lock().unwrap_or_else(|e| e.into_inner());
         let now = Instant::now();
-        idle.retain(|c| now.duration_since(c.last_used) < self.idle_for);
+        idle.retain(|c| now.duration_since(c.last_used()) < self.idle_for);
     }
 }

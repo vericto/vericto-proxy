@@ -1,8 +1,8 @@
 # MCP Proxy mode: `vericto-proxy mcp`
 
 `vericto-proxy mcp` is an [MCP](https://modelcontextprotocol.io) server that lets an AI
-agent (Claude Code, Cursor, Codex, any MCP client) read a PostgreSQL database
-**through Vericto**. The agent gets an `execute_sql` tool and no database credential.
+agent (Claude Code, Cursor, Codex, any MCP client) read a PostgreSQL, MySQL or MariaDB
+database **through Vericto** (MySQL and MariaDB since 5.2.0). The agent gets an `execute_sql` tool and no database credential.
 Every statement is evaluated against the rules first, and the server runs exactly what
 it evaluated, or the policy's own rewrite of it (masked columns, a `LIMIT` bound). What
 is checked is what runs.
@@ -15,16 +15,20 @@ Vericto workspace it applies the workspace's rules instead
 
 It is the same binary and image as the TCP proxy, in a second mode, and it reuses the
 proxy's evaluator, masks, agent-access allowlists, business policies, signed rule sync,
-kill switch and telemetry. This release (5.1.0) is **read-only**: `execute_sql` runs
+kill switch and telemetry. This release (5.2.0) is **read-only**: `execute_sql` runs
 reads only (the "read tier").
 
 > **The guarantee holds only if the agent has no other database credential.** If the
 > agent can also read a `DATABASE_URL`, a `~/.pgpass` or the server's secret file, it
 > can run SQL around Vericto. The server warns when it sees such a credential in its
-> environment (see [Security](#security)).
+> environment (see [Security](#security)), and [hard mode](#hard-mode) keeps the
+> credential out of the agent's reach.
 
 - [Try it without an account](#try-it-without-an-account)
 - [Connect to Vericto](#connect-to-vericto)
+- [Hard mode](#hard-mode)
+- [MySQL and MariaDB](#mysql-and-mariadb)
+- [Read-only database roles](#read-only-database-roles)
 - [How it works](#how-it-works)
 - [Set up (Streamable HTTP) for a team](#set-up-streamable-http-for-a-team)
 - [Tools](#tools)
@@ -53,9 +57,12 @@ ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO vericto_agen
 ```
 
 Supabase, Neon, RDS and Cloud SQL all support such a role. On Supabase use the
-Supavisor pooler host (session mode, port 5432, or transaction mode, 6543).
+Supavisor pooler host (session mode, port 5432, or transaction mode, 6543). MySQL and
+MariaDB, and what each provider needs, are in
+[Read-only database roles](#read-only-database-roles).
 
-**2. The URL in a file, not in the agent's configuration.**
+**2. The URL in a file, not in the agent's configuration** (or in the OS keychain:
+[hard mode](#hard-mode)).
 
 ```bash
 mkdir -p ~/.config/vericto && chmod 700 ~/.config/vericto
@@ -64,7 +71,7 @@ printf '%s' 'postgres://vericto_agent_ro:…@db.example.com:5432/shop?sslmode=ve
 chmod 600 ~/.config/vericto/shop.url
 ```
 
-TLS is `verify-full` by default for any host that is not loopback; `sslrootcert=` in the
+TLS is `verify-full` by default for any host that is not loopback (`sslmode=require`, `prefer` or `allow`, and MySQL's `REQUIRED`/`PREFERRED`, encrypt without checking the certificate, as in libpq and the MySQL clients; off loopback the server says so at startup with the `database_tls_unverified` warning); `sslrootcert=` in the
 URL (or `UPSTREAM_SSLROOTCERT`) names a CA bundle when the provider's certificate is not
 publicly trusted. A database on your own machine (`localhost`, `127.0.0.1`) needs no TLS.
 
@@ -79,7 +86,7 @@ puts `vericto-proxy` in `~/.cargo/bin`; Windows and manual downloads are in the
 
 ```bash
 curl --proto '=https' --tlsv1.2 -LsSf \
-  https://github.com/vericto/vericto-proxy/releases/download/v5.1.0/vericto-proxy-installer.sh | sh
+  https://github.com/vericto/vericto-proxy/releases/download/v5.2.0/vericto-proxy-installer.sh | sh
 claude mcp add vericto-db -- ~/.cargo/bin/vericto-proxy \
   mcp --database-url-file ~/.config/vericto/shop.url
 ```
@@ -122,7 +129,7 @@ user, so the container runs as you):
 claude mcp add vericto-db -- \
   docker run -i --rm --user "$(id -u):$(id -g)" \
     -v ~/.config/vericto/shop.url:/run/secrets/db.url:ro \
-    vericto/vericto-proxy:5.1.0 /usr/local/bin/vericto-proxy mcp --database-url-file /run/secrets/db.url
+    vericto/vericto-proxy:5.2.0 /usr/local/bin/vericto-proxy mcp --database-url-file /run/secrets/db.url
 ```
 
 Cursor (`.cursor/mcp.json`) or any client that takes a command:
@@ -134,7 +141,7 @@ Cursor (`.cursor/mcp.json`) or any client that takes a command:
       "command": "docker",
       "args": ["run", "-i", "--rm", "--user", "501:20",
                "-v", "/Users/me/.config/vericto/shop.url:/run/secrets/db.url:ro",
-               "vericto/vericto-proxy:5.1.0", "/usr/local/bin/vericto-proxy", "mcp",
+               "vericto/vericto-proxy:5.2.0", "/usr/local/bin/vericto-proxy", "mcp",
                "--database-url-file", "/run/secrets/db.url"]
     }
   }
@@ -229,7 +236,7 @@ claude mcp add vericto-db \
   -e VERICTO_API_KEY=vtro_... -e VERICTO_DATABASE_ID=<database id> -- \
   docker run -i --rm --user "$(id -u):$(id -g)" -e VERICTO_API_KEY -e VERICTO_DATABASE_ID \
     -v ~/.config/vericto/shop.url:/run/secrets/db.url:ro \
-    vericto/vericto-proxy:5.1.0 /usr/local/bin/vericto-proxy mcp --database-url-file /run/secrets/db.url
+    vericto/vericto-proxy:5.2.0 /usr/local/bin/vericto-proxy mcp --database-url-file /run/secrets/db.url
 ```
 
 Cursor (`.cursor/mcp.json`):
@@ -242,7 +249,7 @@ Cursor (`.cursor/mcp.json`):
       "args": ["run", "-i", "--rm", "--user", "501:20",
                "-e", "VERICTO_API_KEY", "-e", "VERICTO_DATABASE_ID",
                "-v", "/Users/me/.config/vericto/shop.url:/run/secrets/db.url:ro",
-               "vericto/vericto-proxy:5.1.0", "/usr/local/bin/vericto-proxy", "mcp",
+               "vericto/vericto-proxy:5.2.0", "/usr/local/bin/vericto-proxy", "mcp",
                "--database-url-file", "/run/secrets/db.url"],
       "env": { "VERICTO_API_KEY": "vtro_...", "VERICTO_DATABASE_ID": "<database id>" }
     }
@@ -276,6 +283,233 @@ then:
   `VERICTO_MCP_REQUIRE_CONTROL_PLANE=true` without a key: a process meant to be linked
   never starts on the built-in rules.
 
+## Hard mode
+
+Hard mode (5.2.0) is the setup where **the agent never holds a database credential**:
+the only way from the agent to the database is `execute_sql`, and the credential lives
+where the agent's own tools do not look. It is what `vericto guard install --hard` (the
+CLI) configures. Three parts:
+
+1. **The URL in the OS keychain**, read by the server at startup, never in a file the
+   agent can `cat`, in the MCP client configuration, or in the environment the agent's
+   shell inherits.
+2. **A role that cannot write**, checked at startup; `--require-read-only` refuses to
+   start otherwise.
+3. **The agent's direct database clients and credential files denied** in the agent's
+   own permissions (the CLI's guard writes these rules).
+
+```bash
+# Once: store the URL (read from stdin; hidden on a terminal, never echoed or logged).
+vericto-proxy mcp credential set shop
+# Check it: connects, reports the engine, and whether the role can write.
+vericto-proxy mcp credential test shop --require-read-only
+# Register the server with the entry's name, not the URL.
+claude mcp add vericto-db -- ~/.cargo/bin/vericto-proxy \
+  mcp --database-url-keychain shop --require-read-only
+```
+
+Cursor (`.cursor/mcp.json`), Codex and any client that takes a command:
+
+```json
+{
+  "mcpServers": {
+    "vericto-db": {
+      "command": "/Users/me/.cargo/bin/vericto-proxy",
+      "args": ["mcp", "--database-url-keychain", "shop", "--require-read-only"]
+    }
+  }
+}
+```
+
+**`vericto-proxy mcp credential`** stores, removes and checks keychain entries. An
+entry is `name` (under the service `vericto-proxy`) or `service/name`. Every action
+prints one JSON object on stdout and a sentence on stderr; neither ever contains the URL.
+
+| Action | What it does | Exit codes |
+| --- | --- | --- |
+| `set <name>` | Reads the URL from stdin (hidden on a terminal; a pipe is read whole), checks that it parses, and stores it. `{"ok", "entry", "backend", "replaced", "dialect", "engine", "database", "tls"}` | `0`, `1` (bad URL, store error) |
+| `test <name> [--require-read-only] [flags]` | Connects as the server would (TLS settings and flags apply) and runs the role check. `{"ok", "engine", "server_version", "database", "database_role": {"read_only", "verified", "user", "reasons", "notes"}}` | `0` connected; `2` no such entry; `3` `--require-read-only` and the role can write or is unverified; `4` unreachable or login refused; `1` usage |
+| `delete <name>` | Removes it | `0`, `2` no such entry |
+
+**Precedence** when several credentials are configured (first wins; the others are
+named in a startup warning): `--database-url-keychain` /
+`VERICTO_MCP_DATABASE_URL_KEYCHAIN`, then `--database-url-file` /
+`VERICTO_MCP_DATABASE_URL_FILE`, then `VERICTO_MCP_DATABASE_URL`, then `UPSTREAM_*`.
+`whoami.credential_source` says which (`keychain`, `file`, `environment`,
+`upstream_variables`).
+
+**The role check** runs at startup on one connection (in the background, or before
+serving with `--require-read-only` / `VERICTO_MCP_REQUIRE_READ_ONLY=true`) and shows in
+the log, in `whoami.database_role` and, when the role can write, as the notice
+`database_role_can_write` (`database_role_unverified` when it could not tell):
+
+- **PostgreSQL**: superuser, `CREATEROLE`, `CREATEDB`, any `INSERT`, `UPDATE`, `DELETE`
+  or `TRUNCATE` on a table or view outside the system schemas, `CREATE` on a schema or on
+  the database, membership of `pg_write_all_data`. A hot standby (read replica) is
+  read-only whatever the role. `default_transaction_read_only` is reported but never
+  counted: a session can turn it off.
+- **MySQL and MariaDB**: `SHOW GRANTS` (any privilege that writes data or schema or
+  administers the server, `WITH GRANT OPTION`), `read_only` and `super_read_only`.
+  Privileges granted through roles (MySQL 8 roles, MariaDB roles) are not expanded, so a
+  user that has them is *unverified*: grant `SELECT` to the user directly.
+
+The check is one control statement of `src/mcp/control.rs` (`ROLE_CHECK`,
+`MYSQL_SHOW_GRANTS`, `MYSQL_READ_ONLY_SETTINGS`); it reads the catalog and writes nothing.
+
+### Threat model and honest limits
+
+What hard mode defends against: an agent (or a prompt injection steering it) that reads
+the credential from where agents usually find one (`.env`, `DATABASE_URL`, `~/.pgpass`,
+`~/.my.cnf`, the MCP configuration, a URL file) and runs SQL around Vericto with `psql`,
+`mysql`, an ORM or a script; and a write that gets past both the statement-class check
+and the read-only transaction (the role cannot write).
+
+What it does not do: hard mode is not an OS security boundary. **In stdio mode the server
+runs as the same OS user as the agent**, and anything that user can do, a determined
+agent with a shell can do:
+
+| Platform | Who can read the entry without a prompt |
+| --- | --- |
+| macOS Keychain | The binary that created it (its access list names `vericto-proxy`). Another program of the same user (`security find-generic-password -w`, a script) gets a system prompt the user must approve; a user who clicks *Always Allow* removes that barrier. A new binary (an upgrade) prompts once for itself. |
+| Windows Credential Manager | Any process of the same user, without a prompt (`CredRead` on a generic credential). It keeps the URL out of files and the environment, not out of the user's processes. |
+| Linux Secret Service (GNOME Keyring, KWallet) | Any process of the same user while the collection is unlocked (normally the whole desktop session), without a prompt. The server uses libsecret's `secret-tool` (package `libsecret-tools` on Debian and Ubuntu, `libsecret` on Fedora and Arch); a server or container without a session bus has no Secret Service, use `--database-url-file` there. |
+
+Also: the agent can run `vericto-proxy mcp --database-url-keychain shop` itself, which
+gives it nothing more than `execute_sql`; the keychain entry is only as safe as the
+user's login; and an agent denied `psql` can still try another client the deny list does
+not name. **For strict isolation**, run the server as a different OS user (the agent's
+user cannot read that user's keychain or files) or in a container or on another host,
+over Streamable HTTP ([Set up for a team](#set-up-streamable-http-for-a-team)), with the
+database's network open to the server only. The role that cannot write stays the third
+line in every setup.
+
+## MySQL and MariaDB
+
+Since 5.2.0 the URL's scheme picks the database: `mysql://` (MySQL 8.0 and later, and
+compatible servers) or `mariadb://` (MariaDB; a MySQL URL to a MariaDB server is
+recognised from its version too). With `UPSTREAM_*` instead of a URL, set
+`VERICTO_WIRE_PROTOCOL=mysql` (or `mariadb`); the port defaults to 3306.
+
+```bash
+printf '%s' 'mysql://vericto_agent_ro:…@db.example.com:3306/shop?ssl-mode=VERIFY_IDENTITY' \
+  | vericto-proxy mcp credential set shop
+```
+
+- **TLS**: `verify-full` by default off loopback, as for PostgreSQL. The URL takes
+  `ssl-mode` (`DISABLED`, `REQUIRED`, `VERIFY_CA`, `VERIFY_IDENTITY`; `PREFERRED` means
+  `REQUIRED` here) or `sslmode` with PostgreSQL's names, `ssl-ca`/`sslrootcert`,
+  `ssl-cert`/`sslcert`, `ssl-key`/`sslkey`, and PlanetScale's `sslaccept=strict`.
+  `UPSTREAM_SSL*` override them. Authentication: `caching_sha2_password` (over plaintext
+  loopback with the server's RSA key, never a cleartext password) and
+  `mysql_native_password`.
+- **The database the URL names is the scope.** Unqualified names mean it;
+  `describe_schema` lists it (or the `schema` argument's database); a URL without a
+  database needs qualified names. `VERICTO_MCP_SEARCH_PATH` is PostgreSQL's and is refused.
+- **The same checks and caps**: the evaluator in the MySQL dialect (rules, masks,
+  allowlists, business policies, kill switch), one statement per call, the read tier
+  only, the limits and the output format of PostgreSQL. Placeholders are `?`, bound in
+  order from `params` (a JSON number or boolean is bound as a number, anything else as a
+  string).
+- **What is sent**: every call is one control batch (`SET NAMES utf8mb4`, a pinned
+  `sql_mode` without `ANSI_QUOTES`, `NO_BACKSLASH_ESCAPES` or `PIPES_AS_CONCAT`, so the
+  server reads quotes and backslashes as the evaluator did; `time_zone = '+00:00'`; the
+  statement timeout as `max_execution_time` (MySQL, ms) or `max_statement_time`
+  (MariaDB, s); `lock_wait_timeout` and `innodb_lock_wait_timeout` rounded up to whole
+  seconds; `START TRANSACTION WITH CONSISTENT SNAPSHOT, READ ONLY`), then the statement
+  exactly as evaluated through `COM_STMT_PREPARE` (which refuses a second statement) and
+  `COM_STMT_EXECUTE`, then `ROLLBACK`. The client (`mysql_async`) is configured to send
+  no statement of its own.
+- **Refused before evaluation or execution** (`INVALID_INPUT`, or `BLOCKED` when the
+  engine's rule refuses first): executable comments (`/*! … */`, MariaDB's
+  `/*M! … */`), which the server runs as SQL; optimizer hints (`/*+ … */`), which can
+  raise `MAX_EXECUTION_TIME` or set session variables; named parameters (`:name`), which
+  the driver would rewrite; user-variable assignment (`:=`); `SELECT … INTO`,
+  `FOR UPDATE`/`FOR SHARE`/`LOCK IN SHARE MODE`, `EXPLAIN ANALYZE`; `SET`, `USE`,
+  `CALL`, `LOCK TABLES`, `LOAD DATA`, transaction control, `PREPARE`/`EXECUTE`, `KILL`,
+  users, roles and grants; and the functions `get_lock`, `release_lock`,
+  `release_all_locks`, `master_pos_wait`, `source_pos_wait`,
+  `wait_for_executed_gtid_set`, `wait_until_sql_thread_after_gtids`, `benchmark`,
+  `load_file`, `sys_exec`, `sys_eval`, `sys_get`, `sys_set`, `lib_mysqludf_*` (and
+  `nextval`/`setval`, which are `write`): `MYSQL_DENIED_FUNCTIONS` in
+  `src/mcp/classify.rs`. Runs: `SELECT`, `WITH` (reads), `VALUES`, `TABLE`, `EXPLAIN`
+  and `DESCRIBE` of a read, `DESCRIBE <table>`, `SHOW`.
+- **Rows past the cap**: MySQL has no row limit on an execute, so when a result has
+  more rows (or bytes) than the call returns, the server closes that connection instead
+  of reading the rest; the server stops sending and rolls the transaction back. The next
+  call opens a new connection. A row larger than 16 MiB closes the connection
+  (`DATABASE_UNAVAILABLE`); select fewer or shorter columns.
+- **Timeouts**: `max_execution_time` stops a `SELECT` on MySQL, `max_statement_time`
+  any statement on MariaDB; at the client-side deadline (or when the kill switch
+  engages) the server sends `KILL QUERY` from a second connection of the same user.
+  Errors 3024, 1969 and 1317 answer `TIMEOUT`.
+- **Types**: `tinyint`…`int`, `year` → numbers; `bigint` (signed or `unsigned`) and
+  `decimal` → strings (exact); `float`, `double` → numbers; `date` (`YYYY-MM-DD`),
+  `datetime`, `timestamp` (`YYYY-MM-DD HH:MM:SS[.ffffff]`, UTC for `timestamp`) and
+  `time` → strings; `json` → the JSON value; `binary`, `varbinary`, `blob`, `bit`,
+  `geometry` → `{ "base64", "bytes" }`; text types, `enum`, `set` → strings.
+  `columns[].type` names the MySQL type (`int unsigned`, `varchar` …). A comparison or
+  `COUNT(*)` is a `bigint` in MySQL, so it comes back as a string.
+- **Errors**: `DATABASE_ERROR` carries the SQLSTATE; the sanitized mode also redacts
+  quoted values under MySQL's general `HY000` (for example error 1366). `42S02`
+  (unknown table) and `42S22` (unknown column) point to `describe_schema`.
+- **Not tested yet**: PlanetScale (Vitess) and other MySQL-compatible proxies may refuse
+  a session variable of the control batch; the call then answers `DATABASE_ERROR` with
+  the server's message. MariaDB is supported by the same code (its session variables
+  and `/*M!` comments) and was not part of this release's integration runs.
+
+## Read-only database roles
+
+A role that can only read is the line that holds even if everything above it failed.
+Create one this server alone uses, then check it with
+`vericto-proxy mcp credential test <name>` (or `--require-read-only`).
+
+**PostgreSQL** (any provider):
+
+```sql
+CREATE ROLE vericto_agent_ro LOGIN PASSWORD '…';
+GRANT CONNECT ON DATABASE shop TO vericto_agent_ro;
+GRANT USAGE ON SCHEMA public TO vericto_agent_ro;
+GRANT SELECT ON ALL TABLES IN SCHEMA public TO vericto_agent_ro;
+ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO vericto_agent_ro;
+-- PostgreSQL 14 and earlier: PUBLIC may create objects in schema public.
+REVOKE CREATE ON SCHEMA public FROM PUBLIC;
+-- Optional, a fourth line (the server's own transaction is read-only anyway):
+ALTER ROLE vericto_agent_ro SET default_transaction_read_only = on;
+```
+
+Or, on PostgreSQL 14 and later, `GRANT pg_read_all_data TO vericto_agent_ro;` for every
+table and schema at once. Repeat the `GRANT USAGE` / `SELECT` lines for each schema.
+
+- **Supabase**: create the role in the SQL editor as above (not the `postgres` or
+  `service_role` roles, which bypass RLS and can write); connect through the Supavisor
+  pooler as `vericto_agent_ro.<project-ref>`. RLS policies apply to the role as written;
+  without a policy that names it, tables with RLS on return no rows.
+- **Neon**: create the role in the console or with SQL (Neon's roles created in the
+  console are members of `neon_superuser`, which can write: create it with SQL instead,
+  or check it with `credential test`). A read replica (compute endpoint of type read-only)
+  is reported as a hot standby: read-only whatever the role.
+- **RDS, Cloud SQL, Azure**: as above; the providers' admin roles (`rds_superuser`,
+  `cloudsqlsuperuser`, `azure_pg_admin`) can write.
+
+**MySQL** (8.0 and later) and **MariaDB**:
+
+```sql
+CREATE USER 'vericto_agent_ro'@'%' IDENTIFIED BY '…' REQUIRE SSL;
+GRANT SELECT, SHOW VIEW ON shop.* TO 'vericto_agent_ro'@'%';
+-- Nothing else: no INSERT/UPDATE/DELETE, no CREATE TEMPORARY TABLES, no EXECUTE.
+-- Grant the privileges to the user itself, not through a role, so the role check can
+-- verify them.
+```
+
+- **PlanetScale**: create a password with the **Read-only** role (branch → Passwords);
+  the URL takes `sslaccept=strict`. PlanetScale's own grants are not `SHOW GRANTS` lines
+  the check can read, so `credential test` may report the role as unverified; the
+  password's role is then the line that holds.
+- **Amazon RDS / Aurora MySQL, Cloud SQL, Azure Database for MySQL**: as above, and
+  `REQUIRE SSL` with `ssl-mode=VERIFY_IDENTITY` and the provider's CA in `ssl-ca` when it
+  is not publicly trusted. A read replica with `read_only=ON` (and the user without
+  `SUPER`/`CONNECTION_ADMIN`) is reported read-only.
+
 ## How it works
 
 ```text
@@ -299,10 +533,10 @@ MCP client ──JSON-RPC (stdio or HTTP)──► vericto-proxy mcp ──Postg
   that always ends in `ROLLBACK`, so even a function that writes cannot persist anything.
   Use a database role with `SELECT` grants only as the third line.
 - **No SQL of its own** besides fixed control statements (the transaction, `SET LOCAL`
-  settings, `ROLLBACK`, and the catalog queries of `describe_schema`), all in
-  `src/mcp/control.rs`, with a test that fails if SQL appears anywhere else. It uses the
-  low-level `postgres-protocol` encoders, not a full driver, which would send catalog
-  lookups of its own.
+  settings, `ROLLBACK`, the catalog queries of `describe_schema` and the startup role
+  check), all in `src/mcp/control.rs`, with a test that fails if SQL appears anywhere
+  else. It uses the low-level `postgres-protocol` encoders, not a full driver, which
+  would send catalog lookups of its own. MySQL and MariaDB: [what is sent](#mysql-and-mariadb).
 
 ## Set up (Streamable HTTP) for a team
 
@@ -316,7 +550,7 @@ docker run -d --name vericto-mcp -p 8808:8808 \
   -e VERICTO_MCP_ALLOWED_HOSTS=vericto-mcp.internal \
   -e PROXY_TLS_MODE=require -e PROXY_TLS_CERT=/run/secrets/tls.crt -e PROXY_TLS_KEY=/run/secrets/tls.key \
   -v /srv/secrets:/run/secrets:ro \
-  vericto/vericto-proxy:5.1.0 /usr/local/bin/vericto-proxy mcp --database-url-file /run/secrets/db.url
+  vericto/vericto-proxy:5.2.0 /usr/local/bin/vericto-proxy mcp --database-url-file /run/secrets/db.url
 ```
 
 Clients connect with the URL and their own key:
@@ -491,17 +725,20 @@ no masks, allowlists or kill switch, and `whoami` says so
 - **Give the agent no other way to the database.** In stdio mode the server runs as the
   same OS user as the agent. At startup and in `whoami.execution.warnings`
   (`agent_environment_has_db_credentials`) it reports, by name only, `DATABASE_URL*`,
-  `PGPASSWORD`, `PGPASSFILE`, `PGSERVICE`, `POSTGRES_URL*`, `SUPABASE_DB_*`, `NEON_*` and
-  `VERICTO_MCP_DATABASE_URL` in its environment, a `~/.pgpass`, and a secret file other
-  users can read. The strong setups: HTTP mode in a separate container or host (the agent
+  `PGPASSWORD`, `PGPASSFILE`, `PGSERVICE`, `POSTGRES_URL*`, `SUPABASE_DB_*`, `NEON_*`,
+  `MYSQL_PWD`, `MYSQL_PASSWORD`, `MYSQL_URL*`, `MARIADB_PASSWORD`, `PLANETSCALE_*` and
+  `VERICTO_MCP_DATABASE_URL` in its environment, a `~/.pgpass`, a `~/.my.cnf` or
+  `~/.mylogin.cnf`, and a secret file other users can read. [Hard mode](#hard-mode)
+  covers the rest. The strong setups: HTTP mode in a separate container or host (the agent
   never sees the secret), a role only this server uses, and the database network open to
   the server's address only. Locally, deny the agent's own tools access to the secret
   where the client supports it, for example in Claude Code's `settings.json`:
   `"permissions": { "deny": ["Read(~/.config/vericto/**)", "Bash(psql:*)", "Bash(cat ~/.config/vericto/*)"] }`.
-- **The credential** is read once (`VERICTO_MCP_DATABASE_URL_FILE` is the documented
-  path; the URL in the environment is accepted and warned about; `--database-url` on the
-  command line is refused), its `Debug` form redacts the password, and no error or log
-  line names the URL.
+- **The credential** is read once (the OS keychain, `--database-url-keychain`, or
+  `VERICTO_MCP_DATABASE_URL_FILE`; the URL in the environment is accepted and warned
+  about; `--database-url` on the command line is refused; precedence in
+  [Hard mode](#hard-mode)), its `Debug` form redacts the password, and no error or log
+  line names the URL. A URL file that other users can read is reported at startup.
 - **Authentication to the database**: SCRAM-SHA-256; MD5 is refused unless
   `VERICTO_MCP_ALLOW_MD5=true`; a cleartext password only over TLS or to loopback;
   certificates through `UPSTREAM_SSLCERT`/`UPSTREAM_SSLKEY`.
@@ -531,9 +768,11 @@ the variable.
 | --- | --- | --- |
 | `VERICTO_MCP_TRANSPORT` | `stdio` | `stdio` or `http` |
 | `VERICTO_MCP_LISTEN` | `127.0.0.1:8808` | HTTP only |
-| `VERICTO_MCP_DATABASE_URL_FILE` | — | A file holding the `postgres://` URL (preferred; `~` is expanded) |
+| `VERICTO_MCP_DATABASE_URL_KEYCHAIN` | — | `--database-url-keychain`: an OS keychain entry (`name` or `service/name`) holding the URL ([Hard mode](#hard-mode)); first in the precedence |
+| `VERICTO_MCP_DATABASE_URL_FILE` | — | A file holding the `postgres://`, `mysql://` or `mariadb://` URL (`~` is expanded) |
 | `VERICTO_MCP_DATABASE_URL` | — | The URL in the environment (accepted, warned about) |
-| `UPSTREAM_HOST`, `UPSTREAM_PORT`, `UPSTREAM_USER`, `UPSTREAM_PASSWORD_FILE`, `UPSTREAM_DBNAME` | — | Instead of a URL |
+| `UPSTREAM_HOST`, `UPSTREAM_PORT`, `UPSTREAM_USER`, `UPSTREAM_PASSWORD_FILE`, `UPSTREAM_DBNAME` | — | Instead of a URL; `VERICTO_WIRE_PROTOCOL=mysql` or `mariadb` for MySQL (port 3306) |
+| `VERICTO_MCP_REQUIRE_READ_ONLY` | `false` | `--require-read-only`: refuse to start unless the [role check](#hard-mode) finds the role cannot write |
 | `UPSTREAM_SSLMODE`, `UPSTREAM_SSLROOTCERT`, `UPSTREAM_SSLCERT`, `UPSTREAM_SSLKEY` | `verify-full` off loopback | As for the TCP proxy; they override the URL's `sslmode`/`sslrootcert`/`sslcert`/`sslkey` |
 | `VERICTO_MCP_ALLOW_PLAINTEXT_DB` | `false` | Allow `sslmode=disable` to a host that is not loopback |
 | `VERICTO_MCP_ALLOW_MD5` | `false` | Allow MD5 password authentication |
@@ -568,4 +807,4 @@ run a second container from the same image for the TCP proxy.
   them on.
 - **Trust labels and taint**: `taint` is `null` in every answer and in `whoami`.
 - **HTTP sessions** (`Mcp-Session-Id`): the HTTP transport is stateless.
-- **The hosted Gateway**, Gateway with connector, MySQL, and an npm package.
+- **The hosted Gateway**, Gateway with connector, and an npm package.

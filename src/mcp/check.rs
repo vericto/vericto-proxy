@@ -96,20 +96,105 @@ pub fn split_script(sql: &str, max_binary_operators: usize) -> (Vec<(u32, String
     (out, "statements")
 }
 
+/// A MySQL script split into statements with the line each starts on: the
+/// tokenizer's tokens (strings, quoted identifiers and comments are single
+/// tokens), cut at `;`. `whole_script` when the tokenizer cannot read it.
+pub fn split_script_mysql(
+    sql: &str,
+    max_binary_operators: usize,
+) -> (Vec<(u32, String)>, &'static str) {
+    use sqlparser::tokenizer::{Token, Tokenizer, Whitespace};
+    let whole = || {
+        let first = sql.len() - sql.trim_start().len();
+        let line = sql[..first].matches('\n').count() as u32 + 1;
+        (vec![(line, sql.to_string())], "whole_script")
+    };
+    if crate::tcp::query_complexity::check_binary_operator_chains(
+        sql,
+        vericto_engine::Dialect::Mysql,
+        max_binary_operators,
+    )
+    .is_err()
+    {
+        return whole();
+    }
+    let dialect = sqlparser::dialect::MySqlDialect {};
+    let Ok(tokens) = Tokenizer::new(&dialect, sql).tokenize_with_location() else {
+        return whole();
+    };
+    // Byte offsets of each token's start, from its line and column.
+    let line_starts: Vec<usize> = std::iter::once(0)
+        .chain(sql.match_indices('\n').map(|(i, _)| i + 1))
+        .collect();
+    let offset = |line: u64, col: u64| -> usize {
+        let start = line_starts
+            .get((line.max(1) - 1) as usize)
+            .copied()
+            .unwrap_or(sql.len());
+        let rest = &sql[start..];
+        start
+            + rest
+                .char_indices()
+                .nth((col.max(1) - 1) as usize)
+                .map_or(rest.len(), |(i, _)| i)
+    };
+    let mut out = Vec::new();
+    let mut start: Option<(usize, u32)> = None;
+    let mut end = 0usize;
+    for (i, t) in tokens.iter().enumerate() {
+        let at = offset(t.span.start.line, t.span.start.column);
+        let next = tokens.get(i + 1).map_or(sql.len(), |n| {
+            offset(n.span.start.line, n.span.start.column)
+        });
+        match &t.token {
+            Token::SemiColon => {
+                if let Some((b, line)) = start.take() {
+                    out.push((line, sql[b..end].to_string()));
+                }
+            }
+            Token::Whitespace(
+                Whitespace::Space
+                | Whitespace::Newline
+                | Whitespace::Tab
+                | Whitespace::SingleLineComment { .. }
+                | Whitespace::MultiLineComment(_),
+            ) => {}
+            _ => {
+                start.get_or_insert((at, t.span.start.line as u32));
+                end = next;
+            }
+        }
+    }
+    if let Some((b, line)) = start {
+        out.push((line, sql[b..end].to_string()));
+    }
+    (out, "statements")
+}
+
 /// `check_sql`.
 pub fn check_sql(rt: &Arc<Runtime>, caller: &Caller, args: &Value) -> ToolOutput {
+    let db = rt.dialect();
     let dialect = args
         .get("dialect")
         .and_then(Value::as_str)
-        .unwrap_or("postgres");
-    if dialect != "postgres" {
+        .unwrap_or(db.as_str());
+    let accepted = dialect.eq_ignore_ascii_case(db.as_str())
+        || (db.is_mysql() && dialect.eq_ignore_ascii_case("mariadb"))
+        || (!db.is_mysql() && dialect.eq_ignore_ascii_case("postgresql"));
+    if !accepted {
         return input_error(&format!(
-            "this server checks PostgreSQL only (its database is PostgreSQL), not {dialect}"
+            "this server checks {} only (its database is {}), not {dialect}",
+            db.as_str(),
+            db.product()
         ));
     }
     let (statements, evaluated_as) = match (args.get("sql"), args.get("queries")) {
         (Some(Value::String(sql)), None) => {
-            let (s, how) = split_script(sql, rt.cfg.max_binary_operators);
+            let (s, how) = if db.is_mysql() {
+                split_script_mysql(sql, rt.cfg.max_binary_operators)
+            } else {
+                split_script(sql, rt.cfg.max_binary_operators)
+            };
             if s.is_empty() {
                 return input_error(
                     "The script has no SQL statements (only whitespace or comments).",
@@ -161,7 +246,7 @@ pub fn check_sql(rt: &Arc<Runtime>, caller: &Caller, args: &Value) -> ToolOutput
             "passed": false,
             "summary": { "total": statements.len(), "blocked": statements.len(), "flagged": 0, "monitored": 0, "allowed": 0, "parse_errors": 0 },
             "findings": [],
-            "dialect": "postgres",
+            "dialect": rt.dialect().as_str(),
             "evaluated_as": evaluated_as,
             "ruleset_version": ruleset_version,
             "ci_checks_remaining": null,
@@ -184,7 +269,7 @@ pub fn check_sql(rt: &Arc<Runtime>, caller: &Caller, args: &Value) -> ToolOutput
     let access = rt.access();
     let ctx = VerdictContext {
         access: &access,
-        dialect: "postgres",
+        dialect: rt.dialect().as_str(),
         ruleset_version: Some(&ruleset_version),
         execute_available: true,
     };
@@ -277,7 +362,8 @@ pub fn check_sql(rt: &Arc<Runtime>, caller: &Caller, args: &Value) -> ToolOutput
     }
     if parse_errors > 0 {
         lines.push(format!(
-            "Note: {parse_errors} could not be parsed as postgres and were not evaluated."
+            "Note: {parse_errors} could not be parsed as {} and were not evaluated.",
+            rt.dialect().as_str()
         ));
     }
     let one_step_for_all = steps.len() == 1 && steps[0].lines.len() == all_lines.len();
@@ -289,7 +375,7 @@ pub fn check_sql(rt: &Arc<Runtime>, caller: &Caller, args: &Value) -> ToolOutput
         "passed": blocked == 0,
         "summary": { "total": total, "blocked": blocked, "flagged": flagged, "monitored": monitored, "allowed": allowed, "parse_errors": parse_errors },
         "findings": findings,
-        "dialect": "postgres",
+        "dialect": rt.dialect().as_str(),
         "evaluated_as": evaluated_as,
         "ruleset_version": ruleset_version,
         "ci_checks_remaining": null,

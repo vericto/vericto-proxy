@@ -58,12 +58,32 @@ impl ConnectError {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DbError {
     pub severity: String,
+    /// MySQL's error number (`None` on PostgreSQL).
+    pub code: Option<u32>,
     pub sqlstate: String,
     pub message: String,
     pub detail: Option<String>,
     pub hint: Option<String>,
     pub position: Option<String>,
     pub where_: Option<String>,
+}
+
+impl DbError {
+    /// The statement timeout stopped it: PostgreSQL's `statement_timeout`
+    /// (57014), MySQL's `max_execution_time` (3024), MariaDB's
+    /// `max_statement_time` (1969), or the `KILL QUERY` sent at the deadline
+    /// (1317).
+    pub fn is_timeout(&self) -> bool {
+        self.sqlstate == "57014"
+            || self.code.is_some_and(|c| {
+                [
+                    crate::mcp::mysql::ER_QUERY_TIMEOUT,
+                    crate::mcp::mysql::ER_STATEMENT_TIMEOUT,
+                    crate::mcp::mysql::ER_QUERY_INTERRUPTED,
+                ]
+                .contains(&(c as u16))
+            })
+    }
 }
 
 fn parse_error_fields(body: &[u8]) -> DbError {
@@ -97,7 +117,13 @@ fn parse_error_fields(body: &[u8]) -> DbError {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Column {
     pub name: String,
+    /// The PostgreSQL type (on MySQL, the PostgreSQL type whose conversion the
+    /// MySQL type shares).
     pub type_oid: u32,
+    /// The type name to report when it is not the PostgreSQL built-in's (MySQL).
+    pub type_name: Option<String>,
+    /// The values are raw bytes (MySQL binary types), reported as base64.
+    pub binary: bool,
 }
 
 /// One value as the server sent it in text format, possibly cut.
@@ -772,7 +798,12 @@ fn parse_row_description(body: &[u8]) -> io::Result<Vec<Column>> {
         }
         let type_oid = u32::from_be_bytes([body[i + 6], body[i + 7], body[i + 8], body[i + 9]]);
         i += 18;
-        cols.push(Column { name, type_oid });
+        cols.push(Column {
+            name,
+            type_oid,
+            type_name: None,
+            binary: false,
+        });
     }
     Ok(cols)
 }

@@ -32,7 +32,7 @@ use serde_json::{Map, Value, json};
 
 use crate::mcp::classify::{self, Class, Tier, Unclassifiable};
 use crate::mcp::config::Limits;
-use crate::mcp::control;
+use crate::mcp::db::BeginError;
 use crate::mcp::errors;
 use crate::mcp::identity::sha256_hex;
 use crate::mcp::next_steps::{
@@ -64,6 +64,9 @@ const NOT_READY_RETRY_S: u32 = 2;
 pub struct Input {
     pub sql: Arc<str>,
     pub params: Vec<Option<String>>,
+    /// `numeric[i]`: `params[i]` was a JSON number or boolean (MySQL binds it
+    /// as a number; PostgreSQL types every param from the statement).
+    pub numeric: Vec<bool>,
     pub max_rows: u32,
     pub timeout_ms: u32,
     pub tier: Option<Tier>,
@@ -202,6 +205,7 @@ pub fn parse_input(
             message: format!("The SQL is larger than {max_query_bytes} bytes."),
         });
     }
+    let mut numeric = Vec::new();
     let params = match obj.get("params") {
         None | Some(Value::Null) => Vec::new(),
         Some(Value::Array(items)) => {
@@ -210,6 +214,7 @@ pub fn parse_input(
             }
             let mut out = Vec::with_capacity(items.len());
             for (i, v) in items.iter().enumerate() {
+                numeric.push(matches!(v, Value::Number(_) | Value::Bool(_)));
                 out.push(match v {
                     Value::Null => None,
                     Value::String(s) if s.contains('\0') => {
@@ -299,6 +304,7 @@ pub fn parse_input(
     Ok(Input {
         sql: Arc::from(sql.as_str()),
         params,
+        numeric,
         max_rows,
         timeout_ms,
         tier,
@@ -527,10 +533,9 @@ fn ctx<'a>(
     ruleset: &'a str,
     access: &'a crate::mcp::next_steps::ProxyAccess,
 ) -> ExecuteContext<'a> {
-    let _ = rt;
     ExecuteContext {
         access,
-        dialect: "postgres",
+        dialect: rt.dialect().as_str(),
         ruleset_version: Some(ruleset),
     }
 }
@@ -658,9 +663,10 @@ pub async fn execute_once(rt: &Arc<Runtime>, caller: &Caller, input: Input) -> T
     // classify; a refusal is carried as their normal Parse outcome, then
     // Runtime::evaluate resolves it through the configured parse-error policy.
     // Other agent text is parsed on a thread with a large stack (stack.rs).
+    let dialect = rt.dialect();
     let complexity = crate::tcp::query_complexity::check_binary_operator_chains(
         &sql,
-        vericto_engine::Dialect::Postgres,
+        dialect.engine(),
         rt.cfg.max_binary_operators,
     );
     let analysed = if let Err(e) = complexity {
@@ -668,7 +674,10 @@ pub async fn execute_once(rt: &Arc<Runtime>, caller: &Caller, input: Input) -> T
     } else {
         let sql = Arc::clone(&sql);
         crate::stack::on_big_stack(move || {
-            (classify::statement_count(&sql), classify::classify(&sql))
+            (
+                classify::statement_count_for(dialect, &sql),
+                classify::classify_for(dialect, &sql),
+            )
         })
         .await
     };
@@ -767,7 +776,7 @@ pub async fn execute_once(rt: &Arc<Runtime>, caller: &Caller, input: Input) -> T
                     ..
                 } => {
                     matches!(
-                        classify::classify(r).map(|c| c.class),
+                        classify::classify_for(dialect, r).map(|c| c.class),
                         Ok(Class::Tier(Tier::Read))
                     )
                 }
@@ -824,7 +833,10 @@ pub async fn execute_once(rt: &Arc<Runtime>, caller: &Caller, input: Input) -> T
         return base
             .error(
                 "BLOCKED",
-                "Blocked: the statement could not be parsed as postgres.",
+                &format!(
+                    "Blocked: the statement could not be parsed as {}.",
+                    dialect.as_str()
+                ),
                 &[],
             )
             .finish(&v, event_id);
@@ -922,6 +934,7 @@ pub async fn execute_once(rt: &Arc<Runtime>, caller: &Caller, input: Input) -> T
         caller,
         &bytes,
         &input.params,
+        &input.numeric,
         max_rows,
         timeout_ms,
         &limits,
@@ -971,7 +984,7 @@ pub async fn execute_once(rt: &Arc<Runtime>, caller: &Caller, input: Input) -> T
             let db_ms = outcome.db_time.as_secs_f64() * 1000.0;
             if let Some(e) = &outcome.error {
                 let agent = errors::for_agent(e, rt.cfg.result_detail);
-                let timeout = e.sqlstate == "57014";
+                let timeout = e.is_timeout();
                 let o = if timeout {
                     Outcome::Timeout(timeout_ms)
                 } else {
@@ -997,7 +1010,12 @@ pub async fn execute_once(rt: &Arc<Runtime>, caller: &Caller, input: Input) -> T
                     (
                         "TIMEOUT",
                         format!(
-                            "The statement was cancelled after {timeout_ms} ms (statement_timeout)."
+                            "The statement was cancelled after {timeout_ms} ms ({}).",
+                            match dialect {
+                                crate::mcp::config::DbDialect::Postgres => "statement_timeout",
+                                crate::mcp::config::DbDialect::Mysql => "max_execution_time",
+                                crate::mcp::config::DbDialect::Mariadb => "max_statement_time",
+                            }
                         ),
                     )
                 } else {
@@ -1257,11 +1275,13 @@ pub enum Ran {
 /// Runs `bytes` in a read-only transaction that always ends in ROLLBACK,
 /// with a watcher that cancels it at the client-side deadline or when the
 /// kill switch blocks the caller meanwhile (§7.5).
+#[allow(clippy::too_many_arguments)]
 pub async fn run_read(
     rt: &Arc<Runtime>,
     caller: &Caller,
     bytes: &str,
     params: &[Option<String>],
+    numeric: &[bool],
     max_rows: u32,
     timeout_ms: u32,
     limits: &Limits,
@@ -1271,6 +1291,7 @@ pub async fn run_read(
         Some(caller),
         bytes,
         params,
+        numeric,
         max_rows,
         timeout_ms,
         limits,
@@ -1278,11 +1299,13 @@ pub async fn run_read(
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn run_in_read_transaction(
     rt: &Arc<Runtime>,
     caller: Option<&Caller>,
     bytes: &str,
     params: &[Option<String>],
+    numeric: &[bool],
     max_rows: u32,
     timeout_ms: u32,
     limits: &Limits,
@@ -1311,12 +1334,15 @@ pub async fn run_in_read_transaction(
         }
     };
     let search_path = rt.search_path(&rt.policy_for_db_user());
-    let control =
-        control::read_transaction(timeout_ms, limits.lock_timeout_ms, search_path.as_deref());
-    match checkout.conn.control(&control).await {
-        Ok(b'T') => {}
-        Ok(_) | Err(RunError::Io(_)) => {
-            checkout.conn.broken = true;
+    match checkout
+        .conn
+        .begin_read(timeout_ms, limits.lock_timeout_ms, search_path.as_deref())
+        .await
+    {
+        Ok(()) => {}
+        Err(BeginError::Broken) => {
+            checkout.conn.mark_broken();
+            rt.pool.put(checkout);
             return Ran::Unavailable {
                 reason: Unavailable::Connect,
                 sqlstate: None,
@@ -1324,8 +1350,7 @@ pub async fn run_in_read_transaction(
                     .to_string(),
             };
         }
-        Err(RunError::Control(e)) => {
-            let _ = checkout.conn.control(control::ROLLBACK).await;
+        Err(BeginError::Db(e)) => {
             rt.pool.put(checkout);
             tracing::warn!(sqlstate = %e.sqlstate, "The read-only transaction could not be opened");
             return Ran::Done(Box::new(RunOutcome {
@@ -1378,9 +1403,7 @@ pub async fn run_in_read_transaction(
     let hard = Duration::from_millis(u64::from(timeout_ms) + 10_000);
     let result = tokio::time::timeout(
         hard,
-        checkout
-            .conn
-            .run(bytes, params, read_limits, control::ROLLBACK),
+        checkout.conn.run_read(bytes, params, numeric, read_limits),
     )
     .await;
     let _ = stop.send(());
@@ -1391,7 +1414,7 @@ pub async fn run_in_read_transaction(
     if !matches!(watch, Watch::Quiet) {
         // A CancelRequest was sent: the server may still act on it after the
         // statement ended, so this connection is not reused.
-        checkout.conn.broken = true;
+        checkout.conn.mark_broken();
     }
     let killed = match watch {
         Watch::Killed(b) => Some(b),
@@ -1399,7 +1422,8 @@ pub async fn run_in_read_transaction(
     };
     match result {
         Err(_) => {
-            checkout.conn.broken = true;
+            checkout.conn.mark_broken();
+            rt.pool.put(checkout);
             Ran::Unavailable {
                 reason: Unavailable::Connect,
                 sqlstate: None,
@@ -1410,7 +1434,8 @@ pub async fn run_in_read_transaction(
             if let RunError::Io(e) = &e {
                 tracing::warn!(error_kind = ?e.kind(), error = %e, "The database connection broke during a statement");
             }
-            checkout.conn.broken = true;
+            checkout.conn.mark_broken();
+            rt.pool.put(checkout);
             Ran::Unavailable {
                 reason: Unavailable::Connect,
                 sqlstate: None,

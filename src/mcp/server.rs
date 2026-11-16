@@ -26,11 +26,18 @@ pub const INSTRUCTIONS: &str = "Vericto runs SQL on this PostgreSQL database for
 /// The instructions this server sends: [`INSTRUCTIONS`], and in the local
 /// mode (no control plane) which rules apply and, once, what an account adds.
 pub fn instructions(rt: &Runtime) -> String {
+    let base = match rt.dialect() {
+        crate::mcp::config::DbDialect::Postgres => INSTRUCTIONS.to_string(),
+        d => INSTRUCTIONS.replace("PostgreSQL", d.product()).replace(
+            "the values in params.",
+            "the values in params (? placeholders).",
+        ),
+    };
     if rt.linked {
-        return format!("{INSTRUCTIONS} The rules in force are the workspace's.");
+        return format!("{base} The rules in force are the workspace's.");
     }
     format!(
-        "{INSTRUCTIONS} This server runs locally, without a Vericto account: the rules in force are \
+        "{base} This server runs locally, without a Vericto account: the rules in force are \
          Vericto's built-in ruleset, and nothing is reported anywhere. {}",
         crate::mcp::ACCOUNT_NOTE
     )
