@@ -27,9 +27,9 @@ license file distributed with each version controls that version.
 
 Embedded Vericto component:
 
-- vericto-engine is compiled into the vericto-proxy binary. Version 5.1.0 of
-  the proxy pins version 5.1.0 of the engine (proxy 5.0.0 to 5.0.2 pinned
-  engine 5.0.0). Both public components use
+- vericto-engine is compiled into the vericto-proxy binary. Version 5.2.0 of
+  the proxy pins version 5.1.0 of the engine (proxy 5.1.0 pinned 5.1.0;
+  5.0.0 to 5.0.2 pinned engine 5.0.0). Both public components use
   AGPL-3.0-only. Earlier engine and proxy versions retain the licenses under
   which Vericto made them available.
 

@@ -20,6 +20,12 @@ const EXACT: &[&str] = &[
     "PGSERVICE",
     "PGSERVICEFILE",
     "VERICTO_MCP_DATABASE_URL",
+    // MySQL and MariaDB clients (5.2.0).
+    "MYSQL_PWD",
+    "MYSQL_PASSWORD",
+    "MYSQL_ROOT_PASSWORD",
+    "MARIADB_PASSWORD",
+    "MARIADB_ROOT_PASSWORD",
 ];
 
 /// Prefixes of variables that carry one.
@@ -31,6 +37,9 @@ const PREFIXES: &[&str] = &[
     "SUPABASE_DB_",
     "NEON_",
     "PGPASSWORD_",
+    "MYSQL_URL",
+    "MYSQL_DATABASE_URL",
+    "PLANETSCALE_",
 ];
 
 /// What the environment exposes: the names of the variables, `~/.pgpass`,
@@ -39,12 +48,18 @@ const PREFIXES: &[&str] = &[
 pub struct Exposure {
     pub variables: Vec<String>,
     pub pgpass: bool,
+    /// `~/.my.cnf` or `~/.mylogin.cnf` (MySQL client option files, which
+    /// usually hold a password).
+    pub mysql_option_file: bool,
     pub secret_file_readable_by_others: bool,
 }
 
 impl Exposure {
     pub fn any(&self) -> bool {
-        !self.variables.is_empty() || self.pgpass || self.secret_file_readable_by_others
+        !self.variables.is_empty()
+            || self.pgpass
+            || self.mysql_option_file
+            || self.secret_file_readable_by_others
     }
 
     /// One line for the log and `whoami`.
@@ -58,6 +73,9 @@ impl Exposure {
         }
         if self.pgpass {
             parts.push("~/.pgpass".to_string());
+        }
+        if self.mysql_option_file {
+            parts.push("~/.my.cnf or ~/.mylogin.cnf".to_string());
         }
         if self.secret_file_readable_by_others {
             parts.push("a database secret file other users can read".to_string());
@@ -83,9 +101,12 @@ pub fn inspect(
     variables.sort();
     variables.dedup();
     let pgpass = home.is_some_and(|h| h.join(".pgpass").exists());
+    let mysql_option_file =
+        home.is_some_and(|h| h.join(".my.cnf").exists() || h.join(".mylogin.cnf").exists());
     Exposure {
         variables,
         pgpass,
+        mysql_option_file,
         secret_file_readable_by_others: secret_file.is_some_and(readable_by_others),
     }
 }
@@ -140,11 +161,13 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join(".pgpass"), "h:5432:*:u:p").unwrap();
+        std::fs::write(dir.path().join(".my.cnf"), "[client]\npassword=p").unwrap();
         let secret = dir.path().join("db.url");
         std::fs::write(&secret, "postgres://u:p@h/d").unwrap();
         std::fs::set_permissions(&secret, std::fs::Permissions::from_mode(0o644)).unwrap();
         let e = inspect(Vec::new(), Some(dir.path()), Some(&secret));
-        assert!(e.pgpass && e.secret_file_readable_by_others);
+        assert!(e.pgpass && e.mysql_option_file && e.secret_file_readable_by_others);
+        assert!(e.describe().contains("~/.my.cnf"));
         std::fs::set_permissions(&secret, std::fs::Permissions::from_mode(0o600)).unwrap();
         let e = inspect(Vec::new(), None, Some(&secret));
         assert!(!e.secret_file_readable_by_others);

@@ -123,7 +123,8 @@ pub fn build(
         .columns
         .iter()
         .map(|c| {
-            let mut col = json!({ "name": c.name, "type": type_name(c.type_oid) });
+            let ty = c.type_name.clone().unwrap_or_else(|| type_name(c.type_oid));
+            let mut col = json!({ "name": c.name, "type": ty });
             if let Some(m) = masked(&c.name) {
                 col["masked"] = Value::String(m);
             }
@@ -140,8 +141,16 @@ pub fn build(
             .iter()
             .enumerate()
             .map(|(j, cell)| {
-                let oid = outcome.columns.get(j).map_or(25, |c| c.type_oid);
-                let (v, cut) = value(cell.as_ref(), oid);
+                let col = outcome.columns.get(j);
+                let oid = col.map_or(25, |c| c.type_oid);
+                let (v, cut) = if col.is_some_and(|c| c.binary) {
+                    match cell {
+                        Some(c) => (raw_bytes(c), c.truncated()),
+                        None => (Value::Null, false),
+                    }
+                } else {
+                    value(cell.as_ref(), oid)
+                };
                 row_cut += u32::from(cut);
                 v
             })
@@ -249,6 +258,20 @@ fn bytea(cell: &Cell) -> Value {
     });
     if decoded.len() < total {
         v["preview_bytes"] = json!(decoded.len());
+    }
+    v
+}
+
+/// Raw bytes (MySQL binary types): `{ "base64": <first KiB>, "bytes": n }`,
+/// the shape of a PostgreSQL `bytea`.
+fn raw_bytes(cell: &Cell) -> Value {
+    let shown = &cell.bytes[..cell.bytes.len().min(BYTEA_PREVIEW)];
+    let mut v = json!({
+        "base64": base64::engine::general_purpose::STANDARD.encode(shown),
+        "bytes": cell.full_len,
+    });
+    if shown.len() < cell.full_len {
+        v["preview_bytes"] = json!(shown.len());
     }
     v
 }
@@ -371,11 +394,40 @@ mod tests {
                 .map(|(n, o)| Column {
                     name: n.to_string(),
                     type_oid: *o,
+                    type_name: None,
+                    binary: false,
                 })
                 .collect(),
             rows,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn mysql_columns_report_their_own_types_and_bytes() {
+        let o = RunOutcome {
+            columns: vec![
+                Column {
+                    name: "id".into(),
+                    type_oid: 20,
+                    type_name: Some("bigint unsigned".into()),
+                    binary: false,
+                },
+                Column {
+                    name: "blob".into(),
+                    type_oid: 17,
+                    type_name: Some("varbinary".into()),
+                    binary: true,
+                },
+            ],
+            rows: vec![vec![cell("18446744073709551615"), cell("\u{0}\u{ff}")]],
+            ..Default::default()
+        };
+        let b = build(&o, 10, 1 << 20, &|_| None);
+        assert_eq!(b.columns[0]["type"], "bigint unsigned");
+        assert_eq!(b.rows[0][0], json!("18446744073709551615"));
+        assert_eq!(b.rows[0][1]["bytes"], json!(3));
+        assert_eq!(b.rows[0][1]["base64"], json!("AMO/"));
     }
 
     #[test]

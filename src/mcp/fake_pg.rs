@@ -510,6 +510,7 @@ pub fn runtime(
         )),
         local_tokens: Vec::new(),
         session_id: "test-session".to_string(),
+        role_check: Default::default(),
     };
     (Arc::new(rt), queue)
 }

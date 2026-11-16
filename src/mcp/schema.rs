@@ -16,7 +16,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use serde_json::{Value, json};
-use vericto_engine::{AccessMode, Dialect, SensitivePolicy};
+use vericto_engine::{AccessMode, SensitivePolicy};
 
 use crate::mcp::control;
 use crate::mcp::execute::{self, Ran};
@@ -76,7 +76,7 @@ fn shared_step(rt: &Runtime, o: Outcome) -> Step {
         &o,
         &next_steps::ExecuteContext {
             access: &access,
-            dialect: "postgres",
+            dialect: rt.dialect().as_str(),
             ruleset_version: Some(&ruleset),
         },
     );
@@ -129,10 +129,16 @@ pub async fn describe_schema(rt: &Arc<Runtime>, caller: &Caller, args: &Value) -
     // The catalog queries are control statements: evaluated like any
     // statement, with the workspace policy (an allowlist is applied to the
     // result below, not to the catalog's own tables).
+    let mysql = rt.dialect().is_mysql();
+    let (catalog_columns, catalog_keys) = if mysql {
+        (control::MYSQL_CATALOG_COLUMNS, control::MYSQL_CATALOG_KEYS)
+    } else {
+        (control::CATALOG_COLUMNS, control::CATALOG_KEYS)
+    };
     let mut base = (*rt.policy_for_db_user()).clone();
     let access = base.access_policy.take();
     let evaluated = rt.evaluate(
-        control::CATALOG_COLUMNS,
+        catalog_columns,
         QueryKind::Prepared,
         caller,
         None,
@@ -151,14 +157,20 @@ pub async fn describe_schema(rt: &Arc<Runtime>, caller: &Caller, args: &Value) -
             ),
         );
     }
-    let params = vec![schema.clone(), table.clone()];
+    // MySQL's `?` are positional: each filter names its value twice.
+    let params = if mysql {
+        vec![schema.clone(), schema.clone(), table.clone(), table.clone()]
+    } else {
+        vec![schema.clone(), table.clone()]
+    };
     let limits = rt.limits();
     let timeout = limits.statement_timeout_ms;
     let columns = match execute::run_in_read_transaction(
         rt,
         Some(caller),
-        control::CATALOG_COLUMNS,
+        catalog_columns,
         &params,
+        &[],
         MAX_CATALOG_ROWS,
         timeout,
         &limits,
@@ -207,8 +219,9 @@ pub async fn describe_schema(rt: &Arc<Runtime>, caller: &Caller, args: &Value) -
     let keys = match execute::run_in_read_transaction(
         rt,
         Some(caller),
-        control::CATALOG_KEYS,
+        catalog_keys,
         &params,
+        &[],
         MAX_CATALOG_ROWS,
         timeout,
         &limits,
@@ -220,7 +233,7 @@ pub async fn describe_schema(rt: &Arc<Runtime>, caller: &Caller, args: &Value) -
     };
     let (tables, truncated) = assemble(rt, &columns, keys.as_deref(), access.as_ref());
     let event_id = rt.emit(
-        control::CATALOG_COLUMNS,
+        catalog_columns,
         &evaluated.decision,
         evaluated.eval_us,
         &evaluated.identity,
@@ -329,7 +342,10 @@ fn assemble(
         };
         let data_type = get(4).unwrap_or_default();
         let udt = get(5).unwrap_or_default();
-        let ty = if data_type == "USER-DEFINED" || data_type == "ARRAY" {
+        let ty = if rt.dialect().is_mysql() {
+            // COLUMN_TYPE: `varchar(255)`, `int unsigned`, `enum('a','b')`.
+            if udt.is_empty() { data_type } else { udt }
+        } else if data_type == "USER-DEFINED" || data_type == "ARRAY" {
             udt
         } else {
             data_type
@@ -434,13 +450,13 @@ fn readable(
     if names.is_empty() {
         return Readable::None;
     }
-    let probe = control::access_probe(schema, table, &names);
+    let probe = control::access_probe(rt.dialect().is_mysql(), schema, table, &names);
     let policy = vericto_engine::EnforcementPolicy {
         access_policy: Some(access.clone()),
         ..(*rt.shared.policy.load_full()).clone()
     };
     let rules = rt.shared.ruleset.load_full();
-    let outcome = vericto_engine::evaluate(&probe, Dialect::Postgres, &rules, &policy);
+    let outcome = vericto_engine::evaluate(&probe, rt.dialect().engine(), &rules, &policy);
     if outcome.access_denied.is_empty() {
         return Readable::All;
     }

@@ -38,7 +38,10 @@ pub fn for_agent(e: &DbError, mode: ResultDetail) -> AgentError {
         },
         ResultDetail::Sanitized => {
             let class = e.sqlstate.get(..2).unwrap_or("");
-            let message = if VALUE_CLASSES.contains(&class) {
+            // MySQL reports many data errors (1366 "Incorrect integer value:
+            // '…'") under the general SQLSTATE HY000.
+            let mysql_general = e.code.is_some() && e.sqlstate == "HY000";
+            let message = if VALUE_CLASSES.contains(&class) || mysql_general {
                 redact_quoted(&e.message)
             } else {
                 e.message.clone()
@@ -106,7 +109,27 @@ mod tests {
             hint: Some("hint".into()),
             position: Some("12".into()),
             where_: Some("SQL function".into()),
+            code: None,
         }
+    }
+
+    #[test]
+    fn mysql_general_errors_that_quote_values_are_redacted() {
+        let mut e = err(
+            "HY000",
+            "Incorrect integer value: '123-45-6789' for column 'n' at row 1",
+        );
+        e.code = Some(1366);
+        let a = for_agent(&e, ResultDetail::Sanitized);
+        assert!(!a.message.contains("123-45-6789"), "{}", a.message);
+        // PostgreSQL has no HY000; MySQL's table errors keep their names.
+        let mut e = err("42S02", "Table 'shop.nope' doesn't exist");
+        e.code = Some(1146);
+        assert!(
+            for_agent(&e, ResultDetail::Sanitized)
+                .message
+                .contains("shop.nope")
+        );
     }
 
     #[test]

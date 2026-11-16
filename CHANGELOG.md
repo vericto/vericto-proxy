@@ -7,6 +7,75 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [5.2.0] - 2026-11-16
+
+**Hard mode for `vericto-proxy mcp`: MySQL and MariaDB, the URL in the OS
+keychain, and a read-only check of the database role.** The agent gets
+`execute_sql` and never the credential: the URL can live in the macOS
+Keychain, Windows Credential Manager or the Linux Secret Service instead of a
+file or the environment, and the server can refuse to start when its role can
+write. Minor release (proposed 5.2.0): new settings, a new subcommand, a new
+database; nothing that ran before changes.
+
+### Added
+
+- **MySQL and MariaDB in `vericto-proxy mcp`** (`mysql://`, `mariadb://`, or
+  `UPSTREAM_*` with `VERICTO_WIRE_PROTOCOL=mysql`). `execute_sql`,
+  `describe_schema`, `check_sql` and `whoami` work as on PostgreSQL: the
+  evaluator in the MySQL dialect, one statement per call, the read tier only
+  (statement class from sqlparser's MySQL tree, fail closed), every call in
+  `START TRANSACTION WITH CONSISTENT SNAPSHOT, READ ONLY` that ends in
+  `ROLLBACK`, the same row, byte, cell and time caps and the same output.
+  The statement is sent exactly as evaluated with `COM_STMT_PREPARE` /
+  `COM_STMT_EXECUTE`, `?` params bound in order. Each call pins `sql_mode`
+  (no `ANSI_QUOTES`, `NO_BACKSLASH_ESCAPES` or `PIPES_AS_CONCAT`), UTC and the
+  timeouts (`max_execution_time` on MySQL, `max_statement_time` on MariaDB,
+  `KILL QUERY` at the client-side deadline and on the kill switch). Refused on
+  MySQL: executable comments (`/*! */`, `/*M! */`), optimizer hints
+  (`/*+ */`), named parameters, `:=`, `SELECT … INTO`, locking reads,
+  `EXPLAIN ANALYZE`, and `MYSQL_DENIED_FUNCTIONS` (`get_lock`, `load_file`,
+  `benchmark`, `sys_exec` …). TLS `verify-full` by default off loopback, from
+  `ssl-mode`, `sslmode`, `ssl-ca`, `ssl-cert`, `ssl-key` or `sslaccept`.
+  docs/MCP.md, "MySQL and MariaDB".
+- **`--database-url-keychain <name>`** (`VERICTO_MCP_DATABASE_URL_KEYCHAIN`):
+  the URL from the OS credential store, `name` (service `vericto-proxy`) or
+  `service/name`. First in the precedence keychain, file, URL in the
+  environment, `UPSTREAM_*`; the sources that lose are named in a warning.
+  `whoami.credential_source` says which was used.
+- **`vericto-proxy mcp credential set|delete|test <name>`**: stores a URL read
+  from stdin (hidden on a terminal, never echoed), removes it, or connects with
+  it and reports the engine and the role check. One JSON object on stdout,
+  documented exit codes (0, 1 usage, 2 no such entry, 3 the role can write
+  with `--require-read-only`, 4 unreachable), for `vericto guard install
+  --hard`.
+- **The role check at startup**: whether the database role can write
+  (PostgreSQL: superuser, `CREATEROLE`, `CREATEDB`, write privileges on any
+  table, `CREATE` on a schema or the database, `pg_write_all_data`, a hot
+  standby; MySQL: `SHOW GRANTS`, `read_only`, `super_read_only`). A role that
+  can write is a startup warning and the `whoami` notice
+  `database_role_can_write`; `whoami.database_role` has the details.
+  **`--require-read-only`** (`VERICTO_MCP_REQUIRE_READ_ONLY=true`) refuses to
+  start unless the role is verified read-only.
+- docs/MCP.md: "Hard mode" (setup, threat model and the per-OS limits of the
+  keychain), "MySQL and MariaDB", and "Read-only database roles" (PostgreSQL,
+  MySQL, Supabase, Neon, PlanetScale, RDS).
+- The agent-environment warning also names `MYSQL_PWD`, `MYSQL_PASSWORD`,
+  `MYSQL_URL*`, `MARIADB_PASSWORD`, `PLANETSCALE_*`, `~/.my.cnf` and
+  `~/.mylogin.cnf`.
+
+### Dependencies
+
+- `mysql_async` 0.37 (already the MySQL driver of the tests) and its
+  `mysql_common`, now in the binary: rustls on ring, no C zlib.
+- `keyring` 3.6 (macOS and Windows backends only) and `rpassword` 7. On Linux
+  the Secret Service is reached through libsecret's `secret-tool` command, so
+  the Linux binary still links only libc, libm and libgcc_s and the tree gains
+  no D-Bus crate. The `keychain` feature (default) can be left out with
+  `--no-default-features`.
+- `foldhash` (Zlib, through mysql_async's `lru`) is the first shipped crate
+  under Zlib, which deny.toml already allowed; third-party/about.toml accepts it
+  and THIRD_PARTY_LICENSES is regenerated.
+
 ## [5.1.0] - 2026-11-15
 
 **Engine 5.1.0: whole-table `WHERE` clauses are blocked like a missing `WHERE`.**
@@ -3298,6 +3367,7 @@ the service now targets the rebranded engine.
 - `/health` and `/metrics` (p50/p99 latency) endpoints.
 
 [Unreleased]: https://github.com/vericto/vericto-proxy/compare/v5.1.0...HEAD
+[5.2.0]: https://github.com/vericto/vericto-proxy/compare/v5.1.0...v5.2.0
 [5.1.0]: https://github.com/vericto/vericto-proxy/compare/v5.0.2...v5.1.0
 [5.0.2]: https://github.com/vericto/vericto-proxy/compare/v5.0.1...v5.0.2
 [5.0.1]: https://github.com/vericto/vericto-proxy/compare/v5.0.0...v5.0.1

@@ -459,3 +459,27 @@ async fn real_mcp_an_enforced_allowlist_filters_the_schema_and_refuses_the_rest(
     );
     db.drop().await;
 }
+
+#[tokio::test]
+async fn real_mcp_the_role_check_sees_writes() {
+    let db = real_db!();
+    let (rt, _) = db.runtime(Shared::built_in());
+    // This role has INSERT on app.audit_log: it can write.
+    let c = crate::mcp::readonly::check_pool(&rt.pool).await;
+    assert_eq!(c.can_write, Some(true), "{c:?}");
+    assert!(c.reasons.iter().any(|r| r.contains("INSERT")), "{c:?}");
+    assert_eq!(c.user.as_deref(), Some(db.role.as_str()));
+    // SELECT (and EXECUTE) only: read-only.
+    let mut direct = db.admin.clone();
+    direct.dbname(&db.db);
+    connect(&direct)
+        .await
+        .batch_execute(&format!("REVOKE INSERT ON app.audit_log FROM {}", db.role))
+        .await
+        .unwrap();
+    let (rt, _) = db.runtime(Shared::built_in());
+    let c = crate::mcp::readonly::check_pool(&rt.pool).await;
+    assert!(c.read_only(), "{c:?}");
+    assert!(c.notice().is_none());
+    db.drop().await;
+}

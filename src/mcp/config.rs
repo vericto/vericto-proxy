@@ -25,6 +25,8 @@ pub const FLAGS: &[(&str, &str)] = &[
     ("transport", "VERICTO_MCP_TRANSPORT"),
     ("listen", "VERICTO_MCP_LISTEN"),
     ("database-url-file", "VERICTO_MCP_DATABASE_URL_FILE"),
+    ("database-url-keychain", "VERICTO_MCP_DATABASE_URL_KEYCHAIN"),
+    ("require-read-only", "VERICTO_MCP_REQUIRE_READ_ONLY"),
     ("tiers", "VERICTO_MCP_TIERS"),
     ("max-rows", "VERICTO_MCP_MAX_ROWS"),
     ("max-rows-cap", "VERICTO_MCP_MAX_ROWS_CAP"),
@@ -89,8 +91,9 @@ pub fn parse_args(args: &[String]) -> Result<Args, String> {
         if name == "database-url" {
             return Err(
                 "--database-url is not accepted: a password on the command line is visible to \
-                 every user of the machine (`ps`). Put the URL in a file with mode 0600 and pass \
-                 --database-url-file, or set VERICTO_MCP_DATABASE_URL"
+                 every user of the machine (`ps`). Store it in the OS keychain (`vericto-proxy mcp \
+                 credential set <name>`, then --database-url-keychain <name>), put it in a file \
+                 with mode 0600 and pass --database-url-file, or set VERICTO_MCP_DATABASE_URL"
                     .to_string(),
             );
         }
@@ -133,17 +136,21 @@ fn is_bool_word(s: &str) -> bool {
 /// protocol in stdio mode).
 pub fn help_text() -> String {
     let mut s = String::from(
-        "vericto-proxy mcp: an MCP server that checks and runs SQL on one PostgreSQL database\n\
-         (Proxy mode). The agent gets execute_sql, describe_schema, check_sql and whoami, and\n\
-         no database credential. See docs/MCP.md.\n\n\
-         Usage: vericto-proxy mcp [--flag value]...\n\nFlags (each is also an environment variable):\n",
+        "vericto-proxy mcp: an MCP server that checks and runs SQL on one PostgreSQL, MySQL or\n\
+         MariaDB database (Proxy mode). The agent gets execute_sql, describe_schema, check_sql\n\
+         and whoami, and no database credential. See docs/MCP.md.\n\n\
+         Usage: vericto-proxy mcp [--flag value]...\n\
+         \x20      vericto-proxy mcp credential set|delete|test <name>   (the OS keychain)\n\n\
+         Flags (each is also an environment variable):\n",
     );
     for (flag, var) in FLAGS {
         s.push_str(&format!("  --{flag:<26} {var}\n"));
     }
     s.push_str(
-        "\nThe database: VERICTO_MCP_DATABASE_URL_FILE (preferred), VERICTO_MCP_DATABASE_URL, or\n\
-         UPSTREAM_HOST/UPSTREAM_PORT/UPSTREAM_USER/UPSTREAM_PASSWORD_FILE/UPSTREAM_DBNAME.\n\
+        "\nThe database URL (postgres://, mysql:// or mariadb://), first found wins:\n\
+         VERICTO_MCP_DATABASE_URL_KEYCHAIN (the OS keychain), VERICTO_MCP_DATABASE_URL_FILE,\n\
+         VERICTO_MCP_DATABASE_URL, then UPSTREAM_HOST/UPSTREAM_PORT/UPSTREAM_USER/\n\
+         UPSTREAM_PASSWORD_FILE/UPSTREAM_DBNAME (VERICTO_WIRE_PROTOCOL=mysql for MySQL).\n\
          The control plane (optional): VERICTO_API_KEY and VERICTO_DATABASE_ID (VERICTO_API_URL\n\
          defaults to https://api.vericto.com when a key is set). With none of the three set the\n\
          server runs locally on the built-in ruleset and reports nothing; HTTP mode then needs\n\
@@ -172,9 +179,75 @@ pub enum ResultDetail {
 /// Where the database URL came from (for the startup warnings).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CredentialSource {
+    /// The OS keychain (`VERICTO_MCP_DATABASE_URL_KEYCHAIN`).
+    Keychain,
     UrlFile,
     UrlEnv,
     Upstream,
+}
+
+impl CredentialSource {
+    /// How `whoami` and the logs name it (never the value).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CredentialSource::Keychain => "keychain",
+            CredentialSource::UrlFile => "file",
+            CredentialSource::UrlEnv => "environment",
+            CredentialSource::Upstream => "upstream_variables",
+        }
+    }
+}
+
+/// The database the URL names: the wire protocol `vericto-proxy mcp` speaks
+/// and the dialect the engine evaluates. MariaDB speaks the MySQL protocol and
+/// is evaluated as MySQL; it is told apart for its session variables.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DbDialect {
+    #[default]
+    Postgres,
+    Mysql,
+    Mariadb,
+}
+
+impl DbDialect {
+    /// The engine's dialect.
+    pub fn engine(self) -> vericto_engine::Dialect {
+        match self {
+            DbDialect::Postgres => vericto_engine::Dialect::Postgres,
+            DbDialect::Mysql | DbDialect::Mariadb => vericto_engine::Dialect::Mysql,
+        }
+    }
+
+    /// The dialect name the tools report and `check_sql` accepts.
+    pub fn as_str(self) -> &'static str {
+        self.engine().as_str()
+    }
+
+    /// The product, for messages.
+    pub fn product(self) -> &'static str {
+        match self {
+            DbDialect::Postgres => "PostgreSQL",
+            DbDialect::Mysql => "MySQL",
+            DbDialect::Mariadb => "MariaDB",
+        }
+    }
+
+    /// `postgres`, `mysql` or `mariadb`: `whoami.databases[].engine`.
+    pub fn server(self) -> &'static str {
+        match self {
+            DbDialect::Postgres => "postgres",
+            DbDialect::Mysql => "mysql",
+            DbDialect::Mariadb => "mariadb",
+        }
+    }
+
+    pub fn is_mysql(self) -> bool {
+        !matches!(self, DbDialect::Postgres)
+    }
+
+    pub fn default_port(self) -> u16 {
+        if self.is_mysql() { 3306 } else { 5432 }
+    }
 }
 
 /// A password that never prints.
@@ -203,6 +276,8 @@ impl std::fmt::Debug for Secret {
 /// The one database this process serves.
 #[derive(Clone, PartialEq, Eq)]
 pub struct DatabaseTarget {
+    /// The protocol and dialect (the URL scheme).
+    pub dialect: DbDialect,
     pub host: String,
     pub port: u16,
     pub user: String,
@@ -215,11 +290,15 @@ pub struct DatabaseTarget {
     pub source: CredentialSource,
     /// The path of the secret file, when the credential came from one.
     pub secret_file: Option<PathBuf>,
+    /// The keychain entry (`service/account`), when the credential came from
+    /// the OS keychain. A name, never the secret.
+    pub keychain: Option<String>,
 }
 
 impl std::fmt::Debug for DatabaseTarget {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DatabaseTarget")
+            .field("dialect", &self.dialect)
             .field("host", &self.host)
             .field("port", &self.port)
             .field("user", &self.user)
@@ -311,6 +390,9 @@ pub struct McpConfig {
     pub max_query_bytes: usize,
     /// `VERICTO_MAX_BINARY_OPERATORS`, shared with the TCP proxy.
     pub max_binary_operators: usize,
+    /// `VERICTO_MCP_REQUIRE_READ_ONLY`: refuse to start unless the startup
+    /// check finds that the database role cannot write.
+    pub require_read_only: bool,
     /// Settings the operator wrote that this release ignores, for a warning.
     pub warnings: Vec<String>,
 }
@@ -355,8 +437,20 @@ fn list(env: Lookup<'_>, key: &str) -> Vec<String> {
 
 impl McpConfig {
     /// Builds the configuration from `env` (flags layered over the process
-    /// environment by the caller). Errors name the setting.
+    /// environment by the caller), reading a keychain entry from the OS
+    /// credential store. Errors name the setting. (The binary calls
+    /// [`Self::from_lookup_with`] with the process's store.)
+    #[cfg(test)]
     pub fn from_lookup(env: Lookup<'_>) -> Result<Self, String> {
+        Self::from_lookup_with(env, &crate::mcp::credential::OsStore)
+    }
+
+    /// [`Self::from_lookup`] with the credential store given (tests use an
+    /// in-memory one).
+    pub fn from_lookup_with(
+        env: Lookup<'_>,
+        store: &dyn crate::mcp::credential::SecretStore,
+    ) -> Result<Self, String> {
         let mut warnings = Vec::new();
         let transport = match env("VERICTO_MCP_TRANSPORT")
             .map(|v| v.trim().to_ascii_lowercase())
@@ -377,7 +471,7 @@ impl McpConfig {
             })?,
         };
 
-        let database = database_target(env)?;
+        let database = database_target(env, store, &mut warnings)?;
 
         let d = Limits::default();
         let max_rows_cap = num::<u32>(env, "VERICTO_MCP_MAX_ROWS_CAP")?
@@ -432,6 +526,13 @@ impl McpConfig {
         let search_path = match env("VERICTO_MCP_SEARCH_PATH") {
             None => None,
             Some(v) if v.trim().is_empty() => None,
+            Some(_) if database.dialect.is_mysql() => {
+                return Err(
+                    "VERICTO_MCP_SEARCH_PATH is for PostgreSQL: on MySQL and MariaDB unqualified \
+                     names mean the database the URL names (mysql://user@host/<database>)"
+                        .to_string(),
+                );
+            }
             Some(v) => Some(parse_search_path(&v)?),
         };
 
@@ -509,6 +610,7 @@ impl McpConfig {
                 .filter(|v| !v.trim().is_empty())
                 .map(PathBuf::from),
             allow_md5: flag(env, "VERICTO_MCP_ALLOW_MD5").unwrap_or(false),
+            require_read_only: flag(env, "VERICTO_MCP_REQUIRE_READ_ONLY").unwrap_or(false),
             requested_tiers_above_read,
             max_query_bytes,
             max_binary_operators,
@@ -544,12 +646,74 @@ pub fn parse_search_path(v: &str) -> Result<Vec<String>, String> {
     Ok(names.into_iter().map(|n| n.to_ascii_lowercase()).collect())
 }
 
-/// The database URL or the `UPSTREAM_*` variables.
-fn database_target(env: Lookup<'_>) -> Result<DatabaseTarget, String> {
+/// The database URL or the `UPSTREAM_*` variables. Precedence, first set
+/// wins: the OS keychain (`VERICTO_MCP_DATABASE_URL_KEYCHAIN`), the file
+/// (`VERICTO_MCP_DATABASE_URL_FILE`), the URL in the environment
+/// (`VERICTO_MCP_DATABASE_URL`), then `UPSTREAM_*`. The sources that lose are
+/// named in a warning, so a stale one is noticed.
+fn database_target(
+    env: Lookup<'_>,
+    store: &dyn crate::mcp::credential::SecretStore,
+    warnings: &mut Vec<String>,
+) -> Result<DatabaseTarget, String> {
+    let keychain = env("VERICTO_MCP_DATABASE_URL_KEYCHAIN").filter(|v| !v.trim().is_empty());
     let file = env("VERICTO_MCP_DATABASE_URL_FILE").filter(|v| !v.trim().is_empty());
     let inline = env("VERICTO_MCP_DATABASE_URL").filter(|v| !v.trim().is_empty());
-    let mut target = match (file, inline) {
-        (Some(path), _) => {
+    let set: Vec<&str> = [
+        ("VERICTO_MCP_DATABASE_URL_KEYCHAIN", keychain.is_some()),
+        ("VERICTO_MCP_DATABASE_URL_FILE", file.is_some()),
+        ("VERICTO_MCP_DATABASE_URL", inline.is_some()),
+        (
+            "UPSTREAM_HOST",
+            env("UPSTREAM_HOST").is_some_and(|v| !v.trim().is_empty()),
+        ),
+    ]
+    .iter()
+    .filter(|(_, on)| *on)
+    .map(|(k, _)| *k)
+    .collect();
+    if set.len() > 1 {
+        warnings.push(format!(
+            "several database credentials are configured; {} is used and {} ignored (precedence: \
+             keychain, file, URL in the environment, UPSTREAM_*)",
+            set[0],
+            set[1..].join(", ")
+        ));
+    }
+    let mut target = match (keychain, file, inline) {
+        (Some(name), _, _) => {
+            let entry = crate::mcp::credential::EntryName::parse(name.trim())
+                .map_err(|e| format!("VERICTO_MCP_DATABASE_URL_KEYCHAIN: {e}"))?;
+            let raw = match store.get(&entry) {
+                Ok(Some(url)) => url,
+                Ok(None) => {
+                    return Err(format!(
+                        "VERICTO_MCP_DATABASE_URL_KEYCHAIN: no entry {} in the {} (store one with \
+                         `vericto-proxy mcp credential set {}`)",
+                        entry.display(),
+                        store.backend(),
+                        entry.cli_name()
+                    ));
+                }
+                Err(e) => {
+                    return Err(format!(
+                        "VERICTO_MCP_DATABASE_URL_KEYCHAIN: the {} could not be read for {}: {e}",
+                        store.backend(),
+                        entry.display()
+                    ));
+                }
+            };
+            let mut t = parse_database_url(raw.trim()).map_err(|e| {
+                format!(
+                    "VERICTO_MCP_DATABASE_URL_KEYCHAIN ({}): {e}",
+                    entry.display()
+                )
+            })?;
+            t.source = CredentialSource::Keychain;
+            t.keychain = Some(entry.display());
+            t
+        }
+        (None, Some(path), _) => {
             let path = expand_home(path.trim(), env);
             let raw = std::fs::read_to_string(&path).map_err(|e| {
                 format!(
@@ -564,13 +728,13 @@ fn database_target(env: Lookup<'_>) -> Result<DatabaseTarget, String> {
             t.secret_file = Some(path);
             t
         }
-        (None, Some(url)) => {
+        (None, None, Some(url)) => {
             let mut t = parse_database_url(url.trim())
                 .map_err(|e| format!("VERICTO_MCP_DATABASE_URL: {e}"))?;
             t.source = CredentialSource::UrlEnv;
             t
         }
-        (None, None) => upstream_target(env)?,
+        (None, None, None) => upstream_target(env)?,
     };
 
     // UPSTREAM_SSL* apply on top of the URL's own parameters, and the default
@@ -616,14 +780,30 @@ fn expand_home(path: &str, env: Lookup<'_>) -> PathBuf {
 fn upstream_target(env: Lookup<'_>) -> Result<DatabaseTarget, String> {
     let Some(host) = env("UPSTREAM_HOST").filter(|v| !v.trim().is_empty()) else {
         return Err(
-            "no database configured: set VERICTO_MCP_DATABASE_URL_FILE (a file holding a \
-             postgres:// URL, preferred), VERICTO_MCP_DATABASE_URL, or UPSTREAM_HOST with \
-             UPSTREAM_USER and UPSTREAM_PASSWORD_FILE"
+            "no database configured: set VERICTO_MCP_DATABASE_URL_KEYCHAIN (an OS keychain entry \
+             stored with `vericto-proxy mcp credential set <name>`, preferred), \
+             VERICTO_MCP_DATABASE_URL_FILE (a file holding a postgres://, mysql:// or mariadb:// \
+             URL), VERICTO_MCP_DATABASE_URL, or UPSTREAM_HOST with UPSTREAM_USER and \
+             UPSTREAM_PASSWORD_FILE"
                 .to_string(),
         );
     };
+    let dialect = match env("VERICTO_WIRE_PROTOCOL")
+        .map(|v| v.trim().to_ascii_lowercase())
+        .as_deref()
+    {
+        None | Some("") | Some("postgres") | Some("postgresql") => DbDialect::Postgres,
+        Some("mysql") => DbDialect::Mysql,
+        Some("mariadb") => DbDialect::Mariadb,
+        Some(other) => {
+            return Err(format!(
+                "VERICTO_WIRE_PROTOCOL={other:?} is not supported in mcp mode: use postgres \
+                 (the default), mysql or mariadb"
+            ));
+        }
+    };
     let port = match env("UPSTREAM_PORT") {
-        None => 5432,
+        None => dialect.default_port(),
         Some(p) => p
             .trim()
             .parse()
@@ -652,7 +832,16 @@ fn upstream_target(env: Lookup<'_>) -> Result<DatabaseTarget, String> {
     Ok(DatabaseTarget {
         dbname: env("UPSTREAM_DBNAME")
             .filter(|v| !v.trim().is_empty())
-            .unwrap_or_else(|| user.clone()),
+            .unwrap_or_else(|| {
+                // PostgreSQL's default database is the user's name; MySQL has
+                // none (unqualified names then need a database).
+                if dialect.is_mysql() {
+                    String::new()
+                } else {
+                    user.clone()
+                }
+            }),
+        dialect,
         host: host.trim().to_string(),
         port,
         user,
@@ -663,6 +852,7 @@ fn upstream_target(env: Lookup<'_>) -> Result<DatabaseTarget, String> {
         client_key: None,
         source: CredentialSource::Upstream,
         secret_file,
+        keychain: None,
     })
 }
 
@@ -674,18 +864,27 @@ fn default_tls(host: &str) -> UpstreamTlsMode {
     }
 }
 
-/// Parses a `postgres://` / `postgresql://` URL: user, password, one host,
-/// port, database and the `sslmode`, `sslrootcert`, `sslcert`, `sslkey`
-/// parameters. Errors never include the URL (it holds the password).
+/// Parses a `postgres://` / `postgresql://`, `mysql://` or `mariadb://` URL:
+/// user, password, one host, port, database and the TLS parameters
+/// (PostgreSQL: `sslmode`, `sslrootcert`, `sslcert`, `sslkey`; MySQL also
+/// `ssl-mode`, `ssl-ca`, `ssl-cert`, `ssl-key` and PlanetScale's
+/// `sslaccept`). Errors never include the URL (it holds the password).
 pub fn parse_database_url(raw: &str) -> Result<DatabaseTarget, String> {
     let (scheme, _) = raw.split_once("://").ok_or(
-        "not a postgres:// URL (it should look like postgres://user:password@host:5432/dbname)",
+        "not a database URL (it should look like postgres://user:password@host:5432/dbname or \
+         mysql://user:password@host:3306/dbname)",
     )?;
-    if !scheme.eq_ignore_ascii_case("postgres") && !scheme.eq_ignore_ascii_case("postgresql") {
-        return Err(format!(
-            "the URL scheme is {scheme:?}; only postgres:// and postgresql:// are supported (PostgreSQL only)"
-        ));
-    }
+    let dialect = match scheme.to_ascii_lowercase().as_str() {
+        "postgres" | "postgresql" => DbDialect::Postgres,
+        "mysql" => DbDialect::Mysql,
+        "mariadb" => DbDialect::Mariadb,
+        _ => {
+            return Err(format!(
+                "the URL scheme is {scheme:?}; supported: postgres://, postgresql://, mysql:// and \
+                 mariadb://"
+            ));
+        }
+    };
     let url = reqwest::Url::parse(raw).map_err(|_| {
         "the URL does not parse (check for unescaped @, : or / in the password; percent-encode them)"
             .to_string()
@@ -703,18 +902,27 @@ pub fn parse_database_url(raw: &str) -> Result<DatabaseTarget, String> {
     let decode = |s: &str| -> Result<String, String> { percent_decode(s) };
     let user = decode(url.username())?;
     if user.is_empty() {
-        return Err("the URL has no user (postgres://user:password@host/dbname)".to_string());
+        return Err(format!(
+            "the URL has no user ({}://user:password@host/dbname)",
+            scheme.to_ascii_lowercase()
+        ));
     }
     let password = url.password().map(decode).transpose()?.unwrap_or_default();
     let dbname = decode(url.path().trim_start_matches('/'))?;
+    if dialect.is_mysql() && dbname.contains('/') {
+        return Err("the URL's database name has a `/`; name one database".to_string());
+    }
     let mut target = DatabaseTarget {
+        dialect,
         tls: default_tls(&host),
-        dbname: if dbname.is_empty() {
+        // PostgreSQL connects to the user's database when none is named;
+        // MySQL to none.
+        dbname: if dbname.is_empty() && !dialect.is_mysql() {
             user.clone()
         } else {
             dbname
         },
-        port: url.port().unwrap_or(5432),
+        port: url.port().unwrap_or(dialect.default_port()),
         host,
         user,
         password: Secret::new(password),
@@ -723,35 +931,78 @@ pub fn parse_database_url(raw: &str) -> Result<DatabaseTarget, String> {
         client_key: None,
         source: CredentialSource::UrlEnv,
         secret_file: None,
+        keychain: None,
     };
     for (k, v) in url.query_pairs() {
-        match k.as_ref() {
-            "sslmode" => {
-                target.tls = match v.to_ascii_lowercase().as_str() {
-                    // libpq's `prefer`/`allow` may fall back to plaintext; here
-                    // they mean "encrypt", never less than the URL asked.
-                    "prefer" | "allow" => UpstreamTlsMode::Require,
+        match (dialect.is_mysql(), k.as_ref()) {
+            (_, "sslmode") | (true, "ssl-mode" | "ssl_mode") => {
+                target.tls = match v.to_ascii_lowercase().replace('_', "-").as_str() {
+                    // libpq's `prefer`/`allow` and MySQL's `PREFERRED` may fall
+                    // back to plaintext; here they mean "encrypt", never less
+                    // than the URL asked.
+                    "prefer" | "allow" | "preferred" | "required" => UpstreamTlsMode::Require,
+                    "disabled" => UpstreamTlsMode::Disable,
+                    "verify-identity" => UpstreamTlsMode::VerifyFull,
                     other => UpstreamTlsMode::parse(Some(other))?,
                 }
             }
-            "sslrootcert" => target.ca_path = Some(v.into_owned()),
-            "sslcert" => target.client_cert = Some(v.into_owned()),
-            "sslkey" => target.client_key = Some(v.into_owned()),
-            "options" => {
+            (_, "sslrootcert") | (true, "ssl-ca" | "ssl_ca") => {
+                target.ca_path = Some(v.into_owned())
+            }
+            (_, "sslcert") | (true, "ssl-cert" | "ssl_cert") => {
+                target.client_cert = Some(v.into_owned())
+            }
+            (_, "sslkey") | (true, "ssl-key" | "ssl_key") => {
+                target.client_key = Some(v.into_owned())
+            }
+            // PlanetScale's (and Prisma's) form: `strict` verifies,
+            // `accept_invalid_certs` only encrypts.
+            (true, "sslaccept") => {
+                target.tls = match v.to_ascii_lowercase().as_str() {
+                    "strict" => UpstreamTlsMode::VerifyFull,
+                    "accept_invalid_certs" => UpstreamTlsMode::Require,
+                    other => {
+                        return Err(format!(
+                            "sslaccept={other:?} is not supported: use strict or accept_invalid_certs"
+                        ));
+                    }
+                }
+            }
+            // The Node drivers' `ssl={"rejectUnauthorized":true}`.
+            (true, "ssl") => {
+                let compact: String = v.chars().filter(|c| !c.is_whitespace()).collect();
+                target.tls = if compact.contains("\"rejectUnauthorized\":false") {
+                    UpstreamTlsMode::Require
+                } else {
+                    UpstreamTlsMode::VerifyFull
+                };
+            }
+            (false, "options") => {
                 return Err(
                     "the URL's `options` parameter is not supported: session settings are fixed \
                      by vericto-proxy mcp (search_path: VERICTO_MCP_SEARCH_PATH)"
                         .to_string(),
                 );
             }
+            (true, "socket") => {
+                return Err("Unix sockets are not supported; name a TCP host".to_string());
+            }
             // Informational parameters that change nothing about what runs.
-            "application_name"
-            | "connect_timeout"
-            | "channel_binding"
-            | "target_session_attrs"
-            | "gssencmode"
-            | "pgbouncer" => {}
-            other => {
+            (
+                false,
+                "application_name"
+                | "connect_timeout"
+                | "channel_binding"
+                | "target_session_attrs"
+                | "gssencmode"
+                | "pgbouncer",
+            )
+            | (
+                true,
+                "charset" | "connect_timeout" | "connectTimeout" | "connection_limit"
+                | "pool_timeout",
+            ) => {}
+            (_, other) => {
                 return Err(format!(
                     "the URL parameter {other:?} is not supported by vericto-proxy mcp"
                 ));
@@ -814,7 +1065,9 @@ mod tests {
     #[test]
     fn url_errors_never_echo_the_url() {
         for bad in [
-            "mysql://u:hunter2@h/db",
+            "oracle://u:hunter2@h/db",
+            "mysql://:hunter2@h/db",
+            "mysql://u:hunter2@h/db?bogus=1",
             "postgres://:hunter2@h/db",
             "postgres://u:hunter2@h/db?options=-c%20search_path%3Dx",
             "postgres://u:hunter2@h/db?bogus=1",
@@ -932,6 +1185,143 @@ mod tests {
         for bad in ["a;b", "\"x\"", "x y", "1abc", ""] {
             assert!(parse_search_path(bad).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn mysql_and_mariadb_urls_parse() {
+        let t = parse_database_url(
+            "mysql://agent_ro:s3cr%40t@db.example.com/shop?ssl-mode=VERIFY_IDENTITY",
+        )
+        .unwrap();
+        assert_eq!(t.dialect, DbDialect::Mysql);
+        assert_eq!(t.port, 3306);
+        assert_eq!(t.dbname, "shop");
+        assert_eq!(t.password.expose(), "s3cr@t");
+        assert_eq!(t.tls, UpstreamTlsMode::VerifyFull);
+        // No database named: none (not the user's name, as on PostgreSQL).
+        let t = parse_database_url("mysql://u:p@127.0.0.1:3307").unwrap();
+        assert_eq!(t.dbname, "");
+        assert_eq!(t.port, 3307);
+        assert_eq!(t.tls, UpstreamTlsMode::Disable);
+        let t = parse_database_url("mariadb://u:p@db.example.com/x?ssl-mode=REQUIRED").unwrap();
+        assert_eq!(t.dialect, DbDialect::Mariadb);
+        assert_eq!(t.tls, UpstreamTlsMode::Require);
+        // PlanetScale's forms.
+        let t =
+            parse_database_url("mysql://u:p@aws.connect.psdb.cloud/x?sslaccept=strict").unwrap();
+        assert_eq!(t.tls, UpstreamTlsMode::VerifyFull);
+        let t = parse_database_url(
+            "mysql://u:p@aws.connect.psdb.cloud/x?ssl=%7B%22rejectUnauthorized%22%3Atrue%7D",
+        )
+        .unwrap();
+        assert_eq!(t.tls, UpstreamTlsMode::VerifyFull);
+        let t = parse_database_url(
+            "mysql://u:p@h.example.com/x?ssl-ca=%2Fetc%2Fca.pem&ssl-mode=verify_ca",
+        )
+        .unwrap();
+        assert_eq!(t.ca_path.as_deref(), Some("/etc/ca.pem"));
+        assert_eq!(t.tls, UpstreamTlsMode::VerifyCa);
+        // `ssl-mode=DISABLED` off loopback is refused, as for PostgreSQL.
+        let env = lookup(&[(
+            "VERICTO_MCP_DATABASE_URL",
+            "mysql://u:p@db.example.com/x?ssl-mode=DISABLED",
+        )]);
+        assert!(
+            McpConfig::from_lookup(&env)
+                .unwrap_err()
+                .contains("VERICTO_MCP_ALLOW_PLAINTEXT_DB")
+        );
+        // The search path is PostgreSQL's.
+        let env = lookup(&[
+            ("VERICTO_MCP_DATABASE_URL", "mysql://u:p@localhost/x"),
+            ("VERICTO_MCP_SEARCH_PATH", "app"),
+        ]);
+        assert!(
+            McpConfig::from_lookup(&env)
+                .unwrap_err()
+                .contains("VERICTO_MCP_SEARCH_PATH")
+        );
+        for bad in [
+            "mysql://u:p@h/x?socket=%2Ftmp%2Fm.sock",
+            "mysql://u:p@h/a/b",
+        ] {
+            assert!(parse_database_url(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn upstream_variables_can_name_mysql() {
+        let env = lookup(&[
+            ("UPSTREAM_HOST", "localhost"),
+            ("UPSTREAM_USER", "ro"),
+            ("VERICTO_WIRE_PROTOCOL", "mysql"),
+        ]);
+        let c = McpConfig::from_lookup(&env).unwrap();
+        assert_eq!(c.database.dialect, DbDialect::Mysql);
+        assert_eq!(c.database.port, 3306);
+        assert_eq!(c.database.dbname, "");
+    }
+
+    #[test]
+    fn the_keychain_comes_first_and_its_secret_never_prints() {
+        use crate::mcp::credential::{EntryName, MemoryStore, SecretStore};
+        let store = MemoryStore::default();
+        store
+            .set(
+                &EntryName::parse("shop").unwrap(),
+                "mysql://agent:hunter2@127.0.0.1:3306/shop",
+            )
+            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("db.url");
+        std::fs::write(&file, "postgres://u:p@localhost/other").unwrap();
+        let env = lookup(&[
+            ("VERICTO_MCP_DATABASE_URL_KEYCHAIN", "shop"),
+            ("VERICTO_MCP_DATABASE_URL_FILE", file.to_str().unwrap()),
+            ("VERICTO_MCP_DATABASE_URL", "postgres://u:p@localhost/env"),
+        ]);
+        let c = McpConfig::from_lookup_with(&env, &store).unwrap();
+        assert_eq!(c.database.source, CredentialSource::Keychain);
+        assert_eq!(c.database.dialect, DbDialect::Mysql);
+        assert_eq!(c.database.dbname, "shop");
+        assert_eq!(c.database.keychain.as_deref(), Some("vericto-proxy/shop"));
+        assert!(c.database.secret_file.is_none());
+        // The sources that lose are named in a warning, never their values.
+        let w = c.warnings.join("\n");
+        assert!(w.contains("VERICTO_MCP_DATABASE_URL_FILE"), "{w}");
+        assert!(!w.contains("hunter2") && !format!("{c:?}").contains("hunter2"));
+        // The file wins over the environment.
+        let env = lookup(&[
+            ("VERICTO_MCP_DATABASE_URL_FILE", file.to_str().unwrap()),
+            ("VERICTO_MCP_DATABASE_URL", "postgres://u:p@localhost/env"),
+        ]);
+        assert_eq!(
+            McpConfig::from_lookup_with(&env, &store)
+                .unwrap()
+                .database
+                .dbname,
+            "other"
+        );
+        // A missing entry says how to store one; a bad URL in the keychain
+        // never echoes it.
+        let env = lookup(&[("VERICTO_MCP_DATABASE_URL_KEYCHAIN", "nope")]);
+        let e = McpConfig::from_lookup_with(&env, &store).unwrap_err();
+        assert!(e.contains("vericto-proxy mcp credential set nope"), "{e}");
+        store
+            .set(&EntryName::parse("bad").unwrap(), "oracle://u:hunter2@h/x")
+            .unwrap();
+        let env = lookup(&[("VERICTO_MCP_DATABASE_URL_KEYCHAIN", "bad")]);
+        let e = McpConfig::from_lookup_with(&env, &store).unwrap_err();
+        assert!(!e.contains("hunter2"), "{e}");
+        // A flag maps to the variable.
+        let a = parse_args(&[
+            "--database-url-keychain".into(),
+            "acme/shop".into(),
+            "--require-read-only".into(),
+        ])
+        .unwrap();
+        assert_eq!(a.settings["VERICTO_MCP_DATABASE_URL_KEYCHAIN"], "acme/shop");
+        assert_eq!(a.settings["VERICTO_MCP_REQUIRE_READ_ONLY"], "true");
     }
 
     #[test]

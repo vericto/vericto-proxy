@@ -25,14 +25,18 @@ pub mod check;
 pub mod classify;
 pub mod config;
 pub mod control;
+pub mod credential;
+pub mod db;
 pub mod env_warning;
 pub mod errors;
 pub mod execute;
 pub mod http;
 pub mod identity;
+pub mod mysql;
 pub mod next_steps;
 pub mod pg;
 pub mod pool;
+pub mod readonly;
 pub mod results;
 pub mod runtime;
 pub mod schema;
@@ -48,6 +52,8 @@ mod fake_pg;
 mod prop_tests;
 #[cfg(test)]
 mod protocol_tests;
+#[cfg(test)]
+mod real_mysql_tests;
 #[cfg(test)]
 mod real_pg_tests;
 
@@ -186,6 +192,10 @@ fn fail(msg: &str) -> ! {
 /// Entry point of `vericto-proxy mcp …` (tracing already set up, on stderr).
 pub async fn run(args: Vec<String>) {
     let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
+    if args.first().map(String::as_str) == Some("credential") {
+        let code = run_credential(&args[1..]).await;
+        std::process::exit(code);
+    }
     let parsed = match config::parse_args(&args) {
         Ok(a) => a,
         Err(e) => fail(&e),
@@ -199,7 +209,8 @@ pub async fn run(args: Vec<String>) {
         std::process::exit(0);
     }
     let lookup = layered(parsed.settings, |k| std::env::var(k).ok());
-    let cfg = match McpConfig::from_lookup(&lookup) {
+    let store = credential::process_store();
+    let cfg = match McpConfig::from_lookup_with(&lookup, store.as_ref()) {
         Ok(c) => c,
         Err(e) => fail(&e),
     };
@@ -410,7 +421,42 @@ pub async fn run(args: Vec<String>) {
         process_key,
         local_tokens,
         session_id: uuid::Uuid::new_v4().to_string(),
+        role_check: Default::default(),
     });
+    // The read-only check of the database role (hard mode, 5.2.0): before
+    // serving with --require-read-only, else in the background.
+    if rt.cfg.require_read_only {
+        let check = match tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            readonly::check_pool(&rt.pool),
+        )
+        .await
+        {
+            Ok(c) => c,
+            Err(_) => readonly::RoleCheck::unverified("the check timed out"),
+        };
+        log_role_check(&check);
+        if !check.read_only() {
+            fail(&format!(
+                "--require-read-only: the database role {} ({}). Use a role with SELECT only \
+                 (docs/MCP.md, Hard mode), or drop --require-read-only",
+                if check.can_write == Some(true) {
+                    "can write"
+                } else {
+                    "could not be verified as read-only"
+                },
+                check.reasons.join("; ")
+            ));
+        }
+        rt.role_check.store(Some(Arc::new(check)));
+    } else {
+        let rt = Arc::clone(&rt);
+        tokio::spawn(async move {
+            let check = readonly::check_pool(&rt.pool).await;
+            log_role_check(&check);
+            rt.role_check.store(Some(Arc::new(check)));
+        });
+    }
     {
         let rt = Arc::clone(&rt);
         tokio::spawn(async move {
@@ -423,7 +469,9 @@ pub async fn run(args: Vec<String>) {
     }
     tracing::info!(
         transport = ?rt.cfg.transport,
+        dialect = rt.dialect().server(),
         database = %rt.cfg.database.dbname,
+        credential = rt.cfg.database.source.as_str(),
         tls = ?rt.cfg.database.tls,
         require_control_plane = rt.require_control_plane,
         "vericto-proxy mcp starting (Proxy mode, read tier)"
@@ -476,6 +524,245 @@ pub async fn run(args: Vec<String>) {
                     std::process::exit(0);
                 }
             }
+        }
+    }
+}
+
+fn log_role_check(c: &readonly::RoleCheck) {
+    match c.can_write {
+        Some(false) => tracing::info!(
+            user = c.user.as_deref().unwrap_or(""),
+            notes = %c.notes.join("; "),
+            "Database role check: read-only"
+        ),
+        Some(true) => tracing::warn!(
+            alert = "database_role_can_write",
+            user = c.user.as_deref().unwrap_or(""),
+            reasons = %c.reasons.join("; "),
+            "The database role this server logs in as can write. execute_sql still runs reads \
+             only, in a read-only transaction that is rolled back; a role with SELECT only is the \
+             third line (docs/MCP.md, Hard mode). --require-read-only refuses to start in this case"
+        ),
+        None => tracing::warn!(
+            alert = "database_role_unverified",
+            reasons = %c.reasons.join("; "),
+            "Whether the database role can write could not be verified"
+        ),
+    }
+}
+
+/// The usage of `vericto-proxy mcp credential`.
+const CREDENTIAL_USAGE: &str = "Usage:\n\
+  vericto-proxy mcp credential set <name>      store a database URL read from stdin (hidden on a terminal)\n\
+  vericto-proxy mcp credential delete <name>   remove it\n\
+  vericto-proxy mcp credential test <name> [--require-read-only] [mcp flags]\n\
+                                               connect with it and check the role is read-only\n\
+<name> is `name` (service vericto-proxy) or `service/name`. The URL is never printed.\n\
+Then: vericto-proxy mcp --database-url-keychain <name>\n\
+Exit codes: 0 ok, 1 usage or store error, 2 no such entry, 3 the role can write (test\n\
+--require-read-only), 4 the database is unreachable or refused the login.\n";
+
+/// `vericto-proxy mcp credential set|delete|test <name>`: one JSON object on
+/// stdout, messages on stderr, never the URL.
+pub async fn run_credential(args: &[String]) -> i32 {
+    use credential::exit;
+    let store = credential::process_store();
+    let say = |v: serde_json::Value| println!("{v}");
+    let (Some(action), Some(name)) = (args.first(), args.get(1)) else {
+        eprint!("{CREDENTIAL_USAGE}");
+        return if args.first().is_some_and(|a| a == "--help" || a == "-h") {
+            exit::OK
+        } else {
+            exit::USAGE
+        };
+    };
+    let entry = match credential::EntryName::parse(name) {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("vericto-proxy mcp credential: {e}");
+            return exit::USAGE;
+        }
+    };
+    let rest = &args[2..];
+    match action.as_str() {
+        "set" => {
+            if !rest.is_empty() {
+                eprintln!(
+                    "vericto-proxy mcp credential set: the URL is read from stdin, never from the \
+                     command line (which every user of the machine can see)"
+                );
+                return exit::USAGE;
+            }
+            let url = match credential::read_secret_from_stdin() {
+                Ok(u) => u,
+                Err(e) => {
+                    eprintln!("vericto-proxy mcp credential set: {e}");
+                    return exit::USAGE;
+                }
+            };
+            let target = match config::parse_database_url(&url) {
+                Ok(t) => t,
+                Err(e) => {
+                    eprintln!("vericto-proxy mcp credential set: the URL is not valid: {e}");
+                    return exit::USAGE;
+                }
+            };
+            let replaced = matches!(store.get(&entry), Ok(Some(_)));
+            if let Err(e) = store.set(&entry, &url) {
+                eprintln!(
+                    "vericto-proxy mcp credential set: the {} refused it: {e}",
+                    store.backend()
+                );
+                return exit::USAGE;
+            }
+            eprintln!(
+                "Stored {} in the {} ({}). Use: vericto-proxy mcp --database-url-keychain {}",
+                entry.display(),
+                store.backend(),
+                target.dialect.product(),
+                entry.cli_name()
+            );
+            say(json!({
+                "ok": true,
+                "action": "set",
+                "entry": entry.display(),
+                "backend": store.backend(),
+                "replaced": replaced,
+                "dialect": target.dialect.as_str(),
+                "engine": target.dialect.server(),
+                "database": target.dbname,
+                "tls": format!("{:?}", target.tls),
+            }));
+            exit::OK
+        }
+        "delete" => match store.delete(&entry) {
+            Ok(true) => {
+                eprintln!("Deleted {} from the {}.", entry.display(), store.backend());
+                say(
+                    json!({ "ok": true, "action": "delete", "entry": entry.display(), "deleted": true }),
+                );
+                exit::OK
+            }
+            Ok(false) => {
+                eprintln!("No entry {} in the {}.", entry.display(), store.backend());
+                say(
+                    json!({ "ok": false, "action": "delete", "entry": entry.display(), "deleted": false }),
+                );
+                exit::NOT_FOUND
+            }
+            Err(e) => {
+                eprintln!("vericto-proxy mcp credential delete: {e}");
+                exit::USAGE
+            }
+        },
+        "test" => {
+            let parsed = match config::parse_args(rest) {
+                Ok(a) => a,
+                Err(e) => {
+                    eprintln!("vericto-proxy mcp credential test: {e}");
+                    return exit::USAGE;
+                }
+            };
+            match store.get(&entry) {
+                Ok(Some(_)) => {}
+                Ok(None) => {
+                    eprintln!("No entry {} in the {}.", entry.display(), store.backend());
+                    say(
+                        json!({ "ok": false, "action": "test", "entry": entry.display(), "error": "not_found" }),
+                    );
+                    return exit::NOT_FOUND;
+                }
+                Err(e) => {
+                    eprintln!("vericto-proxy mcp credential test: {e}");
+                    return exit::USAGE;
+                }
+            }
+            let mut settings = parsed.settings;
+            settings.insert(
+                "VERICTO_MCP_DATABASE_URL_KEYCHAIN".to_string(),
+                entry.display(),
+            );
+            let lookup = layered(settings, |k| std::env::var(k).ok());
+            let cfg = match McpConfig::from_lookup_with(&lookup, store.as_ref()) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("vericto-proxy mcp credential test: {e}");
+                    say(
+                        json!({ "ok": false, "action": "test", "entry": entry.display(), "error": "config", "message": e }),
+                    );
+                    return exit::USAGE;
+                }
+            };
+            let t = &cfg.database;
+            if let Err(e) = crate::tcp::upstream::validate_upstream_tls(
+                t.tls,
+                t.ca_path.as_deref(),
+                t.client_cert.as_deref(),
+                t.client_key.as_deref(),
+            ) {
+                eprintln!(
+                    "vericto-proxy mcp credential test: the database TLS settings do not load: {e}"
+                );
+                return exit::USAGE;
+            }
+            let mut conn = match db::Conn::connect(&cfg.database, cfg.allow_md5).await {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!(
+                        "vericto-proxy mcp credential test: could not connect ({}: {})",
+                        e.step, e.message
+                    );
+                    say(json!({
+                        "ok": false, "action": "test", "entry": entry.display(),
+                        "error": "unavailable", "step": e.step, "message": e.message,
+                    }));
+                    return exit::UNAVAILABLE;
+                }
+            };
+            let server_version = conn.server_version();
+            let engine = if conn.is_mariadb() {
+                "mariadb"
+            } else {
+                cfg.database.dialect.server()
+            };
+            let check = readonly::check(&mut conn).await;
+            db::Conn::close(conn).await;
+            let read_only = check.read_only();
+            eprintln!(
+                "Connected to {} ({engine} {}) as {}: {}",
+                if cfg.database.dbname.is_empty() {
+                    "the server"
+                } else {
+                    cfg.database.dbname.as_str()
+                },
+                server_version.as_deref().unwrap_or("?"),
+                check.user.as_deref().unwrap_or("?"),
+                match check.can_write {
+                    Some(false) => "the role is read-only".to_string(),
+                    Some(true) => format!("the role CAN WRITE ({})", check.reasons.join("; ")),
+                    None => format!("not verified ({})", check.reasons.join("; ")),
+                }
+            );
+            say(json!({
+                "ok": true,
+                "action": "test",
+                "entry": entry.display(),
+                "dialect": cfg.database.dialect.as_str(),
+                "engine": engine,
+                "server_version": server_version,
+                "database": cfg.database.dbname,
+                "tls": format!("{:?}", cfg.database.tls),
+                "database_role": check.json(),
+            }));
+            if cfg.require_read_only && !read_only {
+                exit::CAN_WRITE
+            } else {
+                exit::OK
+            }
+        }
+        other => {
+            eprintln!("vericto-proxy mcp credential: unknown action {other:?}\n{CREDENTIAL_USAGE}");
+            exit::USAGE
         }
     }
 }

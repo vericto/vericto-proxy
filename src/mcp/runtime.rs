@@ -10,7 +10,7 @@ use std::time::Instant;
 
 use serde_json::Value;
 use vericto_engine::policy::{DbContext, EvalContext, HostMode, SessionContext, Ticket};
-use vericto_engine::{Dialect, EnforcementPolicy, SensitivePolicy};
+use vericto_engine::{EnforcementPolicy, SensitivePolicy};
 
 use crate::mcp::config::{McpConfig, Transport};
 use crate::mcp::identity::{self, Identity};
@@ -89,6 +89,8 @@ pub struct Runtime {
     pub local_tokens: Vec<Identity>,
     /// stdio: this process's session id (one client, one conversation).
     pub session_id: String,
+    /// The read-only check of the database role (startup), once it ran.
+    pub role_check: arc_swap::ArcSwapOption<crate::mcp::readonly::RoleCheck>,
 }
 
 /// The MCP client's declared `clientInfo`.
@@ -234,6 +236,11 @@ impl Runtime {
         &self.cfg.database.dbname
     }
 
+    /// The database's protocol and dialect.
+    pub fn dialect(&self) -> crate::mcp::config::DbDialect {
+        self.cfg.database.dialect
+    }
+
     /// The kill-switch block that refuses `caller` now, if any: its key's
     /// (HTTP: the agent key's; stdio: the proxy key's), the proxy key's (it
     /// stops every caller of this server), or the database user's and the
@@ -290,6 +297,10 @@ impl Runtime {
                 if let Some(first) = self.cfg.search_path.as_ref().and_then(|p| p.first()) {
                     access.default_schema = Some(first.clone());
                 }
+                // MySQL: unqualified names are the URL's database.
+                if self.dialect().is_mysql() && !self.cfg.database.dbname.is_empty() {
+                    access.default_schema = Some(self.cfg.database.dbname.clone());
+                }
                 Arc::new(EnforcementPolicy {
                     access_policy: Some(access),
                     ..(*base).clone()
@@ -304,6 +315,9 @@ impl Runtime {
     /// `users` mean another table than the one the allowlist checked; else the
     /// role's own.
     pub fn search_path(&self, policy: &EnforcementPolicy) -> Option<Vec<String>> {
+        if self.dialect().is_mysql() {
+            return None;
+        }
         if let Some(p) = &self.cfg.search_path {
             return Some(p.clone());
         }
@@ -362,7 +376,7 @@ impl Runtime {
             let rules = bundle.rules.as_ref().unwrap_or(&rules);
             let d = evaluate_message_with_guard(
                 sql,
-                Dialect::Postgres,
+                self.dialect().engine(),
                 kind,
                 rules,
                 &policy,
@@ -378,7 +392,7 @@ impl Runtime {
             (
                 evaluate_message_guarded(
                     sql,
-                    Dialect::Postgres,
+                    self.dialect().engine(),
                     kind,
                     &rules,
                     &policy,
@@ -416,7 +430,7 @@ impl Runtime {
         let mut ev = crate::tcp::postgres::build_event(
             &sink.database_id,
             sql,
-            Dialect::Postgres,
+            self.dialect().engine(),
             decision,
             eval_us,
             mode,
